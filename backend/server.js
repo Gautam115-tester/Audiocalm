@@ -20,14 +20,14 @@ const PORT = process.env.PORT || 3000;
 // ── Security & logging ────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(morgan('combined'));
-app.use(cors({ origin: '*' }));           // tighten in production if needed
+app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));        // tighten in production if needed
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,  // 15 minutes
-  max: 300,
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 300,
   message: { error: 'Too many requests, please try again later.' },
 });
 app.use('/api/', limiter);
