@@ -193,6 +193,14 @@ router.post('/series-cover', upload.single('file'), async (req, res) => {
   }
 });
 
+router.use((req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (key !== process.env.API_SECRET_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/upload/album-cover
 // Upload cover image for an album to Telegram Covers channel

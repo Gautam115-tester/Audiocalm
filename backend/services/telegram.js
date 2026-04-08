@@ -169,17 +169,19 @@ async function uploadPhoto(filePath, channelId, caption = '') {
   }
 }
 
+const cache = new Map();
 // ── Build a public cover URL ──────────────────────────────────────────────────
 // Flutter uses this as coverUrl in AlbumModel / SeriesModel
 async function getCoverUrl(telegramFileId) {
   if (!telegramFileId) return null;
+  const cached = cache.get(telegramFileId);
+  if (cached && Date.now() < cached.expiry) return cached.url;
   try {
-    return await getFileUrl(telegramFileId);
-  } catch {
-    return null;
-  }
+    const url = await getFileUrl(telegramFileId);
+    cache.set(telegramFileId, { url, expiry: Date.now() + (parseInt(process.env.CACHE_TTL_SECONDS) || 3000) * 1000 });
+    return url;
+  } catch { return null; }
 }
-
 module.exports = {
   streamFile,
   downloadFile,
