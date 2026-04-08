@@ -1,0 +1,64 @@
+name: audio_calm
+description: A soothing mindfulness-focused audio streaming app.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+
+  # Audio
+  just_audio: ^0.9.40
+  audio_service: ^0.18.15
+  audio_session: ^0.1.21
+
+  # Navigation
+  go_router: ^14.2.7
+
+  # Network
+  dio: ^5.7.0
+
+  # Local Storage
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+
+  # Encryption
+  encrypt: ^5.0.3
+  flutter_secure_storage: ^9.2.2
+  pointycastle: ^3.9.1
+
+  # UI
+  cached_network_image: ^3.4.1
+  shimmer: ^3.0.0
+  google_fonts: ^6.2.1
+
+  # Utils
+  path_provider: ^2.1.4
+  uuid: ^4.5.1
+  intl: ^0.19.0
+  connectivity_plus: ^6.1.0
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  hive_generator: ^2.0.1
+  build_runner: ^2.4.12
+  riverpod_generator: ^2.4.0
+
+dependency_overrides:
+  analyzer: '>=6.4.1 <7.0.0'
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/icons/

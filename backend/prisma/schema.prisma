@@ -1,0 +1,74 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Calm Stories ─────────────────────────────────────────────────────────────
+
+model Series {
+  id          String    @id @default(uuid())
+  title       String
+  description String?
+  coverUrl    String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  episodes    Episode[]
+
+  @@map("series")
+}
+
+model Episode {
+  id              String   @id @default(uuid())
+  seriesId        String
+  episodeNumber   Int
+  title           String
+  telegramFileId  String?
+  duration        Int?     // seconds
+  partCount       Int      @default(1)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  series          Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@unique([seriesId, episodeNumber])
+  @@map("episodes")
+}
+
+// ─── Calm Music ───────────────────────────────────────────────────────────────
+
+model Album {
+  id        String   @id @default(uuid())
+  title     String
+  artist    String?
+  coverUrl  String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  songs     Song[]
+
+  @@map("albums")
+}
+
+model Song {
+  id             String   @id @default(uuid())
+  albumId        String
+  trackNumber    Int
+  title          String
+  telegramFileId String?
+  duration       Int?     // seconds
+  partCount      Int      @default(1)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  album          Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  @@unique([albumId, trackNumber])
+  @@map("songs")
+}
