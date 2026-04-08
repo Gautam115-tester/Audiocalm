@@ -86,90 +86,95 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
   }
 
   Future<void> _runDownload(
-      DownloadModel model, String mediaType, int partCount) async {
-    try {
-      final dir = await _getDownloadsDir();
+    DownloadModel model, String mediaType, int partCount) async {
+  try {
+    final dir = await _getDownloadsDir();
 
-      // Determine download URLs
-      final List<String> downloadUrls = [];
-      if (partCount <= 1) {
-        final endpoint = mediaType == 'episode'
-            ? ApiConstants.episodeDownload(model.mediaId)
-            : ApiConstants.songDownload(model.mediaId);
-        downloadUrls.add('${ApiConstants.baseUrl}$endpoint');
-      } else {
-        for (int i = 1; i <= partCount; i++) {
-          final endpoint = mediaType == 'episode'
-              ? '${ApiConstants.episodeStream(model.mediaId)}?part=$i'
-              : '${ApiConstants.songStream(model.mediaId)}?part=$i';
-          downloadUrls.add('${ApiConstants.baseUrl}$endpoint');
-        }
+    // Step 1: Get download info (returns JSON with part URLs)
+    final endpoint = mediaType == 'episode'
+        ? ApiConstants.episodeDownload(model.mediaId)
+        : ApiConstants.songDownload(model.mediaId);
+
+    final downloadInfo = await _dio.get<Map<String, dynamic>>(
+      '${ApiConstants.baseUrl}$endpoint',
+    );
+    final data = downloadInfo.data!;
+    final isMultiPart = data['isMultiPart'] as bool? ?? false;
+
+    // Step 2: Build list of stream URLs to download
+    final List<String> downloadUrls = [];
+    if (isMultiPart) {
+      final parts = data['parts'] as List? ?? [];
+      for (final part in parts) {
+        downloadUrls.add(part['streamUrl'] as String);
       }
+    } else {
+      // Single part — stream URL is in 'url' field
+      downloadUrls.add(data['url'] as String);
+    }
 
-      // Download parts
-      final List<String> partPaths = [];
-      for (int i = 0; i < downloadUrls.length; i++) {
-        final partPath = '${dir.path}/${model.mediaId}_part$i.tmp';
-        partPaths.add(partPath);
+    if (downloadUrls.isEmpty) {
+      throw Exception('No download URLs available');
+    }
 
-        await _dio.download(
-          downloadUrls[i],
-          partPath,
-          onReceiveProgress: (received, total) {
-            if (total > 0) {
-              final partProgress = received / total;
-              final overallProgress =
-                  (i + partProgress) / downloadUrls.length * 0.8;
-              _updateProgress(
-                  model, 'downloading', overallProgress, i + 1);
-            }
-          },
-        );
+    // Step 3: Download each part
+    final List<String> partPaths = [];
+    for (int i = 0; i < downloadUrls.length; i++) {
+      final partPath = '${dir.path}/${model.mediaId}_part$i.tmp';
+      partPaths.add(partPath);
 
-        model.downloadedParts = i + 1;
-        _updateState(model);
-      }
-
-      // Merge parts if multiple
-      String mergedPath;
-      if (partPaths.length > 1) {
-        _updateProgress(model, 'merging', 0.82, partCount);
-        mergedPath = '${dir.path}/${model.mediaId}_merged.tmp';
-        await _mergeParts(partPaths, mergedPath);
-      } else {
-        mergedPath = partPaths.first;
-      }
-
-      // Encrypt
-      _updateProgress(model, 'encrypting', 0.90, partCount);
-      await _encryptionService.encryptFile(mergedPath, model.encryptedFilePath);
-
-      // Cleanup temp files
-      for (final path in partPaths) {
-        try {
-          await File(path).delete();
-        } catch (_) {}
-      }
-      if (partPaths.length > 1) {
-        try {
-          await File(mergedPath).delete();
-        } catch (_) {}
-      }
-
-      // Get encrypted file size
-      final encFile = File(model.encryptedFilePath);
-      final size = await encFile.exists() ? await encFile.length() : 0;
-      model.fileSizeBytes = size;
-      model.status = 'completed';
-      model.progress = 1.0;
-      _updateState(model);
-    } catch (e) {
-      model.status = 'failed';
-      model.errorMessage = e.toString();
-      model.progress = 0.0;
+      await _dio.download(
+        downloadUrls[i],
+        partPath,
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            final partProgress = received / total;
+            final overallProgress =
+                (i + partProgress) / downloadUrls.length * 0.8;
+            _updateProgress(model, 'downloading', overallProgress, i + 1);
+          }
+        },
+      );
+      model.downloadedParts = i + 1;
       _updateState(model);
     }
+
+    // Step 4: Merge if multiple parts
+    String mergedPath;
+    if (partPaths.length > 1) {
+      _updateProgress(model, 'merging', 0.82, downloadUrls.length);
+      mergedPath = '${dir.path}/${model.mediaId}_merged.tmp';
+      await _mergeParts(partPaths, mergedPath);
+    } else {
+      mergedPath = partPaths.first;
+    }
+
+    // Step 5: Encrypt
+    _updateProgress(model, 'encrypting', 0.90, downloadUrls.length);
+    await _encryptionService.encryptFile(mergedPath, model.encryptedFilePath);
+
+    // Step 6: Cleanup temp files
+    for (final path in partPaths) {
+      try { await File(path).delete(); } catch (_) {}
+    }
+    if (partPaths.length > 1) {
+      try { await File(mergedPath).delete(); } catch (_) {}
+    }
+
+    // Step 7: Done
+    final encFile = File(model.encryptedFilePath);
+    final size = await encFile.exists() ? await encFile.length() : 0;
+    model.fileSizeBytes = size;
+    model.status = 'completed';
+    model.progress = 1.0;
+    _updateState(model);
+  } catch (e) {
+    model.status = 'failed';
+    model.errorMessage = e.toString();
+    model.progress = 0.0;
+    _updateState(model);
   }
+}
 
   Future<void> _mergeParts(List<String> partPaths, String outputPath) async {
     final outputFile = File(outputPath);

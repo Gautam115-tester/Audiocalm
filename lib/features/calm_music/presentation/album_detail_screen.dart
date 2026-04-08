@@ -157,17 +157,17 @@ class _SongTile extends ConsumerWidget {
   });
 
   PlayableItem _toPlayable(SongModel s, AlbumModel? album) {
-    return PlayableItem(
-      id: s.id,
-      title: s.title,
-      subtitle: album?.title,
-      artworkUrl: album?.coverUrl,
-      duration: s.duration,
-      partCount: s.partCount,
-      type: MediaType.song,
-      streamUrl: '${ApiConstants.baseUrl}${ApiConstants.songStream(s.id)}',
-    );
-  }
+  return PlayableItem(
+    id: s.id,
+    title: s.title,
+    subtitle: album?.title,
+    artworkUrl: s.coverUrl ?? album?.coverUrl, // ← song has its own cover now
+    duration: s.duration,
+    partCount: s.isMultiPart ? 2 : 1,
+    type: MediaType.song,
+    streamUrl: '${ApiConstants.baseUrl}${ApiConstants.songStream(s.id)}',
+  );
+}
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -226,15 +226,15 @@ class _SongTile extends ConsumerWidget {
               icon: const Icon(Icons.download_rounded, size: 20),
               color: AppColors.textTertiary,
               onPressed: () {
-                ref.read(downloadManagerProvider.notifier).startDownload(
-                      mediaId: song.id,
-                      title: song.title,
-                      mediaType: 'song',
-                      partCount: song.partCount,
-                      artworkUrl: album?.coverUrl,
-                      subtitle: album?.title,
-                    );
-              },
+  ref.read(downloadManagerProvider.notifier).startDownload(
+    mediaId: song.id,
+    title: song.title,
+    mediaType: 'song',
+    partCount: song.isMultiPart ? 2 : 1,
+    artworkUrl: song.coverUrl ?? album?.coverUrl,
+    subtitle: album?.title,
+  );
+},
             )
           else
             const Icon(Icons.check_circle_rounded,
