@@ -4,6 +4,7 @@ const router   = express.Router();
 const axios    = require('axios');
 const prisma   = require('../services/db');
 
+// ── CORS for local HTML dashboard ─────────────────────────────────────────────
 router.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
