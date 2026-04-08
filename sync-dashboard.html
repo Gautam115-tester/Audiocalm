@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AudioCalm — Telegram Sync Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #ffffff;
+      --bg2:        #f5f5f4;
+      --bg3:        #efefed;
+      --text:       #1a1a1a;
+      --text2:      #6b6b6b;
+      --text3:      #a0a09a;
+      --border:     rgba(0,0,0,0.12);
+      --border2:    rgba(0,0,0,0.20);
+      --green:      #1D9E75;
+      --green-bg:   #E1F5EE;
+      --green-text: #0F6E56;
+      --red:        #E24B4A;
+      --red-bg:     #FCEBEB;
+      --red-text:   #A32D2D;
+      --blue:       #378ADD;
+      --blue-bg:    #E6F1FB;
+      --blue-text:  #185FA5;
+      --amber-bg:   #FAEEDA;
+      --amber-text: #854F0B;
+      --radius:     8px;
+      --radius-lg:  12px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:         #1c1c1b;
+        --bg2:        #252523;
+        --bg3:        #2e2e2c;
+        --text:       #f0efe8;
+        --text2:      #a0a09a;
+        --text3:      #6b6b6b;
+        --border:     rgba(255,255,255,0.10);
+        --border2:    rgba(255,255,255,0.18);
+        --green-bg:   #04342C;
+        --green-text: #9FE1CB;
+        --red-bg:     #501313;
+        --red-text:   #F7C1C1;
+        --blue-bg:    #042C53;
+        --blue-text:  #B5D4F4;
+        --amber-bg:   #412402;
+        --amber-text: #FAC775;
+      }
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg3);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 680px;
+    }
+
+    /* ── Header ── */
+    .app-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 2rem;
+    }
+    .app-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius);
+      background: var(--green);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .app-icon svg { width: 20px; height: 20px; fill: white; }
+    .app-header h1 { font-size: 20px; font-weight: 600; }
+    .app-header p  { font-size: 13px; color: var(--text2); margin-top: 2px; }
+
+    /* ── Cards ── */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0,1fr));
+      gap: 10px;
+      margin-bottom: 1.25rem;
+    }
+    .stat-card {
+      background: var(--bg);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 14px 16px;
+    }
+    .stat-label { font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+    .stat-value { font-size: 26px; font-weight: 600; color: var(--text); }
+
+    /* ── Section card ── */
+    .section {
+      background: var(--bg);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .section-title { font-size: 14px; font-weight: 600; }
+    .section-desc  { font-size: 12px; color: var(--text2); margin-bottom: 14px; }
+    .divider { height: 0.5px; background: var(--border); margin: 14px 0; }
+
+    /* ── URL input ── */
+    .url-row { display: flex; gap: 8px; }
+    .url-row input {
+      flex: 1;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      padding: 8px 12px;
+      border-radius: var(--radius);
+      border: 0.5px solid var(--border2);
+      background: var(--bg2);
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .url-row input:focus { border-color: var(--green); }
+
+    /* ── Buttons ── */
+    button {
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      border: 0.5px solid var(--border2);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      white-space: nowrap;
+    }
+    button:hover   { background: var(--bg2); }
+    button:active  { transform: scale(0.97); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    button.primary {
+      background: var(--text);
+      color: var(--bg);
+      border-color: transparent;
+    }
+    button.primary:hover { opacity: 0.85; }
+
+    button.danger {
+      background: var(--red-bg);
+      color: var(--red-text);
+      border-color: transparent;
+    }
+
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* ── Toggle ── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .toggle-label { font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 8px; }
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+      flex-shrink: 0;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: var(--border2);
+      border-radius: 22px;
+      transition: background 0.2s;
+      cursor: pointer;
+    }
+    .toggle-track::before {
+      content: '';
+      position: absolute;
+      width: 16px; height: 16px;
+      left: 3px; top: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .toggle input:checked ~ .toggle-track { background: var(--green); }
+    .toggle input:checked ~ .toggle-track::before { transform: translateX(18px); }
+
+    /* ── Badge ── */
+    .badge {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: var(--radius);
+    }
+    .badge.on  { background: var(--green-bg);  color: var(--green-text); }
+    .badge.off { background: var(--bg2);        color: var(--text3); }
+    .badge.info { background: var(--blue-bg);   color: var(--blue-text); }
+
+    /* ── Status dot ── */
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--border2);
+      display: inline-block;
+      transition: background 0.3s;
+    }
+    .dot.live { background: var(--green); box-shadow: 0 0 0 3px var(--green-bg); }
+
+    /* ── Interval row ── */
+    .interval-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text2);
+    }
+    .interval-row select {
+      font-size: 13px;
+      padding: 6px 10px;
+      border-radius: var(--radius);
+      border: 0.5px solid var(--border2);
+      background: var(--bg2);
+      color: var(--text);
+      outline: none;
+    }
+    #next-run { font-size: 12px; color: var(--text3); margin-left: auto; }
+
+    /* ── Log box ── */
+    .log-box {
+      background: var(--bg2);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      min-height: 90px;
+      max-height: 220px;
+      overflow-y: auto;
+      margin-top: 14px;
+      line-height: 1.9;
+    }
+    .log-line       { color: var(--text2); }
+    .log-line.ok    { color: var(--green-text); }
+    .log-line.err   { color: var(--red-text); }
+    .log-line.info  { color: var(--blue-text); }
+    .log-line.warn  { color: var(--amber-text); }
+    .log-line.muted { color: var(--text3); }
+
+    /* ── Last sync row ── */
+    .last-sync { font-size: 12px; color: var(--text3); margin-top: 10px; }
+
+    /* ── Spinner ── */
+    .spin {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid var(--border2);
+      border-top-color: var(--green);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Progress bar ── */
+    .progress-wrap {
+      height: 3px;
+      background: var(--bg2);
+      border-radius: 3px;
+      margin-top: 10px;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--green);
+      border-radius: 3px;
+      transition: width 0.4s ease;
+    }
+
+    /* ── History list ── */
+    .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 0.5px solid var(--border);
+      font-size: 13px;
+    }
+    .history-item:last-child { border-bottom: none; }
+    .history-time { color: var(--text3); font-size: 12px; }
+    .history-empty { font-size: 13px; color: var(--text3); padding: 8px 0; }
+
+    @media (max-width: 500px) {
+      .stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
+      .btn-row { flex-direction: column; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="app-header">
+    <div class="app-icon">
+      <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+    </div>
+    <div>
+      <h1>AudioCalm Sync</h1>
+      <p>Telegram → Database sync dashboard</p>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-label">Songs synced</div>
+      <div class="stat-value" id="stat-songs">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Albums found</div>
+      <div class="stat-value" id="stat-albums">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Covers linked</div>
+      <div class="stat-value" id="stat-covers">—</div>
+    </div>
+  </div>
+
+  <!-- Base URL -->
+  <div class="section">
+    <div class="section-title">Backend URL</div>
+    <div class="section-desc">Your Render deployment URL</div>
+    <div class="url-row">
+      <input type="text" id="base-url" placeholder="https://your-app.onrender.com" />
+      <button onclick="saveUrl()">Save</button>
+    </div>
+  </div>
+
+  <!-- Auto sync -->
+  <div class="section">
+    <div class="toggle-row">
+      <span class="toggle-label">
+        <span class="dot" id="auto-dot"></span>
+        Auto-sync
+        <span class="badge off" id="auto-badge">off</span>
+      </span>
+      <label class="toggle">
+        <input type="checkbox" id="auto-toggle" onchange="toggleAuto()" />
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="interval-row">
+      Run every
+      <select id="interval-select" onchange="restartAutoIfOn()">
+        <option value="60000">1 minute</option>
+        <option value="300000" selected>5 minutes</option>
+        <option value="600000">10 minutes</option>
+        <option value="1800000">30 minutes</option>
+        <option value="3600000">1 hour</option>
+      </select>
+      <span id="next-run"></span>
+    </div>
+  </div>
+
+  <!-- Manual sync -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">Manual sync</span>
+      <button class="danger" style="font-size:12px; padding:5px 12px;" onclick="clearLog()">Clear log</button>
+    </div>
+    <div class="section-desc">Run sync operations on demand</div>
+
+    <div class="btn-row">
+      <button class="primary" onclick="runSync('both')"   id="btn-all">Sync everything</button>
+      <button               onclick="runSync('music')"  id="btn-music">Music only</button>
+      <button               onclick="runSync('covers')" id="btn-covers">Covers only</button>
+    </div>
+
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+
+    <div class="log-box" id="log">
+      <div class="log-line muted">Waiting for sync...</div>
+    </div>
+
+    <div class="last-sync" id="last-sync"></div>
+  </div>
+
+  <!-- Sync history -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">Sync history</span>
+      <button style="font-size:12px; padding:5px 12px;" onclick="clearHistory()">Clear</button>
+    </div>
+    <div id="history-list">
+      <div class="history-empty">No syncs yet.</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  /* ── State ─────────────────────────────────────────── */
+  let autoTimer    = null;
+  let countTimer   = null;
+  let nextRunAt    = null;
+  let running      = false;
+  let history      = JSON.parse(localStorage.getItem('sync_history') || '[]');
+  let stats        = JSON.parse(localStorage.getItem('sync_stats')   || '{"songs":0,"albums":0,"covers":0}');
+
+  /* ── Init ──────────────────────────────────────────── */
+  window.onload = function() {
+    const saved = localStorage.getItem('sync_base');
+    if (saved) document.getElementById('base-url').value = saved;
+    renderStats();
+    renderHistory();
+  };
+
+  /* ── URL ───────────────────────────────────────────── */
+  function getBase() {
+    return (localStorage.getItem('sync_base') || '').replace(/\/$/, '');
+  }
+
+  function saveUrl() {
+    const val = document.getElementById('base-url').value.trim();
+    if (!val) { addLog('err', 'Please enter a URL'); return; }
+    localStorage.setItem('sync_base', val);
+    addLog('info', 'Base URL saved: ' + val);
+  }
+
+  /* ── Stats ─────────────────────────────────────────── */
+  function renderStats() {
+    document.getElementById('stat-songs').textContent  = stats.songs;
+    document.getElementById('stat-albums').textContent = stats.albums;
+    document.getElementById('stat-covers').textContent = stats.covers;
+  }
+
+  function saveStats() {
+    localStorage.setItem('sync_stats', JSON.stringify(stats));
+  }
+
+  /* ── Log ───────────────────────────────────────────── */
+  function addLog(type, msg) {
+    const box  = document.getElementById('log');
+    const line = document.createElement('div');
+    line.className = 'log-line ' + type;
+    const t = new Date().toLocaleTimeString();
+    line.textContent = '[' + t + '] ' + msg;
+    if (box.children.length === 1 && box.children[0].classList.contains('muted')) {
+      box.innerHTML = '';
+    }
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+    if (box.children.length > 120) box.removeChild(box.children[0]);
+  }
+
+  function clearLog() {
+    document.getElementById('log').innerHTML = '<div class="log-line muted">Log cleared.</div>';
+  }
+
+  /* ── Progress ──────────────────────────────────────── */
+  function setProgress(pct) {
+    const wrap = document.getElementById('progress-wrap');
+    const bar  = document.getElementById('progress-bar');
+    if (pct === null) {
+      wrap.style.display = 'none';
+      bar.style.width = '0%';
+    } else {
+      wrap.style.display = 'block';
+      bar.style.width = pct + '%';
+    }
+  }
+
+  /* ── Buttons ───────────────────────────────────────── */
+  function setBtns(dis) {
+    ['btn-all','btn-music','btn-covers'].forEach(id => {
+      document.getElementById(id).disabled = dis;
+    });
+  }
+
+  /* ── Sync ──────────────────────────────────────────── */
+  async function runSync(type) {
+    if (running) return;
+    const base = getBase();
+    if (!base) { addLog('err', 'Set backend URL first and click Save'); return; }
+
+    running = true;
+    setBtns(true);
+    setProgress(10);
+    addLog('info', '--- Starting ' + type + ' sync ---');
+
+    let totalSongs = 0, totalCovers = 0, totalAlbums = 0;
+    let ok = true;
+
+    try {
+      if (type === 'music' || type === 'both') {
+        addLog('info', 'Calling /api/sync/music...');
+        setProgress(30);
+        const r = await post(base + '/api/sync/music');
+        if (r.error) {
+          addLog('err', 'Music sync failed: ' + r.error);
+          ok = false;
+        } else {
+          totalSongs  += r.created  || 0;
+          totalAlbums += r.albums   || 0;
+          const skipped = r.skipped || 0;
+          addLog('ok', 'Music: +' + totalSongs + ' new songs, ' + skipped + ' already existed');
+          if (totalAlbums > 0) addLog('ok', 'Albums: ' + totalAlbums + ' found/created');
+        }
+        setProgress(type === 'both' ? 60 : 95);
+      }
+
+      if (type === 'covers' || type === 'both') {
+        addLog('info', 'Calling /api/sync/covers...');
+        setProgress(80);
+        const r = await post(base + '/api/sync/covers');
+        if (r.error) {
+          addLog('err', 'Covers sync failed: ' + r.error);
+          ok = false;
+        } else {
+          totalCovers += r.updated || 0;
+          addLog('ok', 'Covers: ' + totalCovers + ' linked');
+        }
+        setProgress(95);
+      }
+
+      /* update stats */
+      stats.songs  += totalSongs;
+      stats.covers += totalCovers;
+      if (totalAlbums > stats.albums) stats.albums = totalAlbums;
+      saveStats();
+      renderStats();
+
+      setProgress(100);
+      const summary = ok ? 'Sync complete' : 'Sync finished with errors';
+      addLog(ok ? 'ok' : 'warn', '--- ' + summary + ' ---');
+      document.getElementById('last-sync').textContent =
+        'Last sync: ' + new Date().toLocaleString();
+
+      addHistory(type, ok, totalSongs, totalCovers);
+
+    } catch(e) {
+      addLog('err', 'Network error: ' + e.message);
+      addLog('warn', 'Make sure your Render URL is correct and the server is running');
+    }
+
+    setTimeout(() => setProgress(null), 800);
+    running = false;
+    setBtns(false);
+  }
+
+  async function post(url) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(res.status + ': ' + text.slice(0, 120));
+    }
+    return await res.json();
+  }
+
+  /* ── History ───────────────────────────────────────── */
+  function addHistory(type, ok, songs, covers) {
+    history.unshift({
+      time: new Date().toISOString(),
+      type, ok, songs, covers,
+    });
+    if (history.length > 20) history.pop();
+    localStorage.setItem('sync_history', JSON.stringify(history));
+    renderHistory();
+  }
+
+  function clearHistory() {
+    history = [];
+    localStorage.removeItem('sync_history');
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const el = document.getElementById('history-list');
+    if (!history.length) {
+      el.innerHTML = '<div class="history-empty">No syncs yet.</div>';
+      return;
+    }
+    el.innerHTML = history.map(h => {
+      const t   = new Date(h.time).toLocaleString();
+      const lbl = h.type === 'both' ? 'All' : h.type.charAt(0).toUpperCase() + h.type.slice(1);
+      const status = h.ok
+        ? '<span class="badge on">ok</span>'
+        : '<span class="badge" style="background:var(--red-bg);color:var(--red-text);">error</span>';
+      const detail = h.songs > 0 || h.covers > 0
+        ? '<span style="font-size:12px;color:var(--text2);margin-left:8px;">+' + h.songs + ' songs, ' + h.covers + ' covers</span>'
+        : '';
+      return '<div class="history-item"><span>' + lbl + status + detail + '</span><span class="history-time">' + t + '</span></div>';
+    }).join('');
+  }
+
+  /* ── Auto-sync ─────────────────────────────────────── */
+  function toggleAuto() {
+    const on = document.getElementById('auto-toggle').checked;
+    document.getElementById('auto-badge').textContent = on ? 'on' : 'off';
+    document.getElementById('auto-badge').className   = 'badge ' + (on ? 'on' : 'off');
+    document.getElementById('auto-dot').className     = 'dot' + (on ? ' live' : '');
+    on ? startAuto() : stopAuto();
+  }
+
+  function restartAutoIfOn() {
+    if (document.getElementById('auto-toggle').checked) {
+      stopAuto(); startAuto();
+    }
+  }
+
+  function startAuto() {
+    stopAuto();
+    const ms = parseInt(document.getElementById('interval-select').value);
+    addLog('info', 'Auto-sync ON — every ' + (ms / 60000).toFixed(0) + ' min');
+    scheduleNext(ms);
+  }
+
+  function scheduleNext(ms) {
+    nextRunAt  = Date.now() + ms;
+    updateCountdown();
+    countTimer = setInterval(updateCountdown, 5000);
+    autoTimer  = setTimeout(async () => {
+      clearInterval(countTimer);
+      await runSync('both');
+      if (document.getElementById('auto-toggle').checked) {
+        scheduleNext(parseInt(document.getElementById('interval-select').value));
+      }
+    }, ms);
+  }
+
+  function stopAuto() {
+    if (autoTimer)  { clearTimeout(autoTimer);   autoTimer  = null; }
+    if (countTimer) { clearInterval(countTimer); countTimer = null; }
+    nextRunAt = null;
+    document.getElementById('next-run').textContent = '';
+  }
+
+  function updateCountdown() {
+    if (!nextRunAt) return;
+    const left = Math.max(0, Math.round((nextRunAt - Date.now()) / 1000));
+    const m    = Math.floor(left / 60);
+    const s    = left % 60;
+    document.getElementById('next-run').textContent =
+      'next in ' + (m > 0 ? m + 'm ' : '') + s + 's';
+  }
+</script>
+</body>
+</html>
