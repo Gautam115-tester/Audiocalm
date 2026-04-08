@@ -13,6 +13,7 @@ const songsRoutes     = require('./routes/songs');
 const searchRoutes    = require('./routes/search');
 const uploadRoutes    = require('./routes/upload');
 const healthRoutes    = require('./routes/health');
+const syncRoutes      = require('./routes/sync');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -20,15 +21,15 @@ const PORT = process.env.PORT || 3000;
 // ── Security & logging ────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(morgan('combined'));
-app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));        // tighten in production if needed
+app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 300,
-  message: { error: 'Too many requests, please try again later.' },
+  max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 300,
+  message:  { error: 'Too many requests, please try again later.' },
 });
 app.use('/api/', limiter);
 
@@ -40,6 +41,7 @@ app.use('/api/albums',    albumsRoutes);
 app.use('/api/songs',     songsRoutes);
 app.use('/api/search',    searchRoutes);
 app.use('/api/upload',    uploadRoutes);
+app.use('/api/sync',      syncRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {
@@ -56,6 +58,8 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Audio Calm API running on port ${PORT}`);
   console.log(`📡 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔄 Sync music:   POST http://localhost:${PORT}/api/sync/music`);
+  console.log(`🖼️  Sync covers:  POST http://localhost:${PORT}/api/sync/covers`);
 });
 
 module.exports = app;
