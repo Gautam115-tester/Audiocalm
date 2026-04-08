@@ -1,5 +1,3 @@
-// lib/features/calm_stories/data/models/series_model.dart
-
 class SeriesModel {
   final String id;
   final String title;
@@ -21,27 +19,15 @@ class SeriesModel {
 
   factory SeriesModel.fromJson(Map<String, dynamic> json) {
     return SeriesModel(
-      id: json['id']?.toString() ?? '',
-      title: json['title']?.toString() ?? '',
-      description: json['description']?.toString(),
-      coverUrl: json['coverUrl']?.toString(),
-      isActive: json['isActive'] as bool? ?? true,
-      episodeCount: json['_count']?['episodes'] as int? ??
-          json['episodeCount'] as int? ??
-          0,
-      createdAt: json['createdAt'] != null
-          ? DateTime.tryParse(json['createdAt'].toString()) ?? DateTime.now()
+      id:           json['id']?.toString() ?? '',
+      title:        json['title']?.toString() ?? '',
+      description:  json['description']?.toString(),
+      coverUrl:     json['cover_image_url']?.toString(),   // ← changed
+      isActive:     json['is_active'] as bool? ?? true,
+      episodeCount: json['episode_count'] as int? ?? 0,    // ← changed
+      createdAt: json['created_at'] != null
+          ? DateTime.tryParse(json['created_at'].toString()) ?? DateTime.now()
           : DateTime.now(),
     );
   }
-
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'description': description,
-        'coverUrl': coverUrl,
-        'isActive': isActive,
-        'episodeCount': episodeCount,
-        'createdAt': createdAt.toIso8601String(),
-      };
 }

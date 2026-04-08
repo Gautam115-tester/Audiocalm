@@ -52,14 +52,15 @@ class SearchNotifier extends StateNotifier<SearchState> {
 
   SearchNotifier(this._ref) : super(const SearchState());
 
+  // --- REPLACE THE OLD SEARCH METHOD WITH YOUR NEW ONE HERE ---
   Future<void> search(String query) async {
     if (query.length < 2) {
       state = state.copyWith(query: query, results: [], isLoading: false);
       return;
     }
-
+    
     state = state.copyWith(query: query, isLoading: true, error: null);
-
+    
     try {
       final dio = _ref.read(dioClientProvider);
       final data = await dio.get<Map<String, dynamic>>(
@@ -67,63 +68,24 @@ class SearchNotifier extends StateNotifier<SearchState> {
         queryParameters: {'q': query},
       );
 
-      final results = <SearchResult>[];
-
-      // Parse series
-      final series = data['series'] as List? ?? [];
-      for (final s in series) {
-        results.add(SearchResult(
-          id: s['id'].toString(),
-          title: s['title'].toString(),
-          subtitle: 'Series',
-          imageUrl: s['coverUrl']?.toString(),
-          type: 'series',
-        ));
-      }
-
-      // Parse albums
-      final albums = data['albums'] as List? ?? [];
-      for (final a in albums) {
-        results.add(SearchResult(
-          id: a['id'].toString(),
-          title: a['title'].toString(),
-          subtitle: a['artist']?.toString() ?? 'Album',
-          imageUrl: a['coverUrl']?.toString(),
-          type: 'album',
-        ));
-      }
-
-      // Parse episodes
-      final episodes = data['episodes'] as List? ?? [];
-      for (final e in episodes) {
-        results.add(SearchResult(
-          id: e['id'].toString(),
-          title: e['title'].toString(),
-          subtitle: 'Episode',
-          type: 'episode',
-        ));
-      }
-
-      // Parse songs
-      final songs = data['songs'] as List? ?? [];
-      for (final s in songs) {
-        results.add(SearchResult(
-          id: s['id'].toString(),
-          title: s['title'].toString(),
-          subtitle: 'Song',
-          type: 'song',
-        ));
-      }
+      final list = data['data'] as List? ?? [];
+      final results = list.map((r) => SearchResult(
+        id:       r['id'].toString(),
+        title:    r['title'].toString(),
+        subtitle: r['subtitle']?.toString(),
+        imageUrl: r['cover_image_url']?.toString(),
+        type:     r['type'].toString(),   // 'series'|'album'|'episode'|'song'
+      )).toList();
 
       state = state.copyWith(results: results, isLoading: false);
     } catch (e) {
       state = state.copyWith(
-        isLoading: false,
-        error: 'Search failed. Please try again.',
-        results: [],
-      );
+          isLoading: false,
+          error: 'Search failed. Please try again.', 
+          results: []);
     }
   }
+  // ------------------------------------------------------------
 
   void clear() {
     state = const SearchState();

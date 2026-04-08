@@ -1,5 +1,3 @@
-// lib/features/calm_music/data/models/album_model.dart
-
 class AlbumModel {
   final String id;
   final String title;
@@ -21,26 +19,15 @@ class AlbumModel {
 
   factory AlbumModel.fromJson(Map<String, dynamic> json) {
     return AlbumModel(
-      id: json['id']?.toString() ?? '',
-      title: json['title']?.toString() ?? '',
-      artist: json['artist']?.toString(),
-      coverUrl: json['coverUrl']?.toString(),
-      isActive: json['isActive'] as bool? ?? true,
-      trackCount:
-          json['_count']?['songs'] as int? ?? json['trackCount'] as int? ?? 0,
-      createdAt: json['createdAt'] != null
-          ? DateTime.tryParse(json['createdAt'].toString()) ?? DateTime.now()
+      id:         json['id']?.toString() ?? '',
+      title:      json['title']?.toString() ?? '',
+      artist:     json['artist']?.toString(),
+      coverUrl:   json['cover_image_url']?.toString(),  // ← changed
+      isActive:   json['is_active'] as bool? ?? true,
+      trackCount: json['track_count'] as int? ?? 0,     // ← changed
+      createdAt: json['created_at'] != null
+          ? DateTime.tryParse(json['created_at'].toString()) ?? DateTime.now()
           : DateTime.now(),
     );
   }
-
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'artist': artist,
-        'coverUrl': coverUrl,
-        'isActive': isActive,
-        'trackCount': trackCount,
-        'createdAt': createdAt.toIso8601String(),
-      };
 }

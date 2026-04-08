@@ -228,15 +228,15 @@ class _EpisodeTile extends ConsumerWidget {
               icon: const Icon(Icons.download_rounded, size: 20),
               color: AppColors.textTertiary,
               onPressed: () {
-                ref.read(downloadManagerProvider.notifier).startDownload(
-                      mediaId: episode.id,
-                      title: episode.title,
-                      mediaType: 'episode',
-                      partCount: episode.partCount,
-                      artworkUrl: series?.coverUrl,
-                      subtitle: series?.title,
-                    );
-              },
+  ref.read(downloadManagerProvider.notifier).startDownload(
+    mediaId: episode.id,
+    title: episode.title,
+    mediaType: 'episode',
+    partCount: episode.isMultiPart ? 2 : 1, // actual count fetched during download
+    artworkUrl: series?.coverUrl,
+    subtitle: series?.title,
+  );
+},
             )
           else
             const Icon(Icons.check_circle_rounded,
