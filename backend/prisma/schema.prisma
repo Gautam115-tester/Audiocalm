@@ -64,6 +64,19 @@ model Song {
   updatedAt      DateTime @updatedAt
   album          Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
 
-  @@unique([albumId, trackNumber])
+  // NOTE: @@unique([albumId, trackNumber]) was removed.
+  // That constraint caused silent data loss via skipDuplicates when two songs
+  // in the same album had colliding TR## track numbers during sync.
+  // Deduplication is handled in sync.js via telegramFileId + title checks.
   @@map("songs")
+}
+
+// Replaces the ephemeral .sync_state.json file.
+// Render resets the filesystem on every deploy — state must live in the DB.
+model SyncState {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("sync_state")
 }
