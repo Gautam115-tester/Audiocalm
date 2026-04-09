@@ -1,26 +1,27 @@
-// server.js
+// backend/server.js
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
+const express   = require('express');
+const cors      = require('cors');
+const helmet    = require('helmet');
+const morgan    = require('morgan');
 const rateLimit = require('express-rate-limit');
 
-const seriesRoutes    = require('./routes/series');
-const episodesRoutes  = require('./routes/episodes');
-const albumsRoutes    = require('./routes/albums');
-const songsRoutes     = require('./routes/songs');
-const searchRoutes    = require('./routes/search');
-const uploadRoutes    = require('./routes/upload');
-const healthRoutes    = require('./routes/health');
-const syncRoutes      = require('./routes/sync');
+const seriesRoutes   = require('./routes/series');
+const episodesRoutes = require('./routes/episodes');
+const albumsRoutes   = require('./routes/albums');
+const songsRoutes    = require('./routes/songs');
+const searchRoutes   = require('./routes/search');
+const uploadRoutes   = require('./routes/upload');
+const healthRoutes   = require('./routes/health');
+const syncRoutes     = require('./routes/sync');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Trust proxy (Render / any reverse proxy) ──────────────────────────────────
-// Must be set BEFORE rate limiter so express-rate-limit can read the real
-// client IP from X-Forwarded-For without throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+// ── Trust proxy ───────────────────────────────────────────────────────────────
+// MUST come before rate limiter. Render sits behind a reverse proxy that sets
+// X-Forwarded-For. Without this, express-rate-limit throws:
+//   ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.set('trust proxy', 1);
 
 // ── Security & logging ────────────────────────────────────────────────────────
@@ -32,23 +33,23 @@ app.use(express.urlencoded({ extended: true }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS)    || 15 * 60 * 1000,
   max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 300,
   message:  { error: 'Too many requests, please try again later.' },
 });
 app.use('/api/', limiter);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/health',        healthRoutes);
-app.use('/api/series',    seriesRoutes);
-app.use('/api/episodes',  episodesRoutes);
-app.use('/api/albums',    albumsRoutes);
-app.use('/api/songs',     songsRoutes);
-app.use('/api/search',    searchRoutes);
-app.use('/api/upload',    uploadRoutes);
-app.use('/api/sync',      syncRoutes);
+app.use('/health',       healthRoutes);
+app.use('/api/series',   seriesRoutes);
+app.use('/api/episodes', episodesRoutes);
+app.use('/api/albums',   albumsRoutes);
+app.use('/api/songs',    songsRoutes);
+app.use('/api/search',   searchRoutes);
+app.use('/api/upload',   uploadRoutes);
+app.use('/api/sync',     syncRoutes);
 
-// ── 404 handler ───────────────────────────────────────────────────────────────
+// ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });

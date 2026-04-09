@@ -1,69 +1,77 @@
+// prisma/schema.prisma
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
   provider  = "postgresql"
+  // DATABASE_URL  → pooled via Supabase PgBouncer (port 6543)
+  //                 must have ?pgbouncer=true&connection_limit=1
   url       = env("DATABASE_URL")
+  // DIRECT_URL    → direct connection (port 5432), used only for migrations
   directUrl = env("DIRECT_URL")
 }
 
-model Series {
-  id                  String    @id @default(uuid())
-  title               String
-  description         String?
-  coverTelegramFileId String?
-  isActive            Boolean   @default(true)
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
-  episodes            Episode[]
-
-  @@map("series")
-}
-
-model Episode {
-  id             String   @id @default(uuid())
-  seriesId       String
-  episodeNumber  Int
-  title          String
-  telegramFileId String?
-  duration       Int?
-  partCount      Int      @default(1)
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  series         Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
-
-  @@unique([seriesId, episodeNumber])
-  @@map("episodes")
-}
-
+// ── Albums ────────────────────────────────────────────────────────────────────
 model Album {
-  id                  String   @id @default(uuid())
+  id                  String   @id @default(cuid())
   title               String
   artist              String?
   coverTelegramFileId String?
   isActive            Boolean  @default(true)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
+
   songs               Song[]
 
   @@map("albums")
 }
 
+// ── Songs ─────────────────────────────────────────────────────────────────────
 model Song {
-  id             String   @id @default(uuid())
-  albumId        String
-  trackNumber    Int
-  title          String
-  telegramFileId String?
-  duration       Int?
-  partCount      Int      @default(1)
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  album          Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  id              String   @id @default(cuid())
+  albumId         String
+  trackNumber     Int
+  title           String
+  telegramFileId  String   @unique
+  duration        Int?
+  partCount       Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  @@unique([albumId, trackNumber])
+  album           Album    @relation(fields: [albumId], references: [id])
+
   @@map("songs")
+}
+
+// ── Series ────────────────────────────────────────────────────────────────────
+model Series {
+  id                  String    @id @default(cuid())
+  title               String
+  coverTelegramFileId String?
+  isActive            Boolean   @default(true)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  episodes            Episode[]
+
+  @@map("series")
+}
+
+// ── Episodes ──────────────────────────────────────────────────────────────────
+model Episode {
+  id              String   @id @default(cuid())
+  seriesId        String
+  episodeNumber   Int
+  title           String
+  telegramFileId  String   @unique
+  duration        Int?
+  partCount       Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  series          Series   @relation(fields: [seriesId], references: [id])
+
+  @@map("episodes")
 }
