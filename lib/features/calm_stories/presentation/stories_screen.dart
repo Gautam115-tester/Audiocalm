@@ -68,7 +68,8 @@ class StoriesScreen extends ConsumerWidget {
         childAspectRatio: 0.72,
       ),
       itemCount: 6,
-      itemBuilder: (_, __) => const ShimmerBox(height: double.infinity, borderRadius: 16),
+      itemBuilder: (_, __) =>
+          const ShimmerBox(height: double.infinity, borderRadius: 16),
     );
   }
 }
@@ -101,31 +102,35 @@ class _SeriesGridCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            ClipRRect(
-              borderRadius:
-                  const BorderRadius.vertical(top: Radius.circular(16)),
-              child: AspectRatio(
-                aspectRatio: 1,
-                child: CoverImage(
-                  url: coverUrl,
-                  size: double.infinity,
-                  borderRadius: 0,
-                  placeholder: Container(
-                    decoration: const BoxDecoration(
-                      gradient: AppColors.cardGradient,
-                    ),
-                    child: const Center(
-                      child: Icon(Icons.auto_stories_rounded,
-                          size: 40, color: AppColors.textTertiary),
+            // FIX: Expanded so image fills remaining space and text never overflows
+            Expanded(
+              child: ClipRRect(
+                borderRadius:
+                    const BorderRadius.vertical(top: Radius.circular(16)),
+                child: SizedBox.expand(
+                  child: CoverImage(
+                    url: coverUrl,
+                    size: double.infinity,
+                    borderRadius: 0,
+                    placeholder: Container(
+                      decoration: const BoxDecoration(
+                        gradient: AppColors.cardGradient,
+                      ),
+                      child: const Center(
+                        child: Icon(Icons.auto_stories_rounded,
+                            size: 40, color: AppColors.textTertiary),
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
+            // Fixed text section — always has room, never overflows
             Padding(
               padding: const EdgeInsets.all(10),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
                     title,
@@ -140,6 +145,8 @@ class _SeriesGridCard extends StatelessWidget {
                   Text(
                     '$episodeCount episodes',
                     style: Theme.of(context).textTheme.bodySmall,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ],
               ),

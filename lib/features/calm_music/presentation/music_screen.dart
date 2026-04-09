@@ -96,30 +96,35 @@ class _AlbumCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            ClipRRect(
-              borderRadius:
-                  const BorderRadius.vertical(top: Radius.circular(16)),
-              child: AspectRatio(
-                aspectRatio: 1,
-                child: CoverImage(
-                  url: coverUrl,
-                  size: double.infinity,
-                  borderRadius: 0,
-                  placeholder: Container(
-                    decoration: const BoxDecoration(
-                        gradient: AppColors.cardGradient),
-                    child: const Center(
-                      child: Icon(Icons.album_rounded,
-                          size: 48, color: AppColors.textTertiary),
+            // FIX: Use Expanded so the image takes remaining space
+            // and the text section below is never squeezed out of bounds.
+            Expanded(
+              child: ClipRRect(
+                borderRadius:
+                    const BorderRadius.vertical(top: Radius.circular(16)),
+                child: SizedBox.expand(
+                  child: CoverImage(
+                    url: coverUrl,
+                    size: double.infinity,
+                    borderRadius: 0,
+                    placeholder: Container(
+                      decoration: const BoxDecoration(
+                          gradient: AppColors.cardGradient),
+                      child: const Center(
+                        child: Icon(Icons.album_rounded,
+                            size: 48, color: AppColors.textTertiary),
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
+            // Fixed-height text section — never overflows
             Padding(
               padding: const EdgeInsets.all(10),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
                     title,
