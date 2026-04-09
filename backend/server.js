@@ -18,6 +18,9 @@ const syncRoutes      = require('./routes/sync');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// 👇 FIX: Tell Express to trust Render's reverse proxy for rate-limiting
+app.set('trust proxy', 1);
+
 // ── Security & logging ────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(morgan('combined'));
@@ -55,7 +58,8 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+// 👇 FIX: Bind to '0.0.0.0' so Render can detect the open port
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Audio Calm API running on port ${PORT}`);
   console.log(`📡 Health check: http://localhost:${PORT}/health`);
   console.log(`🔄 Sync music:   POST http://localhost:${PORT}/api/sync/music`);
