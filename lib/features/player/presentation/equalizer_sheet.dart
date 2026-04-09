@@ -1,218 +1,377 @@
 // lib/features/player/presentation/equalizer_sheet.dart
+//
+// Bottom sheet equalizer UI for music playback.
+// Shows preset chips + vertical band sliders.
+// Matches the existing AppColors-based theme of the project.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../services/equalizer_service.dart';
-import '../../../core/theme/app_theme.dart';
-import '../../../core/constants/app_constants.dart';
 
-class EqualizerSheet extends ConsumerWidget {
+import '../../../core/theme/app_theme.dart';
+import '../services/equalizer_service.dart';
+
+class EqualizerSheet extends ConsumerStatefulWidget {
   const EqualizerSheet({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final eqState = ref.watch(equalizerServiceProvider);
-    final eqService = ref.read(equalizerServiceProvider.notifier);
+  ConsumerState<EqualizerSheet> createState() => _EqualizerSheetState();
+}
 
-    final bandLabels = ['60Hz', '230Hz', '910Hz', '3.6K', '14K'];
+class _EqualizerSheetState extends ConsumerState<EqualizerSheet> {
+  bool _initializing = false;
 
-    return Container(
-      margin: const EdgeInsets.fromLTRB(0, 0, 0, 0),
-      decoration: const BoxDecoration(
-        color: AppColors.surfaceVariant,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const SizedBox(height: 12),
-          Container(
-            width: 40,
-            height: 4,
-            decoration: BoxDecoration(
-              color: AppColors.textTertiary,
-              borderRadius: BorderRadius.circular(2),
-            ),
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _ensureInitialized());
+  }
+
+  Future<void> _ensureInitialized() async {
+    final eq = ref.read(equalizerProvider);
+    if (!eq.isInitialized && !_initializing) {
+      setState(() => _initializing = true);
+      await ref.read(equalizerProvider.notifier).initialize();
+      if (mounted) setState(() => _initializing = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final eq = ref.watch(equalizerProvider);
+
+    return DraggableScrollableSheet(
+      initialChildSize: 0.72,
+      minChildSize: 0.50,
+      maxChildSize: 0.92,
+      expand: false,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
           ),
-          const SizedBox(height: 16),
-
-          // Header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            child: Row(
-              children: [
-                const Icon(Icons.equalizer_rounded, color: AppColors.primary),
-                const SizedBox(width: 10),
-                Text(
-                  'Equalizer',
-                  style: Theme.of(context).textTheme.headlineSmall,
-                ),
-                const Spacer(),
-                Switch(
-                  value: eqState.enabled,
-                  onChanged: eqService.setEnabled,
-                ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 16),
-
-          // Presets horizontal scroll
-          SizedBox(
-            height: 36,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              itemCount: AppConstants.equalizerPresets.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemBuilder: (context, i) {
-                final preset = AppConstants.equalizerPresets[i];
-                final selected = eqState.presetIndex == i;
-                return GestureDetector(
-                  onTap: () => eqService.applyPreset(i),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: selected
-                          ? AppColors.primary
-                          : AppColors.cardColor,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: selected
-                            ? AppColors.primary
-                            : AppColors.textTertiary.withOpacity(0.3),
-                      ),
-                    ),
-                    child: Text(
-                      preset,
-                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                            color: selected
-                                ? Colors.white
-                                : AppColors.textSecondary,
-                            fontWeight: selected
-                                ? FontWeight.w700
-                                : FontWeight.w400,
-                          ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-
-          const SizedBox(height: 24),
-
-          // Band sliders
-          AbsorbPointer(
-            absorbing: !eqState.enabled,
-            child: AnimatedOpacity(
-              opacity: eqState.enabled ? 1.0 : 0.4,
-              duration: const Duration(milliseconds: 200),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: List.generate(
-                    eqState.bandCount.clamp(0, bandLabels.length),
-                    (i) => Expanded(
-                      child: _BandSlider(
-                        label: i < bandLabels.length ? bandLabels[i] : '?',
-                        value: i < eqState.bands.length ? eqState.bands[i] : 0,
-                        minDb: eqState.minDb,
-                        maxDb: eqState.maxDb,
-                        onChanged: (v) => eqService.setBandDb(i, v),
-                      ),
-                    ),
-                  ),
+          child: Column(
+            children: [
+              // ── Handle ──────────────────────────────────────────────────
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 4),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.textTertiary,
+                  borderRadius: BorderRadius.circular(2),
                 ),
               ),
-            ),
+
+              // ── Header ──────────────────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 8, 16, 4),
+                child: Row(
+                  children: [
+                    const Icon(Icons.equalizer_rounded,
+                        color: AppColors.primary, size: 22),
+                    const SizedBox(width: 10),
+                    Text(
+                      'Equalizer',
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+                    const Spacer(),
+                    if (eq.isInitialized) ...[
+                      Text(
+                        eq.isEnabled ? 'ON' : 'OFF',
+                        style: TextStyle(
+                          color: eq.isEnabled
+                              ? AppColors.primary
+                              : AppColors.textTertiary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Switch(
+                        value: eq.isEnabled,
+                        activeColor: AppColors.primary,
+                        inactiveThumbColor: AppColors.textTertiary,
+                        inactiveTrackColor: AppColors.surfaceVariant,
+                        onChanged: (v) {
+                          if (v) {
+                            // Re-enable with last preset, or fall back to flat
+                            final p = eq.currentPreset == EqualizerPreset.off
+                                ? EqualizerPreset.flat
+                                : eq.currentPreset;
+                            ref
+                                .read(equalizerProvider.notifier)
+                                .applyPresetEnum(p);
+                          } else {
+                            ref
+                                .read(equalizerProvider.notifier)
+                                .applyPresetEnum(EqualizerPreset.off);
+                          }
+                        },
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+
+              const Divider(height: 1),
+
+              // ── Body ─────────────────────────────────────────────────────
+              if (_initializing || !eq.isInitialized)
+                const Expanded(
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(color: AppColors.primary),
+                        SizedBox(height: 16),
+                        Text(
+                          'Initializing equalizer…',
+                          style: TextStyle(
+                              color: AppColors.textSecondary, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              else
+                Expanded(
+                  child: ListView(
+                    controller: scrollController,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 12),
+                    children: [
+                      // Preset chips
+                      _PresetChips(
+                        currentPreset: eq.currentPreset,
+                        isEnabled: eq.isEnabled,
+                        onPreset: (p) => ref
+                            .read(equalizerProvider.notifier)
+                            .applyPresetEnum(p),
+                      ),
+
+                      const SizedBox(height: 24),
+
+                      // Band sliders
+                      if (eq.numberOfBands > 0)
+                        _BandSliders(
+                          eqState: eq,
+                          isEnabled: eq.isEnabled,
+                          // sheet passes millibels → service converts to dB
+                          onBandChanged: (band, levelMb) => ref
+                              .read(equalizerProvider.notifier)
+                              .setBandLevelMillibels(band, levelMb),
+                        )
+                      else
+                        const Center(
+                          child: Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text(
+                              'No equalizer bands available on this device.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  color: AppColors.textTertiary, fontSize: 13),
+                            ),
+                          ),
+                        ),
+
+                      const SizedBox(height: 16),
+
+                      // Range info
+                      Center(
+                        child: Text(
+                          'Range: ${(eq.minLevel / 100).toStringAsFixed(0)} dB '
+                          'to ${(eq.maxLevel / 100).toStringAsFixed(0)} dB',
+                          style: const TextStyle(
+                              color: AppColors.textTertiary, fontSize: 11),
+                        ),
+                      ),
+
+                      const SizedBox(height: 24),
+                    ],
+                  ),
+                ),
+            ],
           ),
-
-          const SizedBox(height: 16),
-
-          // Reset button
-          TextButton.icon(
-            onPressed: eqService.reset,
-            icon: const Icon(Icons.restart_alt_rounded, size: 18),
-            label: const Text('Reset to Flat'),
-            style: TextButton.styleFrom(
-              foregroundColor: AppColors.textSecondary,
-            ),
-          ),
-
-          SizedBox(
-              height: MediaQuery.of(context).padding.bottom +
-                  16),
-        ],
-      ),
+        );
+      },
     );
   }
 }
 
-class _BandSlider extends StatelessWidget {
-  final String label;
-  final double value;
-  final double minDb;
-  final double maxDb;
-  final void Function(double) onChanged;
+// ── Preset chips ──────────────────────────────────────────────────────────────
 
-  const _BandSlider({
-    required this.label,
-    required this.value,
-    required this.minDb,
-    required this.maxDb,
-    required this.onChanged,
+class _PresetChips extends StatelessWidget {
+  final EqualizerPreset currentPreset;
+  final bool isEnabled;
+  final void Function(EqualizerPreset) onPreset;
+
+  const _PresetChips({
+    required this.currentPreset,
+    required this.isEnabled,
+    required this.onPreset,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Text(
-          '${value >= 0 ? '+' : ''}${value.toStringAsFixed(0)}',
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: AppColors.primary,
-                fontSize: 10,
-                fontWeight: FontWeight.w700,
+    // Show all except 'custom' — that's set via manual band drag.
+    final presets =
+        EqualizerPreset.values.where((p) => p != EqualizerPreset.custom).toList();
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: presets.map((preset) {
+        final isSelected = currentPreset == preset &&
+            (isEnabled || preset == EqualizerPreset.off);
+        return GestureDetector(
+          onTap: () => onPreset(preset),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: isSelected ? AppColors.primary : AppColors.cardColor,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: isSelected
+                    ? AppColors.primary
+                    : AppColors.textTertiary.withOpacity(0.3),
+                width: 1.5,
               ),
-        ),
-        const SizedBox(height: 6),
-        SizedBox(
-          height: 140,
-          child: RotatedBox(
-            quarterTurns: 3,
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 4,
-                thumbShape:
-                    const RoundSliderThumbShape(enabledThumbRadius: 6),
-                overlayShape:
-                    const RoundSliderOverlayShape(overlayRadius: 14),
-                activeTrackColor: AppColors.primary,
-                inactiveTrackColor: AppColors.cardColor,
-                thumbColor: Colors.white,
-                overlayColor: AppColors.primary.withOpacity(0.15),
-              ),
-              child: Slider(
-                value: value.clamp(minDb, maxDb),
-                min: minDb,
-                max: maxDb,
-                onChanged: onChanged,
+            ),
+            child: Text(
+              preset.label,
+              style: TextStyle(
+                color: isSelected ? Colors.white : AppColors.textSecondary,
+                fontSize: 12,
+                fontWeight:
+                    isSelected ? FontWeight.w600 : FontWeight.w400,
               ),
             ),
           ),
+        );
+      }).toList(),
+    );
+  }
+}
+
+// ── Band sliders ──────────────────────────────────────────────────────────────
+
+class _BandSliders extends StatelessWidget {
+  final EqualizerState eqState;
+  final bool isEnabled;
+  // levelMillibels is int (sheet sends mB to service)
+  final void Function(int band, int levelMillibels) onBandChanged;
+
+  const _BandSliders({
+    required this.eqState,
+    required this.isEnabled,
+    required this.onBandChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final numBands = eqState.numberOfBands;
+    // Slider works in millibels (int range)
+    final minLevel = eqState.minLevel.toDouble();
+    final maxLevel = eqState.maxLevel.toDouble();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.only(bottom: 12),
+          child: Text(
+            'BANDS',
+            style: TextStyle(
+              color: AppColors.textTertiary,
+              fontSize: 11,
+              letterSpacing: 1.2,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
-        const SizedBox(height: 4),
-        Text(
-          label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                fontSize: 9,
-                color: AppColors.textTertiary,
-              ),
+        SizedBox(
+          height: 220,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: List.generate(numBands, (bandIdx) {
+              // bandLevels stores dB; convert to mB for the slider
+              final levelDb = bandIdx < eqState.bandLevels.length
+                  ? eqState.bandLevels[bandIdx]
+                  : 0.0;
+              final levelMb = (levelDb * 100).round().toDouble();
+              final freqLabel = eqState.freqLabel(bandIdx);
+              // Display label in dB
+              final dbLabel = levelDb.toStringAsFixed(1);
+
+              return Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: Column(
+                    children: [
+                      // dB label at top
+                      Text(
+                        '${levelDb >= 0 ? '+' : ''}$dbLabel',
+                        style: TextStyle(
+                          color: isEnabled
+                              ? AppColors.primary
+                              : AppColors.textTertiary,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      // Vertical slider (rotated)
+                      Expanded(
+                        child: RotatedBox(
+                          quarterTurns: 3,
+                          child: SliderTheme(
+                            data: SliderThemeData(
+                              trackHeight: 3,
+                              activeTrackColor: isEnabled
+                                  ? AppColors.primary
+                                  : AppColors.textTertiary,
+                              inactiveTrackColor: AppColors.surfaceVariant,
+                              thumbColor: isEnabled
+                                  ? Colors.white
+                                  : AppColors.textTertiary,
+                              overlayColor:
+                                  AppColors.primary.withOpacity(0.2),
+                              thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 7),
+                            ),
+                            child: Slider(
+                              value: levelMb.clamp(minLevel, maxLevel),
+                              min: minLevel,
+                              max: maxLevel,
+                              divisions:
+                                  ((maxLevel - minLevel) / 100).round(),
+                              onChanged: isEnabled
+                                  ? (v) =>
+                                      onBandChanged(bandIdx, v.round())
+                                  : null,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      // Frequency label at bottom
+                      Text(
+                        freqLabel,
+                        style: const TextStyle(
+                          color: AppColors.textTertiary,
+                          fontSize: 9,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ),
         ),
       ],
     );
