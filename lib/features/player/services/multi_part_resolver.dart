@@ -3,14 +3,13 @@
 // Helpers for building just_audio sources from multi-part audio files.
 // Stateless — no network calls; just source construction and position maths.
 
-import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
 /// A single audio part with its stream URL and optional duration hint.
 class AudioPart {
-  final String partId;        // e.g. "episode-id_part01"
+  final String partId; // e.g. "episode-id_part01"
   final String streamUrl;
   final Duration? knownDuration;
 
@@ -132,10 +131,15 @@ class MultiPartResolver {
       );
     }
 
+    // Only compute total if ALL parts have a known duration.
     Duration? total;
     if (parts.every((p) => p.knownDuration != null)) {
-      total = parts.fold(
-          Duration.zero, (acc, p) => acc + p.knownDuration!);
+      // Explicit typed accumulator avoids the Duration? inference issue.
+      Duration sum = Duration.zero;
+      for (final p in parts) {
+        sum += p.knownDuration!; // safe: guarded by every() check above
+      }
+      total = sum;
     }
 
     return ResolvedAudioSource(
@@ -154,13 +158,20 @@ class MultiPartResolver {
 class MultiPartPositionTracker {
   final List<Duration> _partDurations;
 
-  MultiPartPositionTracker(this._partDurations);
+  MultiPartPositionTracker(this._partDurations)
+      : assert(_partDurations.isNotEmpty, 'partDurations must not be empty');
 
   /// Total duration across all parts.
-  Duration get totalDuration => _partDurations.fold(
-        Duration.zero,
-        (acc, d) => acc + d,
-      );
+  /// FIX: use an explicit typed accumulator so Dart does not widen the
+  /// inferred type to Duration? and then complain that '+' may be called
+  /// on null.
+  Duration get totalDuration {
+    Duration sum = Duration.zero; // typed as Duration, not Duration?
+    for (final d in _partDurations) {
+      sum += d;
+    }
+    return sum;
+  }
 
   /// Offset (start time) of a given part index in the unified timeline.
   Duration offsetForPart(int partIndex) {
@@ -180,7 +191,7 @@ class MultiPartPositionTracker {
       }
       remaining -= _partDurations[i];
     }
-    // Clamp to end of last part
+    // Clamp to end of last part.
     return (
       partIndex: _partDurations.length - 1,
       positionInPart: _partDurations.last,
