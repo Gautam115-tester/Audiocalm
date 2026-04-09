@@ -74,7 +74,7 @@ router.post('/music', async (req, res) => {
 
       // Extract track number from filename e.g. TR02 → 2
       const trackMatch = audio.file_name?.match(/TR(\d+)/i);
-      const trackNumber = trackMatch ? parseInt(trackMatch[1]) : null;
+      const extractedTrackNumber = trackMatch ? parseInt(trackMatch[1]) : null;
 
       // Use our new robust helper to get the exact album name
       const albumName = extractAndCleanAlbumName(audio.file_name, performer);
@@ -101,14 +101,41 @@ router.post('/music', async (req, res) => {
         continue; 
       }
 
-      // Create song linked to the correct album
-      // We calculate trackNumber fallback accurately based on current DB count
-      const fallbackTrackNum = (await prisma.song.count({ where: { albumId: album.id } })) + 1;
+      // --- THE CRITICAL FIX: Safe Track Number Generation ---
+      let finalTrackNumber = extractedTrackNumber;
 
+      // 1. Find the absolute highest track number currently in the album
+      const maxTrackResult = await prisma.song.aggregate({
+        where: { albumId: album.id },
+        _max: { trackNumber: true }
+      });
+      const maxCurrentTrack = maxTrackResult._max.trackNumber || 0;
+
+      if (!finalTrackNumber) {
+        // 2. If no TR tag is found in filename, just add to the end of the album
+        finalTrackNumber = maxCurrentTrack + 1;
+      } else {
+        // 3. If TR tag IS found, verify that it isn't already taken
+        const trackExists = await prisma.song.findUnique({
+          where: { 
+            albumId_trackNumber: { 
+              albumId: album.id, 
+              trackNumber: finalTrackNumber 
+            } 
+          }
+        });
+        
+        // If it is taken (e.g., duplicate TR numbers in Telegram files), push it to the end
+        if (trackExists) {
+          finalTrackNumber = maxCurrentTrack + 1;
+        }
+      }
+
+      // Create song safely
       await prisma.song.create({
         data: {
           albumId:        album.id,
-          trackNumber:    trackNumber || fallbackTrackNum,
+          trackNumber:    finalTrackNumber,
           title:          title,
           telegramFileId: fileId,
           duration:       duration,
@@ -117,7 +144,7 @@ router.post('/music', async (req, res) => {
       });
 
       created++;
-      console.log(`🎵 Saved: ${title} -> Album: ${albumName}`);
+      console.log(`🎵 Saved: ${title} -> Album: ${albumName} (Track: ${finalTrackNumber})`);
     }
 
     res.json({ message: 'Music sync complete', created, skipped });
@@ -156,7 +183,6 @@ router.post('/covers', async (req, res) => {
 
       if (albumMatch) {
         // Clean the caption name just like we clean the audio filenames
-        // so "COVER_ALBUM:Befikre (Original Motion Picture Soundtrack)" matches "Befikre"
         let name = albumMatch[1].replace(/\([^)]*\)/g, '').trim();
         
         const album = await prisma.album.findFirst({
