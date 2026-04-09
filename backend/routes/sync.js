@@ -10,7 +10,7 @@ router.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
@@ -26,13 +26,12 @@ async function fetchUpdates(offset = 0) {
 }
 
 // ── Normalize album name ───────────────────────────────────────────────────
-// Strips common noise suffixes so "Befikre" and
-// "Befikre (Original Motion Picture Soundtrack)" resolve to the same album.
 function normalizeAlbumName(name) {
+  if (!name) return '';
   return name
-    .replace(/\s*[\(\[].*?[\)\]]/g, '')   // remove anything in () or []
-    .replace(/\boriginal\b.*$/gi, '')      // remove trailing "original ..."
-    .replace(/\bsoundtrack\b.*$/gi, '')    // remove trailing "soundtrack ..."
+    .replace(/\s*[\(\[].*?[\)\]]/g, '')
+    .replace(/\boriginal\b.*$/gi, '')
+    .replace(/\bsoundtrack\b.*$/gi, '')
     .replace(/\bost\b/gi, '')
     .replace(/_/g, ' ')
     .replace(/\s+/g, ' ')
@@ -41,43 +40,25 @@ function normalizeAlbumName(name) {
 }
 
 // ── Extract album name from audio message ──────────────────────────────────
-// Priority order:
-//   1. audio.album  — Telegram metadata field (most reliable, set by ID3 tag)
-//   2. filename prefix before _TR or _EP
-//   3. fallback: performer
-//
-// This prevents the bug where "You and Me" got "Vishal & Shekhar..." as album
-// because the filename regex didn't match and performer was used as album name.
 function extractAlbumName(audio) {
-  // 1. Use Telegram's built-in album metadata if present
   if (audio.album && audio.album.trim().length > 0) {
     return audio.album.trim();
   }
 
-  // 2. Parse filename — match everything before _TR\d or _EP\d
-  //    e.g. "Befikre_TR04_You_And_Me.mp3" → "Befikre"
-  //    e.g. "Befikre_Original_Motion_Picture_Soundtrack_TR04_You_And_Me.mp3" → "Befikre"
   const fileName = audio.file_name || '';
-
-  // Strip extension first
   const baseName = fileName.replace(/\.[^.]+$/, '');
 
-  // Match prefix before _TR or _EP (case insensitive)
   const trackMatch = baseName.match(/^(.+?)_(?:TR|EP)\d+/i);
   if (trackMatch) {
     const raw = trackMatch[1].replace(/_/g, ' ').trim();
-    // Title-case each word
     return raw
       .split(' ')
       .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
       .join(' ');
   }
 
-  // 3. Try a broader prefix match: take everything before the last segment
-  //    that looks like a song title (starts with uppercase after underscore)
   const parts = baseName.split('_');
   if (parts.length > 2) {
-    // heuristic: album is likely the first 1-3 segments
     const candidate = parts.slice(0, 2).join(' ').trim();
     if (candidate.length > 0 && candidate.length < 60) {
       return candidate
@@ -87,23 +68,21 @@ function extractAlbumName(audio) {
     }
   }
 
-  // 4. Absolute fallback — use performer but warn
   console.warn(`  ⚠️  Could not extract album from filename "${fileName}", using performer`);
   return audio.performer || 'Unknown Album';
 }
 
-// ── Find existing album by normalized name ─────────────────────────────────
-async function findAlbumByNormalizedName(rawName) {
-  const normalized = normalizeAlbumName(rawName);
-  if (!normalized) return null;
-  const all = await prisma.album.findMany({ where: { isActive: true } });
-  return all.find(a => normalizeAlbumName(a.title) === normalized) || null;
-}
-
 // ── POST /api/sync/music ───────────────────────────────────────────────────
+// FIX: fetch all active albums ONCE before the loop instead of once per track.
+// This eliminates the repeated `findMany` calls that caused the
+// "prepared statement already exists" (42P05) Postgres error.
 router.post('/music', async (req, res) => {
   try {
     const updates = await fetchUpdates();
+
+    // Fetch all active albums once — used for in-memory normalized-name lookup
+    const allAlbums = await prisma.album.findMany({ where: { isActive: true } });
+
     let created = 0;
     let skipped = 0;
 
@@ -120,28 +99,28 @@ router.post('/music', async (req, res) => {
       const fileId    = audio.file_id;
       const duration  = audio.duration;
 
-      // Extract track number from filename e.g. _TR02_ → 2
       const trackMatch  = (audio.file_name || '').match(/_?TR(\d+)_?/i);
       const trackNumber = trackMatch ? parseInt(trackMatch[1]) : null;
 
-      // Extract album name — this is the key fix
       const rawAlbumName = extractAlbumName(audio);
+      const normalized   = normalizeAlbumName(rawAlbumName);
 
-      // Find or create album using normalized name to prevent duplicates
-      let album = await findAlbumByNormalizedName(rawAlbumName);
+      // In-memory lookup — no DB hit per track
+      let album = allAlbums.find(a => normalizeAlbumName(a.title) === normalized) || null;
 
       if (!album) {
         album = await prisma.album.create({
           data: { title: rawAlbumName, artist: performer },
         });
+        allAlbums.push(album); // keep local cache up-to-date for remaining iterations
         console.log(`✅ Created album: "${rawAlbumName}"`);
       } else {
-        // Update artist if album exists but has no artist yet
         if (!album.artist && performer !== 'Unknown') {
           await prisma.album.update({
             where: { id: album.id },
             data:  { artist: performer },
           });
+          album.artist = performer; // keep local copy in sync
         }
       }
 
@@ -189,15 +168,23 @@ router.post('/covers', async (req, res) => {
       const photos  = post.photo;
       if (!photos || photos.length === 0) continue;
 
-      const bestPhoto = photos[photos.length - 1]; // highest resolution
+      const bestPhoto = photos[photos.length - 1];
       const fileId    = bestPhoto.file_id;
 
       const albumMatch  = caption.match(/COVER_ALBUM:(.+)/i);
       const seriesMatch = caption.match(/COVER_SERIES:(.+)/i);
 
       if (albumMatch) {
-        const name  = albumMatch[1].trim();
-        const album = await findAlbumByNormalizedName(name);
+        const name       = albumMatch[1].trim();
+        const normalized = normalizeAlbumName(name);
+        const album      = await prisma.album.findFirst({
+          where: { isActive: true },
+        }).then(async () => {
+          // Inline normalized lookup
+          const all = await prisma.album.findMany({ where: { isActive: true } });
+          return all.find(a => normalizeAlbumName(a.title) === normalized) || null;
+        });
+
         if (album) {
           await prisma.album.update({
             where: { id: album.id },
@@ -236,13 +223,10 @@ router.post('/covers', async (req, res) => {
 });
 
 // ── POST /api/sync/merge-albums ────────────────────────────────────────────
-// One-time utility: merges duplicate albums with the same normalized name.
-// Call once from Postman or dashboard to fix existing DB duplicates.
 router.post('/merge-albums', async (req, res) => {
   try {
     const albums = await prisma.album.findMany({ orderBy: { createdAt: 'asc' } });
 
-    // Group by normalized name
     const groups = {};
     for (const album of albums) {
       const key = normalizeAlbumName(album.title);
@@ -257,14 +241,13 @@ router.post('/merge-albums', async (req, res) => {
     for (const [, group] of Object.entries(groups)) {
       if (group.length <= 1) continue;
 
-      const keeper     = group[0]; // oldest = keeper
+      const keeper     = group[0];
       const duplicates = group.slice(1);
 
       for (const dup of duplicates) {
         const songs = await prisma.song.findMany({ where: { albumId: dup.id } });
 
         for (const song of songs) {
-          // Resolve trackNumber conflicts
           const conflict = await prisma.song.findFirst({
             where: { albumId: keeper.id, trackNumber: song.trackNumber },
           });
@@ -286,7 +269,6 @@ router.post('/merge-albums', async (req, res) => {
           }
         }
 
-        // Copy cover if keeper has none
         if (!keeper.coverTelegramFileId && dup.coverTelegramFileId) {
           await prisma.album.update({
             where: { id: keeper.id },
@@ -295,7 +277,6 @@ router.post('/merge-albums', async (req, res) => {
           keeper.coverTelegramFileId = dup.coverTelegramFileId;
         }
 
-        // Copy artist if keeper has none
         if (!keeper.artist && dup.artist) {
           await prisma.album.update({
             where: { id: keeper.id },

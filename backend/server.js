@@ -18,6 +18,11 @@ const syncRoutes      = require('./routes/sync');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ── Trust proxy (Render / any reverse proxy) ──────────────────────────────────
+// Must be set BEFORE rate limiter so express-rate-limit can read the real
+// client IP from X-Forwarded-For without throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // ── Security & logging ────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(morgan('combined'));
