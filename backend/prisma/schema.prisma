@@ -26,6 +26,7 @@ model Episode {
   seriesId       String
   episodeNumber  Int
   title          String
+  description    String?
   telegramFileId String?
   duration       Int?
   partCount      Int      @default(1)
@@ -42,6 +43,9 @@ model Album {
   id                  String   @id @default(uuid())
   title               String
   artist              String?
+  genre               String?
+  releaseYear         Int?
+  description         String?
   coverTelegramFileId String?
   isActive            Boolean  @default(true)
   createdAt           DateTime @default(now())
@@ -56,6 +60,7 @@ model Song {
   albumId        String
   trackNumber    Int
   title          String
+  artist         String?
   telegramFileId String?
   duration       Int?
   partCount      Int      @default(1)
@@ -64,15 +69,12 @@ model Song {
   updatedAt      DateTime @updatedAt
   album          Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
 
-  // NOTE: @@unique([albumId, trackNumber]) was removed.
-  // That constraint caused silent data loss via skipDuplicates when two songs
-  // in the same album had colliding TR## track numbers during sync.
-  // Deduplication is handled in sync.js via telegramFileId + title checks.
+  // Deduplication handled in sync.js — no unique constraint on trackNumber
+  // to prevent silent data loss via skipDuplicates on track number collisions.
   @@map("songs")
 }
 
-// Replaces the ephemeral .sync_state.json file.
-// Render resets the filesystem on every deploy — state must live in the DB.
+// Persists sync cursor across Render deploys (filesystem resets on each deploy).
 model SyncState {
   key       String   @id
   value     String

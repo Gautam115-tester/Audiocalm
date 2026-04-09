@@ -1,194 +1,255 @@
 // services/telegram.js
+// Unified Telegram service:
+//   - File URL resolution with NodeCache (45-min TTL, auto-refresh on 401/403)
+//   - Proxy streaming with Range header support (seek support for Android)
+//   - File download / upload helpers
+//   - Cover URL helper used by routes
+
 const axios = require('axios');
+const NodeCache = require('node-cache');
 
 const BOT_TOKEN          = process.env.TELEGRAM_BOT_TOKEN;
 const STORIES_CHANNEL_ID = process.env.TELEGRAM_STORIES_CHANNEL_ID;
 const MUSIC_CHANNEL_ID   = process.env.TELEGRAM_MUSIC_CHANNEL_ID;
 const COVERS_CHANNEL_ID  = process.env.TELEGRAM_COVERS_CHANNEL_ID;
 
-const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+if (!BOT_TOKEN) {
+  console.error('❌  TELEGRAM_BOT_TOKEN is missing — set it in .env');
+  if (process.env.NODE_ENV === 'production') process.exit(1);
+}
+
+const TELEGRAM_API      = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${BOT_TOKEN}`;
 
-// ── Validate config on startup ────────────────────────────────────────────────
-if (!BOT_TOKEN) {
-  console.error('❌ TELEGRAM_BOT_TOKEN is missing from .env');
-  process.exit(1);
-}
+// Cache file URLs for 45 min. Telegram signed URLs typically expire in ~1 h,
+// so 45 min gives a comfortable buffer before expiry.
+const FILE_URL_TTL = 2700; // seconds
+const urlCache = new NodeCache({ stdTTL: FILE_URL_TTL, checkperiod: 300 });
 
-// ── Get file download URL from Telegram ──────────────────────────────────────
+const tgApi = axios.create({
+  baseURL: TELEGRAM_API,
+  timeout: 30_000,
+});
+
+// ── getFileUrl ────────────────────────────────────────────────────────────────
+// Resolves a Telegram file_id → temporary download URL.
+// Result is cached 45 min to reduce Telegram API calls.
 async function getFileUrl(telegramFileId) {
+  if (!telegramFileId) throw new Error('telegramFileId is required');
+
+  const cacheKey = `url:${telegramFileId}`;
+  const cached   = urlCache.get(cacheKey);
+  if (cached) return cached;
+
   try {
-    const response = await axios.get(`${TELEGRAM_API}/getFile`, {
-      params: { file_id: telegramFileId },
-    });
+    const res = await tgApi.get('/getFile', { params: { file_id: telegramFileId } });
+    if (!res.data.ok) throw new Error(`Telegram getFile: ${res.data.description}`);
 
-    if (!response.data.ok) {
-      throw new Error(`Telegram getFile failed: ${response.data.description}`);
-    }
+    const filePath = res.data.result?.file_path;
+    if (!filePath) throw new Error('getFile returned empty file_path');
 
-    const filePath = response.data.result.file_path;
-    return `${TELEGRAM_FILE_API}/${filePath}`;
+    const url = `${TELEGRAM_FILE_API}/${filePath}`;
+    urlCache.set(cacheKey, url);
+    return url;
   } catch (err) {
-    console.error('❌ getFileUrl error:', err.message);
+    if (err.response) {
+      const s = err.response.status;
+      const d = err.response.data;
+      if (s === 400 && d?.description?.toLowerCase().includes('file is too big')) {
+        throw Object.assign(new Error('FILE_TOO_LARGE'), { code: 'FILE_TOO_LARGE' });
+      }
+      throw new Error(`Telegram API HTTP ${s}: ${JSON.stringify(d)}`);
+    }
     throw err;
   }
 }
 
-// ── Stream audio file from Telegram to Flutter ────────────────────────────────
-// Used for: /api/songs/:id/stream  and  /api/episodes/:id/stream
-async function streamFile(telegramFileId, res, rangeHeader = null) {
+// ── proxyStream ───────────────────────────────────────────────────────────────
+// Proxies a Telegram audio file to the HTTP response.
+// Forwards Range headers → Android just_audio can seek without re-downloading.
+// Auto-refreshes the URL on 401/403 (expired signed URL).
+async function proxyStream(telegramFileId, req, res) {
+  // Resolve URL (cached)
+  let url;
   try {
-    const fileUrl = await getFileUrl(telegramFileId);
-
-    const headers = {};
-    if (rangeHeader) {
-      headers['Range'] = rangeHeader;
+    url = await getFileUrl(telegramFileId);
+  } catch (err) {
+    if (!res.headersSent) {
+      if (err.code === 'FILE_TOO_LARGE') {
+        return res.status(503).json({
+          error: 'File exceeds Telegram Bot API 20 MB limit.',
+          hint:  'Split into <20 MB parts named _part01, _part02 and re-upload.',
+          code:  'FILE_TOO_LARGE',
+        });
+      }
+      return res.status(503).json({ error: `Cannot resolve file: ${err.message}` });
     }
+    return;
+  }
 
-    const telegramResponse = await axios.get(fileUrl, {
-      responseType: 'stream',
-      headers,
+  const rangeHeader = req.headers['range'];
+  const upstreamHeaders = {
+    'User-Agent': 'Mozilla/5.0 (compatible; AudioCalmProxy/2.0)',
+    Accept: '*/*',
+    ...(rangeHeader ? { Range: rangeHeader } : {}),
+  };
+
+  const fetchUpstream = (targetUrl) =>
+    axios.get(targetUrl, {
+      responseType:     'stream',
+      timeout:          120_000,
+      headers:          upstreamHeaders,
+      validateStatus:   (s) => s >= 200 && s < 300,
+      maxContentLength: 500 * 1024 * 1024,
+      maxBodyLength:    500 * 1024 * 1024,
     });
 
-    // Forward content headers to Flutter
-    res.set('Content-Type', telegramResponse.headers['content-type'] || 'audio/mpeg');
-    res.set('Accept-Ranges', 'bytes');
-
-    if (telegramResponse.headers['content-length']) {
-      res.set('Content-Length', telegramResponse.headers['content-length']);
-    }
-    if (telegramResponse.headers['content-range']) {
-      res.set('Content-Range', telegramResponse.headers['content-range']);
-      res.status(206); // Partial Content
-    } else {
-      res.status(200);
-    }
-
-    telegramResponse.data.pipe(res);
+  let tgRes;
+  try {
+    tgRes = await fetchUpstream(url);
   } catch (err) {
-    console.error('❌ streamFile error:', err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to stream file from Telegram' });
+    const status = err.response?.status;
+    if (status === 401 || status === 403) {
+      // Signed URL expired — delete from cache and retry once
+      urlCache.del(`url:${telegramFileId}`);
+      try {
+        const freshUrl = await getFileUrl(telegramFileId);
+        tgRes = await fetchUpstream(freshUrl);
+      } catch (retryErr) {
+        if (!res.headersSent)
+          res.status(502).json({ error: `Upstream retry failed: ${retryErr.message}` });
+        return;
+      }
+    } else {
+      if (!res.headersSent)
+        res.status(502).json({ error: `Upstream error: ${err.message}` });
+      return;
     }
   }
+
+  // Forward headers
+  const ct = tgRes.headers['content-type'] || 'audio/mpeg';
+  res.setHeader('Content-Type',                ct);
+  res.setHeader('Accept-Ranges',               tgRes.headers['accept-ranges'] || 'bytes');
+  res.setHeader('Cache-Control',               'public, max-age=3600');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers',
+    'Content-Length, Content-Range, Accept-Ranges, Content-Type');
+
+  if (tgRes.headers['content-length'])  res.setHeader('Content-Length',  tgRes.headers['content-length']);
+  if (tgRes.headers['content-range'])   res.setHeader('Content-Range',   tgRes.headers['content-range']);
+
+  const httpStatus = tgRes.status === 206 ? 206 : 200;
+  res.status(httpStatus);
+
+  console.log(
+    `[PROXY] ${httpStatus} | ${ct} | ` +
+    `${tgRes.headers['content-length'] || '?'} bytes | ` +
+    `Range: ${rangeHeader || 'none'}`
+  );
+
+  // Clean up upstream stream if client disconnects early
+  const destroy = () => { if (!tgRes.data.destroyed) tgRes.data.destroy(); };
+  req.on('close',   destroy);
+  req.on('aborted', destroy);
+
+  tgRes.data.on('error', (e) => {
+    console.error('[PROXY] stream error:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream stream error' });
+    else res.destroy();
+  });
+
+  tgRes.data.pipe(res);
 }
 
-// ── Download full file buffer from Telegram ───────────────────────────────────
-// Used for: /api/songs/:id/download  and  /api/episodes/:id/download
-async function downloadFile(telegramFileId, res) {
+// ── downloadFile ──────────────────────────────────────────────────────────────
+// For the /download endpoint — streams the full file with attachment headers.
+async function downloadFile(telegramFileId, req, res) {
   try {
-    const fileUrl = await getFileUrl(telegramFileId);
+    const url    = await getFileUrl(telegramFileId);
+    const tgRes  = await axios.get(url, { responseType: 'stream' });
 
-    const telegramResponse = await axios.get(fileUrl, {
-      responseType: 'stream',
-    });
-
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Content-Disposition', 'attachment');
-
-    if (telegramResponse.headers['content-length']) {
-      res.set('Content-Length', telegramResponse.headers['content-length']);
-    }
+    res.setHeader('Content-Type',        tgRes.headers['content-type'] || 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment');
+    if (tgRes.headers['content-length'])
+      res.setHeader('Content-Length', tgRes.headers['content-length']);
 
     res.status(200);
-    telegramResponse.data.pipe(res);
+    tgRes.data.pipe(res);
   } catch (err) {
-    console.error('❌ downloadFile error:', err.message);
-    if (!res.headersSent) {
+    console.error('downloadFile error:', err.message);
+    if (!res.headersSent)
       res.status(500).json({ error: 'Failed to download file from Telegram' });
-    }
   }
 }
 
-// ── Upload audio file to a Telegram channel ───────────────────────────────────
-// Returns the telegramFileId to store in your database
-async function uploadAudio(filePath, channelId, caption = '') {
-  try {
-    const FormData = require('form-data');
-    const fs = require('fs');
-
-    const form = new FormData();
-    form.append('chat_id', channelId);
-    form.append('audio', fs.createReadStream(filePath));
-    if (caption) form.append('caption', caption);
-
-    const response = await axios.post(`${TELEGRAM_API}/sendAudio`, form, {
-      headers: form.getHeaders(),
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    });
-
-    if (!response.data.ok) {
-      throw new Error(`Telegram upload failed: ${response.data.description}`);
-    }
-
-    const audio = response.data.result.audio;
-    return {
-      telegramFileId: audio.file_id,
-      duration: audio.duration,       // seconds
-      fileSize: audio.file_size,
-    };
-  } catch (err) {
-    console.error('❌ uploadAudio error:', err.message);
-    throw err;
-  }
-}
-
-// ── Upload cover image to a Telegram channel ──────────────────────────────────
-// Returns the telegramFileId for the cover photo
-async function uploadPhoto(filePath, channelId, caption = '') {
-  try {
-    const FormData = require('form-data');
-    const fs = require('fs');
-
-    const form = new FormData();
-    form.append('chat_id', channelId);
-    form.append('photo', fs.createReadStream(filePath));
-    if (caption) form.append('caption', caption);
-
-    const response = await axios.post(`${TELEGRAM_API}/sendPhoto`, form, {
-      headers: form.getHeaders(),
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    });
-
-    if (!response.data.ok) {
-      throw new Error(`Telegram photo upload failed: ${response.data.description}`);
-    }
-
-    // Get the highest resolution version
-    const photos = response.data.result.photo;
-    const bestPhoto = photos[photos.length - 1];
-
-    return {
-      telegramFileId: bestPhoto.file_id,
-    };
-  } catch (err) {
-    console.error('❌ uploadPhoto error:', err.message);
-    throw err;
-  }
-}
-
-const cache = new Map();
-// ── Build a public cover URL ──────────────────────────────────────────────────
-// Flutter uses this as coverUrl in AlbumModel / SeriesModel
+// ── getCoverUrl ───────────────────────────────────────────────────────────────
+// Returns a fresh (cached) Telegram URL for a cover image.
+// Returns null if fileId is falsy or getFileUrl fails (never throws).
 async function getCoverUrl(telegramFileId) {
   if (!telegramFileId) return null;
-  const cached = cache.get(telegramFileId);
-  if (cached && Date.now() < cached.expiry) return cached.url;
   try {
-    const url = await getFileUrl(telegramFileId);
-    cache.set(telegramFileId, { url, expiry: Date.now() + (parseInt(process.env.CACHE_TTL_SECONDS) || 3000) * 1000 });
-    return url;
-  } catch { return null; }
+    return await getFileUrl(telegramFileId);
+  } catch (err) {
+    console.warn(`[telegram] getCoverUrl failed (${telegramFileId?.slice(0, 15)}…): ${err.message}`);
+    return null;
+  }
 }
+
+// ── uploadAudio ───────────────────────────────────────────────────────────────
+async function uploadAudio(filePath, channelId, caption = '') {
+  const FormData = require('form-data');
+  const fs       = require('fs');
+
+  const form = new FormData();
+  form.append('chat_id', channelId);
+  form.append('audio',   fs.createReadStream(filePath));
+  if (caption) form.append('caption', caption);
+
+  const res = await axios.post(`${TELEGRAM_API}/sendAudio`, form, {
+    headers:          form.getHeaders(),
+    maxContentLength: Infinity,
+    maxBodyLength:    Infinity,
+    timeout:          300_000,
+  });
+
+  if (!res.data.ok) throw new Error(`Telegram sendAudio: ${res.data.description}`);
+
+  const audio = res.data.result.audio;
+  return { telegramFileId: audio.file_id, duration: audio.duration, fileSize: audio.file_size };
+}
+
+// ── uploadPhoto ───────────────────────────────────────────────────────────────
+async function uploadPhoto(filePath, channelId, caption = '') {
+  const FormData = require('form-data');
+  const fs       = require('fs');
+
+  const form = new FormData();
+  form.append('chat_id', channelId);
+  form.append('photo',   fs.createReadStream(filePath));
+  if (caption) form.append('caption', caption);
+
+  const res = await axios.post(`${TELEGRAM_API}/sendPhoto`, form, {
+    headers:          form.getHeaders(),
+    maxContentLength: Infinity,
+    maxBodyLength:    Infinity,
+    timeout:          120_000,
+  });
+
+  if (!res.data.ok) throw new Error(`Telegram sendPhoto: ${res.data.description}`);
+
+  const photos    = res.data.result.photo;
+  const bestPhoto = photos[photos.length - 1]; // highest resolution
+  return { telegramFileId: bestPhoto.file_id };
+}
+
 module.exports = {
-  streamFile,
+  getFileUrl,
+  getCoverUrl,
+  proxyStream,
   downloadFile,
   uploadAudio,
   uploadPhoto,
-  getCoverUrl,
-  getFileUrl,
   STORIES_CHANNEL_ID,
   MUSIC_CHANNEL_ID,
   COVERS_CHANNEL_ID,

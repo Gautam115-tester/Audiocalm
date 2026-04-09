@@ -1,104 +1,82 @@
 // routes/search.js
-const express = require('express');
-const router  = express.Router();
-const prisma  = require('../services/db');
+const express  = require('express');
+const router   = express.Router();
+const prisma   = require('../services/db');
 const telegram = require('../services/telegram');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/search?q=keyword
-// Full-text search across series, albums, episodes, songs
-// Used by Flutter SearchScreen
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/', async (req, res) => {
+// ── GET /api/search?q=keyword ─────────────────────────────────────────────────
+router.get('/', async (req, res, next) => {
   try {
-    const query = req.query.q?.toString().trim();
-
-    if (!query || query.length < 2) {
+    const query = req.query.q?.toString().trim() || '';
+    if (query.length < 2)
       return res.status(400).json({ error: 'Query must be at least 2 characters' });
-    }
 
-    const searchTerm = query.toLowerCase();
+    const term = { contains: query, mode: 'insensitive' };
 
-    // Run all searches in parallel
-    const [series, albums, episodes, songs] = await Promise.all([
-
+    const [seriesList, albumList, episodeList, songList] = await Promise.all([
       prisma.series.findMany({
-        where: {
-          isActive: true,
-          title: { contains: searchTerm, mode: 'insensitive' },
-        },
+        where:   { isActive: true, title: term },
         include: { _count: { select: { episodes: true } } },
         take: 10,
       }),
-
       prisma.album.findMany({
-        where: {
-          isActive: true,
-          OR: [
-            { title:  { contains: searchTerm, mode: 'insensitive' } },
-            { artist: { contains: searchTerm, mode: 'insensitive' } },
-          ],
-        },
+        where:   { isActive: true, OR: [{ title: term }, { artist: term }] },
         include: { _count: { select: { songs: true } } },
         take: 10,
       }),
-
       prisma.episode.findMany({
-        where: {
-          isActive: true,
-          title: { contains: searchTerm, mode: 'insensitive' },
-        },
+        where:   { isActive: true, title: term },
+        include: { series: { select: { id: true, title: true } } },
         take: 10,
       }),
-
       prisma.song.findMany({
-        where: {
-          isActive: true,
-          title: { contains: searchTerm, mode: 'insensitive' },
-        },
+        where:   { isActive: true, OR: [{ title: term }, { artist: term }] },
+        include: { album: { select: { id: true, title: true } } },
         take: 10,
       }),
-
     ]);
 
-    // Attach cover URLs to series and albums
-    const seriesWithCovers = await Promise.all(
-      series.map(async (s) => ({
+    const [seriesWithCovers, albumsWithCovers] = await Promise.all([
+      Promise.all(seriesList.map(async (s) => ({
         id:           s.id,
+        type:         'series',
         title:        s.title,
         coverUrl:     await telegram.getCoverUrl(s.coverTelegramFileId),
         episodeCount: s._count.episodes,
-      }))
-    );
-
-    const albumsWithCovers = await Promise.all(
-      albums.map(async (a) => ({
+      }))),
+      Promise.all(albumList.map(async (a) => ({
         id:         a.id,
+        type:       'album',
         title:      a.title,
         artist:     a.artist,
         coverUrl:   await telegram.getCoverUrl(a.coverTelegramFileId),
         trackCount: a._count.songs,
-      }))
-    );
+      }))),
+    ]);
 
     res.json({
-      series:   seriesWithCovers,
-      albums:   albumsWithCovers,
-      episodes: episodes.map((ep) => ({
-        id:       ep.id,
-        title:    ep.title,
-        seriesId: ep.seriesId,
-      })),
-      songs: songs.map((s) => ({
-        id:      s.id,
-        title:   s.title,
-        albumId: s.albumId,
-      })),
+      success: true,
+      data: {
+        series:   seriesWithCovers,
+        albums:   albumsWithCovers,
+        episodes: episodeList.map((ep) => ({
+          id:       ep.id,
+          type:     'episode',
+          title:    ep.title,
+          seriesId: ep.seriesId,
+          seriesTitle: ep.series.title,
+        })),
+        songs: songList.map((s) => ({
+          id:         s.id,
+          type:       'song',
+          title:      s.title,
+          artist:     s.artist,
+          albumId:    s.albumId,
+          albumTitle: s.album.title,
+        })),
+      },
     });
-  } catch (err) {
-    console.error('GET /api/search error:', err);
-    res.status(500).json({ error: 'Search failed' });
-  }
+  } catch (err) { next(err); }
 });
 
 module.exports = router;

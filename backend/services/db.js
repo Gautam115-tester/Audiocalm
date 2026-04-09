@@ -7,4 +7,9 @@ const prisma = new PrismaClient({
     : ['error'],
 });
 
+// Graceful shutdown — prevents connection leaks on Render restarts
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
+});
+
 module.exports = prisma;

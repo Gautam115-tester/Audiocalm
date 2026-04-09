@@ -4,176 +4,116 @@ const router   = express.Router();
 const prisma   = require('../services/db');
 const telegram = require('../services/telegram');
 
-// ── Helper: attach live coverUrl from Telegram ────────────────────────────────
-async function attachCoverUrl(series) {
-  if (!series) return null;
-  const coverUrl = await telegram.getCoverUrl(series.coverTelegramFileId);
-  return { ...series, coverUrl };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/series
-// Returns all active series (used by Flutter StoriesScreen & HomeScreen)
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/', async (req, res) => {
+// ── GET /api/series ──────────────────────────────────────────────────────────
+router.get('/', async (req, res, next) => {
   try {
     const allSeries = await prisma.series.findMany({
-      where: { isActive: true },
+      where:   { isActive: true },
       orderBy: { createdAt: 'desc' },
-      include: {
-        _count: { select: { episodes: true } },
-      },
+      include: { _count: { select: { episodes: { where: { isActive: true } } } } },
     });
 
-    // Attach live Telegram cover URLs
-    const withCovers = await Promise.all(
-      allSeries.map(async (s) => {
-        const coverUrl = await telegram.getCoverUrl(s.coverTelegramFileId);
-        return {
-          id:           s.id,
-          title:        s.title,
-          description:  s.description,
-          coverUrl,
-          isActive:     s.isActive,
-          episodeCount: s._count.episodes,
-          createdAt:    s.createdAt,
-        };
-      })
+    const data = await Promise.all(
+      allSeries.map(async (s) => ({
+        id:           s.id,
+        title:        s.title,
+        description:  s.description,
+        coverUrl:     await telegram.getCoverUrl(s.coverTelegramFileId),
+        episodeCount: s._count.episodes,
+        createdAt:    s.createdAt,
+      }))
     );
 
-    res.json(withCovers);
-  } catch (err) {
-    console.error('GET /api/series error:', err);
-    res.status(500).json({ error: 'Failed to fetch series' });
-  }
+    res.json({ success: true, data });
+  } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/series/:id
-// Single series detail (used by Flutter SeriesDetailScreen)
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/:id', async (req, res) => {
+// ── GET /api/series/:id ──────────────────────────────────────────────────────
+router.get('/:id', async (req, res, next) => {
   try {
     const series = await prisma.series.findUnique({
-      where: { id: req.params.id },
-      include: {
-        _count: { select: { episodes: true } },
-      },
+      where:   { id: req.params.id },
+      include: { _count: { select: { episodes: { where: { isActive: true } } } } },
     });
 
     if (!series) return res.status(404).json({ error: 'Series not found' });
 
-    const coverUrl = await telegram.getCoverUrl(series.coverTelegramFileId);
-
     res.json({
-      id:           series.id,
-      title:        series.title,
-      description:  series.description,
-      coverUrl,
-      isActive:     series.isActive,
-      episodeCount: series._count.episodes,
-      createdAt:    series.createdAt,
+      success: true,
+      data: {
+        id:           series.id,
+        title:        series.title,
+        description:  series.description,
+        coverUrl:     await telegram.getCoverUrl(series.coverTelegramFileId),
+        episodeCount: series._count.episodes,
+        isActive:     series.isActive,
+        createdAt:    series.createdAt,
+      },
     });
-  } catch (err) {
-    console.error('GET /api/series/:id error:', err);
-    res.status(500).json({ error: 'Failed to fetch series' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/series/:id/episodes
-// All episodes for a series (used by Flutter SeriesDetailScreen episode list)
-// ─────────────────────────────────────────────────────────────────────────────
-router.get('/:id/episodes', async (req, res) => {
+// ── GET /api/series/:id/episodes ─────────────────────────────────────────────
+router.get('/:id/episodes', async (req, res, next) => {
   try {
     const episodes = await prisma.episode.findMany({
-      where: {
-        seriesId: req.params.id,
-        isActive: true,
-      },
+      where:   { seriesId: req.params.id, isActive: true },
       orderBy: { episodeNumber: 'asc' },
     });
 
-    res.json(
-      episodes.map((ep) => ({
-        id:             ep.id,
-        seriesId:       ep.seriesId,
-        episodeNumber:  ep.episodeNumber,
-        title:          ep.title,
-        telegramFileId: ep.telegramFileId,
-        duration:       ep.duration,
-        partCount:      ep.partCount,
-        isActive:       ep.isActive,
-      }))
-    );
-  } catch (err) {
-    console.error('GET /api/series/:id/episodes error:', err);
-    res.status(500).json({ error: 'Failed to fetch episodes' });
-  }
+    res.json({
+      success: true,
+      data: episodes.map((ep) => ({
+        id:            ep.id,
+        seriesId:      ep.seriesId,
+        episodeNumber: ep.episodeNumber,
+        title:         ep.title,
+        description:   ep.description,
+        duration:      ep.duration,
+        partCount:     ep.partCount,
+        isMultiPart:   ep.partCount > 1,
+        createdAt:     ep.createdAt,
+      })),
+    });
+  } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/series
-// Create a new series (admin use)
-// Body: { title, description }
-// coverTelegramFileId is set via the upload route separately
-// ─────────────────────────────────────────────────────────────────────────────
-router.post('/', async (req, res) => {
+// ── POST /api/series ─────────────────────────────────────────────────────────
+router.post('/', async (req, res, next) => {
   try {
     const { title, description } = req.body;
-    if (!title) return res.status(400).json({ error: 'title is required' });
+    if (!title?.trim()) return res.status(400).json({ error: 'title is required' });
 
-    const series = await prisma.series.create({
-      data: { title, description },
-    });
-
-    res.status(201).json(series);
-  } catch (err) {
-    console.error('POST /api/series error:', err);
-    res.status(500).json({ error: 'Failed to create series' });
-  }
+    const series = await prisma.series.create({ data: { title: title.trim(), description: description?.trim() || null } });
+    res.status(201).json({ success: true, data: series });
+  } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/series/:id
-// Update series (title, description, isActive, coverTelegramFileId)
-// ─────────────────────────────────────────────────────────────────────────────
-router.patch('/:id', async (req, res) => {
+// ── PATCH /api/series/:id ────────────────────────────────────────────────────
+router.patch('/:id', async (req, res, next) => {
   try {
     const { title, description, isActive, coverTelegramFileId } = req.body;
 
     const series = await prisma.series.update({
       where: { id: req.params.id },
       data: {
-        ...(title                !== undefined && { title }),
-        ...(description         !== undefined && { description }),
-        ...(isActive            !== undefined && { isActive }),
-        ...(coverTelegramFileId !== undefined && { coverTelegramFileId }),
+        ...(title                != null && { title: title.trim() }),
+        ...(description          != null && { description }),
+        ...(isActive             != null && { isActive }),
+        ...(coverTelegramFileId  != null && { coverTelegramFileId }),
       },
     });
 
-    res.json(series);
-  } catch (err) {
-    console.error('PATCH /api/series/:id error:', err);
-    res.status(500).json({ error: 'Failed to update series' });
-  }
+    res.json({ success: true, data: series });
+  } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/series/:id
-// Soft delete (sets isActive = false)
-// ─────────────────────────────────────────────────────────────────────────────
-router.delete('/:id', async (req, res) => {
+// ── DELETE /api/series/:id  (soft delete) ────────────────────────────────────
+router.delete('/:id', async (req, res, next) => {
   try {
-    await prisma.series.update({
-      where: { id: req.params.id },
-      data: { isActive: false },
-    });
-    res.json({ message: 'Series deactivated' });
-  } catch (err) {
-    console.error('DELETE /api/series/:id error:', err);
-    res.status(500).json({ error: 'Failed to delete series' });
-  }
+    await prisma.series.update({ where: { id: req.params.id }, data: { isActive: false } });
+    res.json({ success: true, message: 'Series deactivated' });
+  } catch (err) { next(err); }
 });
 
 module.exports = router;
