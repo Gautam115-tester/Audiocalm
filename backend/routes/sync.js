@@ -19,60 +19,104 @@ const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OFFSET TRACKING
+// MESSAGE ID TRACKING
 //
-// ⚠️  RULE 1 — Save offset ONLY after DB success.
-//     Telegram's getUpdates queue is destructive: once you advance the offset,
-//     those older updates are deleted from Telegram forever.
-//     If we save the offset before the DB write and the write fails,
-//     those messages are permanently lost on the next sync.
+// We store the last processed message_id PER CHANNEL (not update_id).
+// This is the key difference from the old approach:
 //
-// ⚠️  RULE 2 — Music and covers share ONE offset.
-//     getUpdates returns ALL updates from ALL channels in a single stream.
-//     If music sync advances the offset, it silently consumes and discards
-//     cover posts (they don't match the music channel ID filter).
-//     Fix: fetch once, split by channel — never fetch twice.
+// ❌ OLD: getUpdates (offset-based) — only works for recent 24hrs, destructive,
+//         limited to 100 at a time, mixes all channels in one stream.
+//
+// ✅ NEW: forwardMessages (message_id-based) — works on ALL historical messages,
+//         non-destructive (reading doesn't delete anything), channels are
+//         independent, fetches as far back as message_id=1.
+//
+// We forward messages to a private "dump" chat (your own bot's private chat or
+// a private group) and inspect the forwarded content. This is the only way
+// to read full channel history with a bot token.
 // ─────────────────────────────────────────────────────────────────────────────
-const OFFSET_FILE = path.join(__dirname, '../.sync_offset.json');
+const STATE_FILE = path.join(__dirname, '../.sync_state.json');
 
-function readOffset() {
+function readState() {
   try {
-    const data = JSON.parse(fs.readFileSync(OFFSET_FILE, 'utf8'));
-    // Handle both old format { music, covers } and new { offset }
-    return typeof data.offset === 'number' ? data.offset : 0;
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch {
-    return 0;
+    return { musicLastMsgId: 0, coversLastMsgId: 0 };
   }
 }
 
-function saveOffset(value) {
-  fs.writeFileSync(OFFSET_FILE, JSON.stringify({ offset: value }), 'utf8');
+function saveState(patch) {
+  const state = readState();
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, ...patch }), 'utf8');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FETCH ALL UPDATES — paginates through the full queue
-// Returns { updates, nextOffset } but does NOT save the offset.
-// Caller must save it only after a successful DB write.
+// FETCH CHANNEL MESSAGES — reads ALL messages from a channel using
+// forwardMessages to a dump chat, starting from (lastMsgId + 1).
+//
+// HOW IT WORKS:
+//   Telegram Bot API doesn't expose getChatHistory directly, but we can use
+//   forwardMessages to forward a range of message IDs to any chat the bot
+//   can write to. Forwarded messages come back as normal messages with full
+//   audio/photo metadata intact.
+//
+// SETUP NEEDED:
+//   Set TELEGRAM_DUMP_CHAT_ID in your .env to any chat your bot can send to.
+//   The easiest option: send /start to your bot in DM, use your own user ID.
+//   Or create a private group, add your bot, use that group's ID.
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchAllUpdates() {
-  let offset     = readOffset();
-  let nextOffset = offset;
-  const all      = [];
+const BATCH_SIZE = 100; // Telegram max for forwardMessages
 
-  while (true) {
-    const res = await axios.get(`${TELEGRAM_API}/getUpdates`, {
-      params: { offset, limit: 100, timeout: 0 },
-    });
-
-    const batch = res.data.result || [];
-    if (batch.length === 0) break;
-
-    all.push(...batch);
-    offset     = batch[batch.length - 1].update_id + 1;
-    nextOffset = offset;
+async function fetchChannelMessages(channelId, fromMsgId = 1) {
+  const DUMP_CHAT = process.env.TELEGRAM_DUMP_CHAT_ID;
+  if (!DUMP_CHAT) {
+    throw new Error('TELEGRAM_DUMP_CHAT_ID is not set in .env — see sync.js comments for setup instructions');
   }
 
-  return { updates: all, nextOffset };
+  const messages = [];
+
+  // We need to find the latest message_id in the channel first
+  // by trying to forward a very high message_id and seeing what exists.
+  // Simpler approach: forward batches from fromMsgId upward until we hit empty.
+
+  let currentId = fromMsgId;
+  let consecutiveEmpty = 0;
+
+  while (consecutiveEmpty < 3) {
+    // Build array of IDs to try: [currentId, currentId+1, ..., currentId+99]
+    const msgIds = Array.from({ length: BATCH_SIZE }, (_, i) => currentId + i);
+
+    let forwarded;
+    try {
+      const res = await axios.post(`${TELEGRAM_API}/forwardMessages`, {
+        chat_id:     DUMP_CHAT,
+        from_chat_id: channelId,
+        message_ids: msgIds,
+        disable_notification: true,
+      });
+      forwarded = res.data.result || [];
+    } catch (err) {
+      // Telegram returns 400 if ALL message IDs in the batch don't exist
+      // This means we've gone past the end of the channel
+      if (err.response?.status === 400) break;
+      throw err;
+    }
+
+    if (forwarded.length === 0) {
+      consecutiveEmpty++;
+      currentId += BATCH_SIZE;
+      continue;
+    }
+
+    consecutiveEmpty = 0;
+    messages.push(...forwarded);
+    currentId += BATCH_SIZE;
+
+    // Small delay to avoid hitting rate limits
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  return messages;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,57 +144,54 @@ function extractAndCleanAlbumName(fileName, performer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/sync/music
-//
-// DUPLICATE LOGIC (2-layer):
-//   Layer 1 — telegramFileId  : same exact file → skip always
-//   Layer 2 — title + albumId : same name in same album → skip
-//   Same title in a DIFFERENT album → allowed ✅
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/music', async (req, res) => {
   try {
-    // ── Step 1: Fetch new updates (offset NOT saved yet) ──────────────────────
-    const { updates, nextOffset } = await fetchAllUpdates();
+    const state      = readState();
+    const fromMsgId  = (state.musicLastMsgId || 0) + 1;
+    const channelId  = process.env.TELEGRAM_MUSIC_CHANNEL_ID;
 
-    const audioPosts = updates.filter((u) => {
-      const post = u.channel_post;
-      return (
-        post &&
-        post.audio &&
-        String(post.chat.id) === String(process.env.TELEGRAM_MUSIC_CHANNEL_ID)
-      );
+    console.log(`📡 Fetching music channel messages from ID ${fromMsgId}…`);
+    const rawMessages = await fetchChannelMessages(channelId, fromMsgId);
+
+    // Filter to only audio messages
+    const audioMessages = rawMessages.filter(m => m.audio || m.forward_origin?.message_id);
+
+    // More accurately: forwarded messages keep the original audio field
+    const audioPosts = rawMessages.filter(m => {
+      // forwardMessages returns the forwarded message objects which have audio directly
+      return m.audio != null;
     });
 
     if (audioPosts.length === 0) {
-      // No music posts, but still advance offset past any noise (cover posts etc.)
-      if (updates.length > 0) saveOffset(nextOffset);
-      return res.json({ message: 'Music sync complete', created: 0, skipped: 0 });
+      return res.json({ message: 'Music sync complete — no new messages', created: 0, skipped: 0 });
     }
 
-    console.log(`📥 Processing ${audioPosts.length} new audio posts…`);
+    console.log(`📥 Found ${audioPosts.length} audio messages`);
 
-    // ── Step 2: Pre-load all albums into memory (1 DB query) ──────────────────
-    const existingAlbums = await prisma.album.findMany({
-      select: { id: true, title: true },
-    });
-    const albumMap = new Map(
-      existingAlbums.map((a) => [a.title.toLowerCase(), a])
-    );
+    // Track highest message_id seen in this batch
+    let highestMsgId = state.musicLastMsgId || 0;
+    for (const m of rawMessages) {
+      // The forwarded message has forward_from_message_id
+      const origId = m.forward_from_message_id || m.message_id;
+      if (origId > highestMsgId) highestMsgId = origId;
+    }
 
-    // ── Step 3: Pre-load all songs into memory (1 DB query) ───────────────────
+    // ── Pre-load albums ───────────────────────────────────────────────────────
+    const existingAlbums = await prisma.album.findMany({ select: { id: true, title: true } });
+    const albumMap = new Map(existingAlbums.map(a => [a.title.toLowerCase(), a]));
+
+    // ── Pre-load songs ────────────────────────────────────────────────────────
     const existingSongs = await prisma.song.findMany({
       select: { telegramFileId: true, title: true, albumId: true },
     });
-    const existingFileIds = new Set(
-      existingSongs.map((s) => s.telegramFileId).filter(Boolean)
-    );
-    const existingTitleAlbum = new Set(
-      existingSongs.map((s) => `${s.title.toLowerCase()}::${s.albumId}`)
-    );
+    const existingFileIds    = new Set(existingSongs.map(s => s.telegramFileId).filter(Boolean));
+    const existingTitleAlbum = new Set(existingSongs.map(s => `${s.title.toLowerCase()}::${s.albumId}`));
 
-    // ── Step 4: Collect albums that need creating ─────────────────────────────
+    // ── Collect new albums ────────────────────────────────────────────────────
     const albumsToCreate = new Map();
-    for (const update of audioPosts) {
-      const audio     = update.channel_post.audio;
+    for (const msg of audioPosts) {
+      const audio     = msg.audio;
       const performer = audio.performer || 'Unknown';
       const albumName = extractAndCleanAlbumName(audio.file_name, performer);
       const key       = albumName.toLowerCase();
@@ -159,114 +200,69 @@ router.post('/music', async (req, res) => {
       }
     }
 
-    // ── Step 5: Bulk-create missing albums (1 DB query) ───────────────────────
     if (albumsToCreate.size > 0) {
-      await prisma.album.createMany({
-        data:           [...albumsToCreate.values()],
-        skipDuplicates: true,
-      });
-      console.log(`✅ Bulk-created ${albumsToCreate.size} new album(s)`);
-
-      const freshAlbums = await prisma.album.findMany({
-        select: { id: true, title: true },
-      });
-      freshAlbums.forEach((a) => albumMap.set(a.title.toLowerCase(), a));
+      await prisma.album.createMany({ data: [...albumsToCreate.values()], skipDuplicates: true });
+      console.log(`✅ Created ${albumsToCreate.size} new album(s)`);
+      const fresh = await prisma.album.findMany({ select: { id: true, title: true } });
+      fresh.forEach(a => albumMap.set(a.title.toLowerCase(), a));
     }
 
-    // ── Step 6: Pre-load max track numbers per album (1 DB query) ─────────────
-    const trackAgg = await prisma.song.groupBy({
-      by:   ['albumId'],
-      _max: { trackNumber: true },
-    });
-    const maxTrackMap     = new Map(trackAgg.map((r) => [r.albumId, r._max.trackNumber || 0]));
+    // ── Pre-load max track numbers ────────────────────────────────────────────
+    const trackAgg = await prisma.song.groupBy({ by: ['albumId'], _max: { trackNumber: true } });
+    const maxTrackMap     = new Map(trackAgg.map(r => [r.albumId, r._max.trackNumber || 0]));
     const pendingTrackMap = new Map();
 
-    // ── Step 7: Build song insert list ────────────────────────────────────────
+    // ── Build songs to insert ─────────────────────────────────────────────────
     const songsToCreate = [];
     let skipped = 0;
 
-    for (const update of audioPosts) {
-      const audio     = update.channel_post.audio;
+    for (const msg of audioPosts) {
+      const audio     = msg.audio;
       const title     = audio.title || audio.file_name || 'Unknown';
       const performer = audio.performer || 'Unknown';
       const fileId    = audio.file_id;
       const duration  = audio.duration;
 
-      // Layer-1: same Telegram file
-      if (existingFileIds.has(fileId)) {
-        skipped++;
-        continue;
-      }
+      // Layer-1: same file
+      if (existingFileIds.has(fileId)) { skipped++; continue; }
 
       const albumName = extractAndCleanAlbumName(audio.file_name, performer);
       const album     = albumMap.get(albumName.toLowerCase());
+      if (!album) { console.warn(`⚠️  No album for "${albumName}"`); skipped++; continue; }
 
-      if (!album) {
-        console.warn(`⚠️  No album found for "${albumName}" — skipping: ${title}`);
-        skipped++;
-        continue;
-      }
+      // Layer-2: same title + album
+      const titleKey = `${title.toLowerCase()}::${album.id}`;
+      if (existingTitleAlbum.has(titleKey)) { skipped++; continue; }
 
-      // Layer-2: same title in same album
-      const titleAlbumKey = `${title.toLowerCase()}::${album.id}`;
-      if (existingTitleAlbum.has(titleAlbumKey)) {
-        skipped++;
-        continue;
-      }
-
-      // ── Track number (collision-safe, no per-song DB queries) ────────────
+      // Track number
       const trackMatch = audio.file_name?.match(/TR(\d+)/i);
       let   trackNum   = trackMatch ? parseInt(trackMatch[1]) : null;
-
-      if (trackNum !== null && pendingTrackMap.has(`${album.id}::${trackNum}`)) {
-        trackNum = null; // already claimed in this batch → append instead
-      }
-
+      if (trackNum !== null && pendingTrackMap.has(`${album.id}::${trackNum}`)) trackNum = null;
       if (trackNum === null) {
-        const dbMax      = maxTrackMap.get(album.id) || 0;
-        const pendingMax = pendingTrackMap.get(`${album.id}::__max`) || 0;
-        trackNum         = Math.max(dbMax, pendingMax) + 1;
+        const dbMax  = maxTrackMap.get(album.id) || 0;
+        const penMax = pendingTrackMap.get(`${album.id}::__max`) || 0;
+        trackNum     = Math.max(dbMax, penMax) + 1;
       }
-
       pendingTrackMap.set(`${album.id}::${trackNum}`, true);
-      const curMax = pendingTrackMap.get(`${album.id}::__max`) || 0;
-      pendingTrackMap.set(`${album.id}::__max`, Math.max(curMax, trackNum));
-
+      pendingTrackMap.set(`${album.id}::__max`, Math.max(pendingTrackMap.get(`${album.id}::__max`) || 0, trackNum));
       existingFileIds.add(fileId);
-      existingTitleAlbum.add(titleAlbumKey);
+      existingTitleAlbum.add(titleKey);
 
-      songsToCreate.push({
-        albumId:        album.id,
-        trackNumber:    trackNum,
-        title,
-        telegramFileId: fileId,
-        duration,
-        partCount:      1,
-      });
+      songsToCreate.push({ albumId: album.id, trackNumber: trackNum, title, telegramFileId: fileId, duration, partCount: 1 });
     }
 
-    // ── Step 8: DB write first, THEN save offset ──────────────────────────────
+    // ── Bulk insert, then save state ──────────────────────────────────────────
     if (songsToCreate.length > 0) {
-      await prisma.song.createMany({
-        data:           songsToCreate,
-        skipDuplicates: true,
-      });
-      console.log(`🎵 Bulk-inserted ${songsToCreate.length} song(s)`);
+      await prisma.song.createMany({ data: songsToCreate, skipDuplicates: true });
+      console.log(`🎵 Inserted ${songsToCreate.length} songs`);
     }
 
-    // ✅ Offset only advances after a successful DB write.
-    // If prisma.song.createMany throws, we never reach this line,
-    // so the same updates will be retried on the next sync call.
-    saveOffset(nextOffset);
+    // Save the highest original message_id we processed
+    saveState({ musicLastMsgId: highestMsgId });
 
-    res.json({
-      message: 'Music sync complete',
-      created: songsToCreate.length,
-      skipped,
-    });
+    res.json({ message: 'Music sync complete', created: songsToCreate.length, skipped });
   } catch (err) {
     console.error('Music sync error:', err.message);
-    // Offset intentionally NOT saved — next sync will retry these updates
     res.status(500).json({ error: 'Sync failed', message: err.message });
   }
 });
@@ -276,81 +272,65 @@ router.post('/music', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/covers', async (req, res) => {
   try {
-    const { updates, nextOffset } = await fetchAllUpdates();
+    const state     = readState();
+    const fromMsgId = (state.coversLastMsgId || 0) + 1;
+    const channelId = process.env.TELEGRAM_COVERS_CHANNEL_ID;
 
-    const coverPosts = updates.filter((u) => {
-      const post = u.channel_post;
-      return (
-        post &&
-        post.photo &&
-        String(post.chat.id) === String(process.env.TELEGRAM_COVERS_CHANNEL_ID)
-      );
-    });
+    console.log(`📡 Fetching covers channel messages from ID ${fromMsgId}…`);
+    const rawMessages = await fetchChannelMessages(channelId, fromMsgId);
 
-    if (coverPosts.length === 0) {
-      if (updates.length > 0) saveOffset(nextOffset);
-      return res.json({ message: 'Covers sync complete', updated: 0 });
+    const photoMessages = rawMessages.filter(m => m.photo);
+
+    if (photoMessages.length === 0) {
+      return res.json({ message: 'Covers sync complete — no new messages', updated: 0 });
+    }
+
+    let highestMsgId = state.coversLastMsgId || 0;
+    for (const m of rawMessages) {
+      const origId = m.forward_from_message_id || m.message_id;
+      if (origId > highestMsgId) highestMsgId = origId;
     }
 
     const [allAlbums, allSeries] = await Promise.all([
       prisma.album.findMany({ select: { id: true, title: true } }),
       prisma.series.findMany({ select: { id: true, title: true } }),
     ]);
+    const albumMap  = new Map(allAlbums.map(a => [a.title.toLowerCase(), a]));
+    const seriesMap = new Map(allSeries.map(s => [s.title.toLowerCase(), s]));
 
-    const albumMap  = new Map(allAlbums.map((a) => [a.title.toLowerCase(), a]));
-    const seriesMap = new Map(allSeries.map((s) => [s.title.toLowerCase(), s]));
+    const albumUpdates  = [];
+    const seriesUpdates = [];
 
-    const albumCoverUpdates  = [];
-    const seriesCoverUpdates = [];
-
-    for (const update of coverPosts) {
-      const post    = update.channel_post;
-      const fileId  = post.photo[post.photo.length - 1].file_id;
-      const caption = post.caption || '';
+    for (const msg of photoMessages) {
+      const caption = msg.caption || msg.forward_origin?.caption || '';
+      const fileId  = msg.photo[msg.photo.length - 1].file_id;
 
       const albumMatch  = caption.match(/COVER_ALBUM:(.+)/i);
       const seriesMatch = caption.match(/COVER_SERIES:(.+)/i);
 
       if (albumMatch) {
         const name  = albumMatch[1].replace(/\([^)]*\)/g, '').trim().toLowerCase();
-        const album = albumMap.get(name)
-          ?? [...albumMap.values()].find((a) => a.title.toLowerCase().includes(name));
-        if (album) {
-          albumCoverUpdates.push({ id: album.id, fileId });
-          console.log(`🖼️  Queued cover for album: ${album.title}`);
-        } else {
-          console.warn(`⚠️  No album matched cover caption: "${name}"`);
-        }
+        const album = albumMap.get(name) ?? [...albumMap.values()].find(a => a.title.toLowerCase().includes(name));
+        if (album) { albumUpdates.push({ id: album.id, fileId }); console.log(`🖼️  Album cover: ${album.title}`); }
+        else console.warn(`⚠️  No album for cover: "${name}"`);
       }
 
       if (seriesMatch) {
         const name   = seriesMatch[1].replace(/\([^)]*\)/g, '').trim().toLowerCase();
-        const series = seriesMap.get(name)
-          ?? [...seriesMap.values()].find((s) => s.title.toLowerCase().includes(name));
-        if (series) {
-          seriesCoverUpdates.push({ id: series.id, fileId });
-          console.log(`🖼️  Queued cover for series: ${series.title}`);
-        } else {
-          console.warn(`⚠️  No series matched cover caption: "${name}"`);
-        }
+        const series = seriesMap.get(name) ?? [...seriesMap.values()].find(s => s.title.toLowerCase().includes(name));
+        if (series) { seriesUpdates.push({ id: series.id, fileId }); console.log(`🖼️  Series cover: ${series.title}`); }
+        else console.warn(`⚠️  No series for cover: "${name}"`);
       }
     }
 
-    // DB writes first, offset save second
     await Promise.all([
-      ...albumCoverUpdates.map(({ id, fileId }) =>
-        prisma.album.update({ where: { id }, data: { coverTelegramFileId: fileId } })
-      ),
-      ...seriesCoverUpdates.map(({ id, fileId }) =>
-        prisma.series.update({ where: { id }, data: { coverTelegramFileId: fileId } })
-      ),
+      ...albumUpdates.map( ({ id, fileId }) => prisma.album.update({ where: { id }, data: { coverTelegramFileId: fileId } })),
+      ...seriesUpdates.map(({ id, fileId }) => prisma.series.update({ where: { id }, data: { coverTelegramFileId: fileId } })),
     ]);
 
-    // ✅ Only save offset after all DB writes succeed
-    saveOffset(nextOffset);
+    saveState({ coversLastMsgId: highestMsgId });
 
-    const updated = albumCoverUpdates.length + seriesCoverUpdates.length;
-    res.json({ message: 'Covers sync complete', updated });
+    res.json({ message: 'Covers sync complete', updated: albumUpdates.length + seriesUpdates.length });
   } catch (err) {
     console.error('Covers sync error:', err.message);
     res.status(500).json({ error: 'Covers sync failed', message: err.message });
@@ -358,12 +338,12 @@ router.post('/covers', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/sync/reset-offset — re-process all Telegram history from scratch
+// POST /api/sync/reset  — re-process everything from message_id 1
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/reset-offset', (req, res) => {
+router.post('/reset', (req, res) => {
   try {
-    saveOffset(0);
-    res.json({ message: 'Offset reset. Next sync will re-process all Telegram history.' });
+    saveState({ musicLastMsgId: 0, coversLastMsgId: 0 });
+    res.json({ message: 'State reset. Next sync will read all messages from the beginning.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
