@@ -1,3 +1,5 @@
+// lib/features/calm_music/data/models/song_model.dart
+
 class SongModel {
   final String id;
   final String albumId;
@@ -22,16 +24,17 @@ class SongModel {
   });
 
   factory SongModel.fromJson(Map<String, dynamic> json) {
+    final partCount = json['partCount'] as int? ?? 1;
     return SongModel(
       id:          json['id']?.toString() ?? '',
-      albumId:     json['album_id']?.toString() ?? '',   // ← changed
-      trackNumber: json['track_number'] as int? ?? 0,    // ← changed
+      albumId:     json['albumId']?.toString() ?? '',     // backend sends 'albumId'
+      trackNumber: json['trackNumber'] as int? ?? 0,      // backend sends 'trackNumber'
       title:       json['title']?.toString() ?? '',
       artist:      json['artist']?.toString(),
-      duration:    json['duration_seconds'] as int?,     // ← changed
-      isMultiPart: json['is_multi_part'] as bool? ?? false,
-      isActive:    true,
-      coverUrl:    json['cover_image_url']?.toString(),  // ← added
+      duration:    json['duration'] as int?,              // backend sends 'duration'
+      isMultiPart: partCount > 1,
+      isActive:    json['isActive'] as bool? ?? true,
+      coverUrl:    null, // songs don't have individual covers; use album cover
     );
   }
 
@@ -39,6 +42,6 @@ class SongModel {
     if (duration == null) return '--:--';
     final m = duration! ~/ 60;
     final s = duration! % 60;
-    return '${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}';
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 }

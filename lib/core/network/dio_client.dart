@@ -39,13 +39,14 @@ class DioClient {
 
   Dio get dio => _dio;
 
+  /// Returns response.data directly — could be a List or Map depending on endpoint.
   Future<T> get<T>(
     String path, {
     Map<String, dynamic>? queryParameters,
     Options? options,
   }) async {
     try {
-      final response = await _dio.get<T>(
+      final response = await _dio.get(
         path,
         queryParameters: queryParameters,
         options: options,

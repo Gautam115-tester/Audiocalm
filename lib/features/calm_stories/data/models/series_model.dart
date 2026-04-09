@@ -1,3 +1,5 @@
+// lib/features/calm_stories/data/models/series_model.dart
+
 class SeriesModel {
   final String id;
   final String title;
@@ -22,11 +24,11 @@ class SeriesModel {
       id:           json['id']?.toString() ?? '',
       title:        json['title']?.toString() ?? '',
       description:  json['description']?.toString(),
-      coverUrl:     json['cover_image_url']?.toString(),   // ← changed
-      isActive:     json['is_active'] as bool? ?? true,
-      episodeCount: json['episode_count'] as int? ?? 0,    // ← changed
-      createdAt: json['created_at'] != null
-          ? DateTime.tryParse(json['created_at'].toString()) ?? DateTime.now()
+      coverUrl:     json['coverUrl']?.toString(),          // backend sends 'coverUrl'
+      isActive:     json['isActive'] as bool? ?? true,     // backend sends 'isActive'
+      episodeCount: json['episodeCount'] as int? ?? 0,     // backend sends 'episodeCount'
+      createdAt: json['createdAt'] != null
+          ? DateTime.tryParse(json['createdAt'].toString()) ?? DateTime.now()
           : DateTime.now(),
     );
   }

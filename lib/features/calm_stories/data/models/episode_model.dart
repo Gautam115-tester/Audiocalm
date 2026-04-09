@@ -1,3 +1,5 @@
+// lib/features/calm_stories/data/models/episode_model.dart
+
 class EpisodeModel {
   final String id;
   final String seriesId;
@@ -20,27 +22,27 @@ class EpisodeModel {
   });
 
   factory EpisodeModel.fromJson(Map<String, dynamic> json) {
+    final partCount = json['partCount'] as int? ?? 1;
     return EpisodeModel(
       id:            json['id']?.toString() ?? '',
-      seriesId:      json['series_id']?.toString() ?? '',   // ← changed
-      episodeNumber: json['episode_number'] as int? ?? 0,   // ← changed
+      seriesId:      json['seriesId']?.toString() ?? '',      // backend sends 'seriesId'
+      episodeNumber: json['episodeNumber'] as int? ?? 0,      // backend sends 'episodeNumber'
       title:         json['title']?.toString() ?? '',
-      duration:      json['duration_seconds'] as int?,      // ← changed
-      isMultiPart:   json['is_multi_part'] as bool? ?? false,
-      isActive:      true,
+      duration:      json['duration'] as int?,                // backend sends 'duration'
+      partCount:     partCount,
+      isMultiPart:   partCount > 1,
+      isActive:      json['isActive'] as bool? ?? true,
     );
   }
 
-  // partCount is determined by calling /parts endpoint
-  // For display purposes, use isMultiPart flag
   String get formattedDuration {
     if (duration == null) return '--:--';
     final h = duration! ~/ 3600;
     final m = (duration! % 3600) ~/ 60;
     final s = duration! % 60;
     if (h > 0) {
-      return '${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}';
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
     }
-    return '${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}';
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 }
