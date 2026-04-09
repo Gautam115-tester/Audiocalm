@@ -183,13 +183,17 @@
     .history-time { color: var(--text3); font-size: 12px; }
     .history-empty { font-size: 13px; color: var(--text3); padding: 8px 0; }
 
-    /* compatibility notice */
     .compat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
     .compat-item {
       display: flex; align-items: center; gap: 8px; font-size: 12px;
       background: var(--bg2); border-radius: var(--radius); padding: 8px 10px;
     }
     .compat-item .dot { width: 10px; height: 10px; background: var(--green); box-shadow: none; }
+
+    .key-saved-badge {
+      font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: var(--radius);
+      background: var(--green-bg); color: var(--green-text); display: none;
+    }
 
     @media (max-width: 540px) {
       .stat-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -240,6 +244,20 @@
     <div class="url-row">
       <input type="text" id="base-url" placeholder="https://your-app.onrender.com" />
       <button onclick="saveUrl()">Save</button>
+    </div>
+  </div>
+
+  <!-- API Key -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">API Key</span>
+      <span class="key-saved-badge" id="key-saved-badge">Saved</span>
+    </div>
+    <div class="section-desc">Sent as <code style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;background:var(--bg2);padding:1px 5px;border-radius:4px;">x-api-key</code> header with every request</div>
+    <div class="url-row">
+      <input type="password" id="api-key" placeholder="your-secret-api-key" />
+      <button onclick="saveKey()">Save</button>
+      <button onclick="toggleKeyVisibility()" id="btn-show-key" style="padding:8px 12px;">Show</button>
     </div>
   </div>
 
@@ -336,9 +354,15 @@
 
   /* ── Init ───────────────────────────────────────────────────────────────── */
   window.onload = function () {
-    const saved = localStorage.getItem('sync_base');
-    if (saved) document.getElementById('base-url').value = saved;
-    // migrate old stats shape
+    const savedUrl = localStorage.getItem('sync_base');
+    if (savedUrl) document.getElementById('base-url').value = savedUrl;
+
+    const savedKey = localStorage.getItem('sync_api_key');
+    if (savedKey) {
+      document.getElementById('api-key').value = savedKey;
+      document.getElementById('key-saved-badge').style.display = 'inline-block';
+    }
+
     if (stats.episodes === undefined) { stats.episodes = 0; saveStats(); }
     renderStats();
     renderHistory();
@@ -353,6 +377,26 @@
     if (!val) { addLog('err', 'Please enter a URL'); return; }
     localStorage.setItem('sync_base', val);
     addLog('info', 'Base URL saved: ' + val);
+  }
+
+  /* ── API Key ─────────────────────────────────────────────────────────────── */
+  function saveKey() {
+    const val = document.getElementById('api-key').value.trim();
+    if (!val) { addLog('err', 'Please enter an API key'); return; }
+    localStorage.setItem('sync_api_key', val);
+    document.getElementById('key-saved-badge').style.display = 'inline-block';
+    addLog('info', 'API key saved.');
+  }
+  function toggleKeyVisibility() {
+    const input = document.getElementById('api-key');
+    const btn   = document.getElementById('btn-show-key');
+    if (input.type === 'password') {
+      input.type = 'text';
+      btn.textContent = 'Hide';
+    } else {
+      input.type = 'password';
+      btn.textContent = 'Show';
+    }
   }
 
   /* ── Stats ───────────────────────────────────────────────────────────────── */
@@ -402,6 +446,11 @@
     if (running) return;
     const base = getBase();
     if (!base) { addLog('err', 'Set backend URL first and click Save'); return; }
+
+    const apiKey = localStorage.getItem('sync_api_key') || '';
+    if (!apiKey) {
+      addLog('warn', 'No API key set — request may be rejected with 401');
+    }
 
     running = true;
     setBtns(true);
@@ -470,7 +519,6 @@
         setProgress(95);
       }
 
-      /* update running stats */
       stats.songs    += totalSongs;
       stats.covers   += totalCovers;
       stats.episodes += totalEpisodes;
@@ -494,11 +542,14 @@
   }
 
   async function post(url) {
+    const apiKey = localStorage.getItem('sync_api_key') || '';
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['x-api-key'] = apiKey;
+
     const res = await fetch(url, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
     });
-    // Sync routes now respond synchronously — always 200 with a body
     if (!res.ok) {
       const text = await res.text();
       throw new Error(res.status + ': ' + text.slice(0, 200));
