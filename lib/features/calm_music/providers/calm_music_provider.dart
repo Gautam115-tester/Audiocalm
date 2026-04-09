@@ -9,9 +9,12 @@ import '../../../core/di/providers.dart';
 final albumsListProvider = FutureProvider<List<AlbumModel>>((ref) async {
   final dio = ref.watch(dioClientProvider);
   try {
-    // Backend returns a plain List, not { data: [...] }
-    final data = await dio.get<List<dynamic>>(ApiConstants.albums);
-    return (data as List).map((e) => AlbumModel.fromJson(e as Map<String, dynamic>)).toList();
+    // Backend returns { success: true, data: [...] }
+    final response = await dio.get<Map<String, dynamic>>(ApiConstants.albums);
+    final data = response['data'] as List<dynamic>? ?? [];
+    return data
+        .map((e) => AlbumModel.fromJson(e as Map<String, dynamic>))
+        .toList();
   } catch (e) {
     return [];
   }
@@ -21,8 +24,12 @@ final songsProvider =
     FutureProvider.family<List<SongModel>, String>((ref, albumId) async {
   final dio = ref.watch(dioClientProvider);
   try {
-    final data = await dio.get<List<dynamic>>(ApiConstants.albumSongs(albumId));
-    return (data as List).map((e) => SongModel.fromJson(e as Map<String, dynamic>)).toList();
+    // Backend returns { success: true, data: [...] }
+    final response = await dio.get<Map<String, dynamic>>(ApiConstants.albumSongs(albumId));
+    final data = response['data'] as List<dynamic>? ?? [];
+    return data
+        .map((e) => SongModel.fromJson(e as Map<String, dynamic>))
+        .toList();
   } catch (e) {
     return [];
   }
@@ -32,8 +39,11 @@ final albumDetailProvider =
     FutureProvider.family<AlbumModel?, String>((ref, id) async {
   final dio = ref.watch(dioClientProvider);
   try {
-    final data = await dio.get<Map<String, dynamic>>(ApiConstants.albumById(id));
-    return AlbumModel.fromJson(data as Map<String, dynamic>);
+    // Backend returns { success: true, data: { ... } }
+    final response = await dio.get<Map<String, dynamic>>(ApiConstants.albumById(id));
+    final data = response['data'] as Map<String, dynamic>?;
+    if (data == null) return null;
+    return AlbumModel.fromJson(data);
   } catch (e) {
     return null;
   }

@@ -24,8 +24,10 @@ class DioClient {
 
     _dio.interceptors.add(LogInterceptor(
       requestBody: false,
-      responseBody: false,
+      responseBody: true,   // Enable to debug response shape
+      responseHeader: false,
       error: true,
+      logPrint: (obj) => print('[DioClient] $obj'),
     ));
 
     _dio.interceptors.add(
@@ -39,7 +41,9 @@ class DioClient {
 
   Dio get dio => _dio;
 
-  /// Returns response.data directly — could be a List or Map depending on endpoint.
+  /// Returns response.data directly.
+  /// Use get<Map<String, dynamic>> for wrapped responses like { success, data }
+  /// Use get<List<dynamic>> only if the backend returns a bare array.
   Future<T> get<T>(
     String path, {
     Map<String, dynamic>? queryParameters,

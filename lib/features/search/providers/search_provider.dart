@@ -63,11 +63,14 @@ class SearchNotifier extends StateNotifier<SearchState> {
     try {
       final dio = _ref.read(dioClientProvider);
 
-      // Backend returns { series: [], albums: [], episodes: [], songs: [] }
-      final raw = await dio.get<Map<String, dynamic>>(
+      // Backend returns { success: true, data: { series: [], albums: [], episodes: [], songs: [] } }
+      final response = await dio.get<Map<String, dynamic>>(
         ApiConstants.search,
         queryParameters: {'q': query},
       );
+
+      // Unwrap the data envelope
+      final raw = response['data'] as Map<String, dynamic>? ?? {};
 
       final results = <SearchResult>[];
 
@@ -95,7 +98,7 @@ class SearchNotifier extends StateNotifier<SearchState> {
         results.add(SearchResult(
           id:       e['id'].toString(),
           title:    e['title'].toString(),
-          subtitle: null,
+          subtitle: e['seriesTitle']?.toString(),
           imageUrl: null,
           type:     'episode',
         ));
@@ -105,7 +108,7 @@ class SearchNotifier extends StateNotifier<SearchState> {
         results.add(SearchResult(
           id:       s['id'].toString(),
           title:    s['title'].toString(),
-          subtitle: null,
+          subtitle: s['albumTitle']?.toString(),
           imageUrl: null,
           type:     'song',
         ));
