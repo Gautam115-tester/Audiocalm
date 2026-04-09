@@ -1,19 +1,18 @@
 // routes/sync.js
-// Syncs music and cover art from Telegram channels into the database.
+// Syncs music, audio stories, and cover images from Telegram channels into the DB.
 //
 // HOW IT WORKS
-//  Telegram bots cannot call getChatHistory on channels they don't own.
-//  The workaround is forwardMessages: forward batches of message IDs from the
-//  source channel to a private "dump" chat. The bot receives the forwarded
-//  messages with full metadata (audio, photo, caption, forward_origin).
+//  Uses getUpdates to replay channel post updates the bot received, and upserts
+//  any songs, episodes, or covers that are missing from the DB.
+//  No dump chat needed — the bot reads directly from its own update queue.
 //
 // STATE
-//  The last-seen message ID cursor is stored in the SyncState table so it
+//  The last-seen Telegram update_id cursor is stored in SyncState so it
 //  survives Render deploys (Render resets the container filesystem on deploy).
 //
 // CONCURRENCY
-//  Each sync type (music / covers) is guarded by a running flag. A 409 is
-//  returned if a sync is already in progress.
+//  Each sync type is guarded by a running flag. A 409 is returned if a sync
+//  is already in progress.
 
 const express = require('express');
 const router  = express.Router();
@@ -23,21 +22,26 @@ const prisma  = require('../services/db');
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
+const MUSIC_CHANNEL_ID   = process.env.TELEGRAM_MUSIC_CHANNEL_ID;
+const STORIES_CHANNEL_ID = process.env.TELEGRAM_STORIES_CHANNEL_ID;
+const COVERS_CHANNEL_ID  = process.env.TELEGRAM_COVERS_CHANNEL_ID;
+
 // ── Startup validation ────────────────────────────────────────────────────────
-for (const key of ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_MUSIC_CHANNEL_ID', 'TELEGRAM_COVERS_CHANNEL_ID', 'TELEGRAM_DUMP_CHAT_ID']) {
+for (const key of ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_MUSIC_CHANNEL_ID', 'TELEGRAM_STORIES_CHANNEL_ID', 'TELEGRAM_COVERS_CHANNEL_ID']) {
   if (!process.env[key]) console.error(`❌ Missing env var: ${key}`);
 }
 
 // ── State helpers (DB-backed, memory fallback) ────────────────────────────────
-let memState = { musicLastMsgId: 0, coversLastMsgId: 0 };
+let memState = { musicLastUpdateId: 0, storiesLastUpdateId: 0, coversLastUpdateId: 0 };
 
 async function readState() {
   try {
     const rows  = await prisma.syncState.findMany();
-    const state = { musicLastMsgId: 0, coversLastMsgId: 0 };
+    const state = { musicLastUpdateId: 0, storiesLastUpdateId: 0, coversLastUpdateId: 0 };
     for (const row of rows) {
-      if (row.key === 'musicLastMsgId')  state.musicLastMsgId  = parseInt(row.value) || 0;
-      if (row.key === 'coversLastMsgId') state.coversLastMsgId = parseInt(row.value) || 0;
+      if (row.key === 'musicLastUpdateId')   state.musicLastUpdateId   = parseInt(row.value) || 0;
+      if (row.key === 'storiesLastUpdateId') state.storiesLastUpdateId = parseInt(row.value) || 0;
+      if (row.key === 'coversLastUpdateId')  state.coversLastUpdateId  = parseInt(row.value) || 0;
     }
     memState = state;
     return state;
@@ -64,69 +68,59 @@ async function saveState(patch) {
   }
 }
 
-// ── In-memory sync status for the /status endpoint ───────────────────────────
+// ── In-memory sync status ─────────────────────────────────────────────────────
 const syncStatus = {
-  music:  { running: false, lastResult: null, lastError: null, lastRun: null },
-  covers: { running: false, lastResult: null, lastError: null, lastRun: null },
+  music:   { running: false, lastResult: null, lastError: null, lastRun: null },
+  stories: { running: false, lastResult: null, lastError: null, lastRun: null },
+  covers:  { running: false, lastResult: null, lastError: null, lastRun: null },
 };
 
-// ── fetchChannelMessages ──────────────────────────────────────────────────────
-// Forwards batches of message IDs from a channel to TELEGRAM_DUMP_CHAT_ID.
-// Returns the array of forwarded message objects received by the bot.
-const BATCH_SIZE   = 100; // Telegram hard limit for forwardMessages
-const MAX_EMPTY    = 5;   // consecutive empty batches → stop
+// ── fetchUpdates ──────────────────────────────────────────────────────────────
+// Fetches all pending bot updates (channel posts) from a given update_id offset.
+// Telegram getUpdates returns up to 100 updates per call.
+// We filter to only updates from the target channel.
+async function fetchUpdates(channelId, fromUpdateId = 0) {
+  const messages = [];
+  let   offset   = fromUpdateId > 0 ? fromUpdateId + 1 : 0;
 
-async function fetchChannelMessages(channelId, fromMsgId = 1) {
-  const DUMP_CHAT = process.env.TELEGRAM_DUMP_CHAT_ID;
-  if (!DUMP_CHAT)  throw new Error('TELEGRAM_DUMP_CHAT_ID not set');
-  if (!channelId)  throw new Error('channelId not set — check .env');
-
-  const messages       = [];
-  let   currentId      = fromMsgId;
-  let   emptyStreak    = 0;
-
-  while (emptyStreak < MAX_EMPTY) {
-    const msgIds = Array.from({ length: BATCH_SIZE }, (_, i) => currentId + i);
-
-    let forwarded = [];
+  while (true) {
+    let updates = [];
     try {
-      const res = await axios.post(`${TELEGRAM_API}/forwardMessages`, {
-        chat_id:              DUMP_CHAT,
-        from_chat_id:         channelId,
-        message_ids:          msgIds,
-        disable_notification: true,
+      const res = await axios.get(`${TELEGRAM_API}/getUpdates`, {
+        params: {
+          offset,
+          limit:            100,
+          timeout:          0,
+          allowed_updates:  ['channel_post'],
+        },
       });
-      forwarded = res.data.result || [];
+      updates = res.data.result || [];
     } catch (err) {
-      if (err.response?.status === 400) break; // past end of channel
-      throw err;
+      console.error('❌ getUpdates error:', err.message);
+      break;
     }
 
-    if (forwarded.length === 0) {
-      emptyStreak++;
-    } else {
-      emptyStreak = 0;
-      messages.push(...forwarded);
+    if (updates.length === 0) break;
+
+    for (const update of updates) {
+      const post = update.channel_post;
+      // Normalize channel ID comparison (Telegram returns numbers, env has strings)
+      if (post && String(post.chat.id) === String(channelId)) {
+        messages.push({ update_id: update.update_id, ...post });
+      }
+      offset = update.update_id + 1;
     }
 
-    currentId += BATCH_SIZE;
-    await new Promise((r) => setTimeout(r, 400)); // stay under 30 req/s global limit
+    // Fewer than 100 means we've caught up
+    if (updates.length < 100) break;
+
+    await new Promise((r) => setTimeout(r, 200));
   }
 
-  return messages;
+  return { messages, lastUpdateId: offset - 1 };
 }
 
-// Channel forwards carry the source message ID in forward_origin.message_id
-function getOriginalMsgId(msg) {
-  return (
-    msg?.forward_origin?.message_id ||
-    msg?.forward_from_message_id    ||
-    msg?.message_id                 ||
-    0
-  );
-}
-
-// ── Album name cleaner (used during music sync) ───────────────────────────────
+// ── Album name cleaner ────────────────────────────────────────────────────────
 function cleanAlbumName(fileName, performer) {
   if (!fileName) return performer || 'Unknown';
   const m    = fileName.match(/^(.+?)(?:[\s_([\-]*(?:Original|OST|Soundtrack|TR\d)|\.[a-z0-9]{3,4}$|$)/i);
@@ -143,43 +137,35 @@ function cleanAlbumName(fileName, performer) {
 
 // ── runMusicSync ──────────────────────────────────────────────────────────────
 async function runMusicSync() {
-  const state     = await readState();
-  const fromMsgId = (state.musicLastMsgId || 0) + 1;
-  const channelId = process.env.TELEGRAM_MUSIC_CHANNEL_ID;
+  const state       = await readState();
+  const fromUpdateId = state.musicLastUpdateId || 0;
 
-  console.log(`📡 [Music] Syncing from message ID ${fromMsgId}…`);
-  const raw = await fetchChannelMessages(channelId, fromMsgId);
-  console.log(`📦 [Music] ${raw.length} messages received`);
-
-  // Track highest message ID regardless of content
-  let highestMsgId = state.musicLastMsgId || 0;
-  for (const m of raw) {
-    const id = getOriginalMsgId(m);
-    if (id > highestMsgId) highestMsgId = id;
-  }
+  console.log(`📡 [Music] Fetching updates from offset ${fromUpdateId}…`);
+  const { messages: raw, lastUpdateId } = await fetchUpdates(MUSIC_CHANNEL_ID, fromUpdateId);
+  console.log(`📦 [Music] ${raw.length} channel posts received`);
 
   const audioPosts = raw.filter((m) => m.audio != null);
   console.log(`🎵 [Music] ${audioPosts.length} audio messages`);
 
   if (audioPosts.length === 0) {
-    await saveState({ musicLastMsgId: highestMsgId });
+    if (lastUpdateId > fromUpdateId) await saveState({ musicLastUpdateId: lastUpdateId });
     return { created: 0, skipped: 0, scanned: raw.length };
   }
 
-  // Pre-load albums and songs for deduplication
+  // Pre-load for deduplication
   const existingAlbums = await prisma.album.findMany({ select: { id: true, title: true } });
   const albumMap       = new Map(existingAlbums.map((a) => [a.title.toLowerCase(), a]));
 
-  const existingSongs    = await prisma.song.findMany({ select: { telegramFileId: true, title: true, albumId: true } });
-  const seenFileIds      = new Set(existingSongs.map((s) => s.telegramFileId).filter(Boolean));
-  const seenTitleAlbum   = new Set(existingSongs.map((s) => `${s.title.toLowerCase()}::${s.albumId}`));
+  const existingSongs  = await prisma.song.findMany({ select: { telegramFileId: true, title: true, albumId: true } });
+  const seenFileIds    = new Set(existingSongs.map((s) => s.telegramFileId).filter(Boolean));
+  const seenTitleAlbum = new Set(existingSongs.map((s) => `${s.title.toLowerCase()}::${s.albumId}`));
 
   // Determine which albums need to be created
   const albumsToCreate = new Map();
   for (const msg of audioPosts) {
-    const a        = msg.audio;
-    const name     = cleanAlbumName(a.file_name, a.performer);
-    const key      = name.toLowerCase();
+    const a   = msg.audio;
+    const name = cleanAlbumName(a.file_name, a.performer);
+    const key  = name.toLowerCase();
     if (!albumMap.has(key) && !albumsToCreate.has(key)) {
       albumsToCreate.set(key, { title: name, artist: a.performer || null });
     }
@@ -188,15 +174,14 @@ async function runMusicSync() {
   if (albumsToCreate.size > 0) {
     await prisma.album.createMany({ data: [...albumsToCreate.values()], skipDuplicates: true });
     console.log(`✅ [Music] Created ${albumsToCreate.size} album(s)`);
-    // Reload album map with new IDs
     const fresh = await prisma.album.findMany({ select: { id: true, title: true } });
     fresh.forEach((a) => albumMap.set(a.title.toLowerCase(), a));
   }
 
-  // Build track-number helpers (avoid duplicates within a session)
+  // Track-number helpers
   const trackAgg    = await prisma.song.groupBy({ by: ['albumId'], _max: { trackNumber: true } });
   const maxTrackMap = new Map(trackAgg.map((r) => [r.albumId, r._max.trackNumber || 0]));
-  const sessionMax  = new Map(); // albumId → highest track number added this session
+  const sessionMax  = new Map();
 
   const songsToCreate = [];
   let skipped = 0;
@@ -208,7 +193,6 @@ async function runMusicSync() {
     const fileId    = audio.file_id;
     const duration  = audio.duration ?? null;
 
-    // Skip duplicates by fileId first, then by title+album
     if (seenFileIds.has(fileId)) { skipped++; continue; }
 
     const albumName = cleanAlbumName(audio.file_name, performer);
@@ -218,11 +202,9 @@ async function runMusicSync() {
     const titleKey = `${title.toLowerCase()}::${album.id}`;
     if (seenTitleAlbum.has(titleKey)) { skipped++; continue; }
 
-    // Determine track number: prefer TR## in filename, else auto-increment
-    const trMatch = audio.file_name?.match(/TR(\d+)/i);
+    const trMatch  = audio.file_name?.match(/TR(\d+)/i);
     let   trackNum = trMatch ? parseInt(trMatch[1]) : null;
 
-    // If TR## already used this session, fall back to auto
     if (trackNum !== null && sessionMax.has(`${album.id}::${trackNum}`)) trackNum = null;
 
     if (trackNum === null) {
@@ -252,31 +234,107 @@ async function runMusicSync() {
     console.log(`🎵 [Music] Inserted ${songsToCreate.length} songs, skipped ${skipped}`);
   }
 
-  await saveState({ musicLastMsgId: highestMsgId });
+  if (lastUpdateId > fromUpdateId) await saveState({ musicLastUpdateId: lastUpdateId });
   return { created: songsToCreate.length, skipped, scanned: raw.length };
+}
+
+// ── runStoriesSync ────────────────────────────────────────────────────────────
+async function runStoriesSync() {
+  const state        = await readState();
+  const fromUpdateId = state.storiesLastUpdateId || 0;
+
+  console.log(`📡 [Stories] Fetching updates from offset ${fromUpdateId}…`);
+  const { messages: raw, lastUpdateId } = await fetchUpdates(STORIES_CHANNEL_ID, fromUpdateId);
+  console.log(`📦 [Stories] ${raw.length} channel posts received`);
+
+  const audioPosts = raw.filter((m) => m.audio != null);
+  console.log(`🎙️  [Stories] ${audioPosts.length} audio messages`);
+
+  if (audioPosts.length === 0) {
+    if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
+    return { created: 0, skipped: 0, scanned: raw.length };
+  }
+
+  const allSeries  = await prisma.series.findMany({ select: { id: true, title: true } });
+  const seriesMap  = new Map(allSeries.map((s) => [s.title.toLowerCase(), s]));
+
+  const existingEpisodes = await prisma.episode.findMany({ select: { telegramFileId: true, seriesId: true, episodeNumber: true } });
+  const seenFileIds      = new Set(existingEpisodes.map((e) => e.telegramFileId).filter(Boolean));
+  const seenEpKeys       = new Set(existingEpisodes.map((e) => `${e.seriesId}::${e.episodeNumber}`));
+
+  const episodesToCreate = [];
+  let skipped = 0;
+
+  for (const msg of audioPosts) {
+    const audio   = msg.audio;
+    const fileId  = audio.file_id;
+    const caption = msg.caption || '';
+
+    if (seenFileIds.has(fileId)) { skipped++; continue; }
+
+    // Caption format expected: "Series Title — EP1: Episode Title"
+    // or filename: SeriesTitle_EP01_EpisodeTitle.m4a
+    const captionMatch  = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
+    const fileNameMatch = audio.file_name?.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
+    const match         = captionMatch || fileNameMatch;
+
+    if (!match) {
+      console.warn(`⚠️  [Stories] Cannot parse series/episode from: "${caption || audio.file_name}"`);
+      skipped++;
+      continue;
+    }
+
+    const seriesTitle  = match[1].trim();
+    const episodeNum   = parseInt(match[2]);
+    const episodeTitle = match[3].trim();
+
+    // Find or create series
+    let series = seriesMap.get(seriesTitle.toLowerCase());
+    if (!series) {
+      series = await prisma.series.create({ data: { title: seriesTitle } });
+      seriesMap.set(seriesTitle.toLowerCase(), series);
+      console.log(`📚 [Stories] Created series: "${seriesTitle}"`);
+    }
+
+    const epKey = `${series.id}::${episodeNum}`;
+    if (seenEpKeys.has(epKey)) { skipped++; continue; }
+
+    seenFileIds.add(fileId);
+    seenEpKeys.add(epKey);
+
+    episodesToCreate.push({
+      seriesId:       series.id,
+      episodeNumber:  episodeNum,
+      title:          episodeTitle,
+      telegramFileId: fileId,
+      duration:       audio.duration ?? null,
+      partCount:      1,
+    });
+  }
+
+  if (episodesToCreate.length > 0) {
+    await prisma.episode.createMany({ data: episodesToCreate, skipDuplicates: true });
+    console.log(`🎙️  [Stories] Inserted ${episodesToCreate.length} episodes, skipped ${skipped}`);
+  }
+
+  if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
+  return { created: episodesToCreate.length, skipped, scanned: raw.length };
 }
 
 // ── runCoversSync ─────────────────────────────────────────────────────────────
 async function runCoversSync() {
-  const state     = await readState();
-  const fromMsgId = (state.coversLastMsgId || 0) + 1;
-  const channelId = process.env.TELEGRAM_COVERS_CHANNEL_ID;
+  const state        = await readState();
+  const fromUpdateId = state.coversLastUpdateId || 0;
 
-  console.log(`📡 [Covers] Syncing from message ID ${fromMsgId}…`);
-  const raw = await fetchChannelMessages(channelId, fromMsgId);
-  console.log(`📦 [Covers] ${raw.length} messages received`);
-
-  let highestMsgId = state.coversLastMsgId || 0;
-  for (const m of raw) {
-    const id = getOriginalMsgId(m);
-    if (id > highestMsgId) highestMsgId = id;
-  }
+  console.log(`📡 [Covers] Fetching updates from offset ${fromUpdateId}…`);
+  const { messages: raw, lastUpdateId } = await fetchUpdates(COVERS_CHANNEL_ID, fromUpdateId);
+  console.log(`📦 [Covers] ${raw.length} channel posts received`);
 
   const photoMessages = raw.filter((m) => m.photo);
   console.log(`🖼️  [Covers] ${photoMessages.length} photo messages`);
 
   if (photoMessages.length === 0) {
-    await saveState({ coversLastMsgId: highestMsgId });
+    if (lastUpdateId > fromUpdateId) await saveState({ coversLastUpdateId: lastUpdateId });
     return { updated: 0, scanned: raw.length };
   }
 
@@ -292,8 +350,7 @@ async function runCoversSync() {
   const seriesUpdates = [];
 
   for (const msg of photoMessages) {
-    // Caption may be on the original message (via forward_origin) or the forwarded copy
-    const caption = msg.caption || msg.forward_origin?.caption || '';
+    const caption = msg.caption || '';
     const fileId  = msg.photo[msg.photo.length - 1].file_id; // highest resolution
 
     const albumMatch  = caption.match(/COVER_ALBUM:(.+)/i);
@@ -301,7 +358,6 @@ async function runCoversSync() {
 
     if (albumMatch) {
       const name  = albumMatch[1].replace(/\([^)]*\)/g, '').trim().toLowerCase();
-      // Exact match first, then partial
       const album = albumMap.get(name) ?? [...albumMap.values()].find((a) => a.title.toLowerCase().includes(name));
       if (album) {
         albumUpdates.push({ id: album.id, fileId });
@@ -332,7 +388,7 @@ async function runCoversSync() {
     ),
   ]);
 
-  await saveState({ coversLastMsgId: highestMsgId });
+  if (lastUpdateId > fromUpdateId) await saveState({ coversLastUpdateId: lastUpdateId });
   return { updated: albumUpdates.length + seriesUpdates.length, scanned: raw.length };
 }
 
@@ -350,6 +406,20 @@ router.post('/music', (req, res) => {
     .then((r)  => { syncStatus.music.lastResult = r; console.log('✅ [Music] sync done:', r); })
     .catch((e) => { syncStatus.music.lastError  = e.message; console.error('❌ [Music]', e.message); })
     .finally(() => { syncStatus.music.running = false; });
+});
+
+// POST /api/sync/stories
+router.post('/stories', (req, res) => {
+  if (syncStatus.stories.running)
+    return res.status(409).json({ message: 'Stories sync already running — poll GET /api/sync/status' });
+
+  syncStatus.stories = { ...syncStatus.stories, running: true, lastError: null, lastRun: new Date().toISOString() };
+  res.status(202).json({ message: 'Stories sync started. Poll GET /api/sync/status for result.' });
+
+  runStoriesSync()
+    .then((r)  => { syncStatus.stories.lastResult = r; console.log('✅ [Stories] sync done:', r); })
+    .catch((e) => { syncStatus.stories.lastError  = e.message; console.error('❌ [Stories]', e.message); })
+    .finally(() => { syncStatus.stories.running = false; });
 });
 
 // POST /api/sync/covers
@@ -370,17 +440,18 @@ router.post('/covers', (req, res) => {
 router.get('/status', async (req, res, next) => {
   try {
     const state = await readState();
-    res.json({ success: true, data: { music: syncStatus.music, covers: syncStatus.covers, state } });
+    res.json({ success: true, data: { music: syncStatus.music, stories: syncStatus.stories, covers: syncStatus.covers, state } });
   } catch (err) { next(err); }
 });
 
-// POST /api/sync/reset — re-scans everything from message ID 1
+// POST /api/sync/reset — re-scans everything from the beginning
 router.post('/reset', async (req, res, next) => {
   try {
-    await saveState({ musicLastMsgId: 0, coversLastMsgId: 0 });
-    syncStatus.music.lastResult  = null;
-    syncStatus.covers.lastResult = null;
-    res.json({ success: true, message: 'Sync state reset. Next run will scan all messages from the start.' });
+    await saveState({ musicLastUpdateId: 0, storiesLastUpdateId: 0, coversLastUpdateId: 0 });
+    syncStatus.music.lastResult   = null;
+    syncStatus.stories.lastResult = null;
+    syncStatus.covers.lastResult  = null;
+    res.json({ success: true, message: 'Sync state reset. Next run will fetch all updates from the beginning.' });
   } catch (err) { next(err); }
 });
 
