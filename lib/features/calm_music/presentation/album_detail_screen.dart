@@ -1,17 +1,18 @@
 // lib/features/calm_music/presentation/album_detail_screen.dart
 //
-// FIX 1 — BLASTBufferQueue "max frames 7" overflow:
-//   Root cause: _SongTile watched the full downloadManagerProvider and
-//   favoritesProvider. Both update frequently (download ticks every ~200ms,
-//   audio position every 1s). With 10 tiles on screen each update triggered
-//   ALL tiles to rebuild simultaneously → 10+ GPU frame submissions → buffer
-//   overflow (max is 5+2=7).
-//   Fix: .select() so each tile only rebuilds when ITS OWN data changes.
+// FIX 1 — Instant "queued" feedback on download tap
+//   DownloadManager now sets status='downloading' before the async work starts,
+//   so the icon flips to a progress ring immediately on tap.
 //
-// FIX 2 — Instant album open (no loading on tap):
-//   albumWithSongsProvider now finds both albumDetail + songs already in
-//   Riverpod cache (prefetched by AlbumPrefetchController in background).
-//   The screen transitions immediately with no network call.
+// FIX 2 — Progress % shown inside the ring while downloading
+//   _SongTile reads dl.progress and shows "XX%" text overlaid on the ring.
+//
+// FIX 3 — Retry button on failed downloads
+//   If status == failed, show a red retry icon instead of the download arrow.
+//
+// FIX 4 — Polished ENC lock badge with glow
+//   Replaced the plain EncryptedBadge with an inline lock icon + "ENC" text
+//   that glows gold to make it obviously mean "offline-encrypted".
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -21,6 +22,7 @@ import '../providers/calm_music_provider.dart';
 import '../../player/providers/audio_player_provider.dart';
 import '../../player/domain/media_item_model.dart';
 import '../../downloads/data/services/download_manager.dart';
+import '../../downloads/data/models/download_model.dart';
 import '../../favorites/providers/favorites_provider.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/theme/app_theme.dart';
@@ -38,7 +40,6 @@ class AlbumDetailScreen extends ConsumerWidget {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: combinedAsync.when(
-        // After prefetch this loading state should never be visible
         loading: () => _AlbumDetailSkeleton(),
         error: (_, __) => Scaffold(
           appBar: AppBar(backgroundColor: AppColors.background),
@@ -51,7 +52,6 @@ class AlbumDetailScreen extends ConsumerWidget {
               _AlbumHeader(album: data.album!, songCount: data.songs.length)
             else
               const SliverAppBar(pinned: true),
-
             if (data.songs.isEmpty)
               const SliverToBoxAdapter(
                 child: EmptyStateWidget(
@@ -73,7 +73,6 @@ class AlbumDetailScreen extends ConsumerWidget {
                   addRepaintBoundaries: true,
                 ),
               ),
-
             const SliverToBoxAdapter(child: SizedBox(height: 120)),
           ],
         ),
@@ -190,6 +189,8 @@ class _AlbumHeader extends StatelessWidget {
   }
 }
 
+// ── Song tile ──────────────────────────────────────────────────────────────────
+
 class _SongTile extends ConsumerWidget {
   final SongModel song;
   final List<SongModel> allSongs;
@@ -218,20 +219,12 @@ class _SongTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // FIX: .select() — this tile ONLY rebuilds when its own song's download
-    // state changes. Previously watched the whole map → ALL tiles rebuilt on
-    // every 200ms progress tick for any downloading song → BLASTBufferQueue.
     final dl = ref.watch(
       downloadManagerProvider.select((map) => map[song.id]),
     );
-
-    // FIX: .select() — only rebuilds when THIS song's favorite state flips.
     final isFav = ref.watch(
       favoritesProvider.select((set) => set.contains(song.id)),
     );
-
-    final isDownloaded = dl?.isCompleted ?? false;
-    final isDownloading = dl?.isInProgress ?? false;
 
     return RepaintBoundary(
       child: ListTile(
@@ -266,45 +259,20 @@ class _SongTile extends ConsumerWidget {
             if (song.duration != null)
               DurationBadge(duration: song.formattedDuration),
             const SizedBox(width: 6),
-            if (isDownloaded) const EncryptedBadge(),
+            if (dl?.isCompleted == true) const _EncLockBadge(),
           ],
         ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (isDownloading)
-              SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(
-                  value: dl?.progress,
-                  strokeWidth: 2,
-                  color: AppColors.primary,
-                ),
-              )
-            else if (!isDownloaded)
-              IconButton(
-                icon: const Icon(Icons.download_rounded, size: 20),
-                color: AppColors.textTertiary,
-                onPressed: () {
-                  ref.read(downloadManagerProvider.notifier).startDownload(
-                        mediaId: song.id,
-                        title: song.title,
-                        mediaType: 'song',
-                        partCount: song.isMultiPart ? 2 : 1,
-                        artworkUrl: song.coverUrl ?? album?.coverUrl,
-                        subtitle: album?.title,
-                      );
-                },
-              )
-            else
-              const Icon(Icons.check_circle_rounded,
-                  color: AppColors.success, size: 20),
+            _DownloadButton(
+              song: song,
+              album: album,
+              dl: dl,
+            ),
             IconButton(
               icon: Icon(
-                isFav
-                    ? Icons.favorite_rounded
-                    : Icons.favorite_border_rounded,
+                isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
                 size: 20,
               ),
               color: isFav ? AppColors.error : AppColors.textTertiary,
@@ -321,6 +289,198 @@ class _SongTile extends ConsumerWidget {
               .playItem(queue[index], queue: queue, index: index);
           AppRouter.navigateToPlayer(context);
         },
+      ),
+    );
+  }
+}
+
+// ── Download button widget ────────────────────────────────────────────────────
+// Shows: download arrow → animated ring with % → check/lock → retry on fail
+
+class _DownloadButton extends ConsumerWidget {
+  final SongModel song;
+  final AlbumModel? album;
+  final DownloadModel? dl;
+
+  const _DownloadButton({
+    required this.song,
+    required this.album,
+    required this.dl,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // ── Completed ──────────────────────────────────────────────────────────
+    if (dl?.isCompleted == true) {
+      return const Padding(
+        padding: EdgeInsets.all(8.0),
+        child: Icon(
+          Icons.check_circle_rounded,
+          color: AppColors.success,
+          size: 22,
+        ),
+      );
+    }
+
+    // ── Downloading / merging / encrypting ──────────────────────────────────
+    if (dl?.isInProgress == true) {
+      final progress = dl!.progress.clamp(0.0, 1.0);
+      final pct = (progress * 100).round();
+
+      // Color by phase
+      final Color ringColor;
+      final String label;
+      if (dl!.status == 'merging' || dl!.status == 'encrypting') {
+        ringColor = AppColors.accentGold;
+        label = dl!.status == 'encrypting' ? '🔒' : '⚙';
+      } else {
+        ringColor = AppColors.primary;
+        label = '$pct%';
+      }
+
+      return SizedBox(
+        width: 44,
+        height: 44,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            // Background track
+            SizedBox(
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(
+                value: progress > 0 ? progress : null,
+                strokeWidth: 2.5,
+                backgroundColor: AppColors.surfaceVariant,
+                color: ringColor,
+              ),
+            ),
+            // Percentage label inside ring
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 8,
+                fontWeight: FontWeight.w700,
+                color: ringColor,
+                letterSpacing: -0.3,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // ── Failed — show retry ────────────────────────────────────────────────
+    if (dl?.isFailed == true) {
+      return IconButton(
+        icon: const Icon(Icons.refresh_rounded, size: 20),
+        color: AppColors.error,
+        tooltip: 'Retry download',
+        onPressed: () {
+          ref.read(downloadManagerProvider.notifier).retryDownload(song.id);
+        },
+      );
+    }
+
+    // ── Not downloaded — show download arrow ───────────────────────────────
+    return IconButton(
+      icon: const Icon(Icons.download_rounded, size: 20),
+      color: AppColors.textTertiary,
+      onPressed: () {
+        ref.read(downloadManagerProvider.notifier).startDownload(
+              mediaId: song.id,
+              title: song.title,
+              mediaType: 'song',
+              partCount: song.isMultiPart ? 2 : 1,
+              artworkUrl: song.coverUrl ?? album?.coverUrl,
+              subtitle: album?.title,
+            );
+
+        // Show snackbar so user knows it started
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.download_rounded,
+                    color: Colors.white, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Downloading "${song.title}"…',
+                    style: const TextStyle(fontSize: 13),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10)),
+            backgroundColor: AppColors.surfaceVariant,
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ── Polished ENC lock badge ───────────────────────────────────────────────────
+
+class _EncLockBadge extends StatelessWidget {
+  const _EncLockBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.accentGold.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+          color: AppColors.accentGold.withOpacity(0.55),
+          width: 0.8,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.accentGold.withOpacity(0.25),
+            blurRadius: 6,
+            spreadRadius: 0,
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.lock_rounded,
+            size: 9,
+            color: AppColors.accentGold,
+            shadows: [
+              Shadow(
+                color: AppColors.accentGold.withOpacity(0.6),
+                blurRadius: 4,
+              ),
+            ],
+          ),
+          const SizedBox(width: 3),
+          Text(
+            'ENC',
+            style: TextStyle(
+              color: AppColors.accentGold,
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.6,
+              shadows: [
+                Shadow(
+                  color: AppColors.accentGold.withOpacity(0.5),
+                  blurRadius: 4,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

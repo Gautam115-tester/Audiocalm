@@ -1,11 +1,10 @@
 // lib/features/calm_stories/presentation/series_detail_screen.dart
 //
-// FIX: BLASTBufferQueue "acquired max frames" error — same root cause as
-// album_detail_screen.dart. _EpisodeTile was watching the full
-// downloadManagerProvider (rebuilds ALL tiles on every progress tick for
-// ANY episode) and favoritesProvider (rebuilds ALL tiles on any toggle).
-//
-// Solution: use select() so each tile only rebuilds when its OWN data changes.
+// Same download UX improvements as album_detail_screen.dart:
+// - Instant feedback on tap (snackbar + icon flips immediately)
+// - Progress ring with % shown while downloading
+// - Retry button when failed
+// - Polished ENC lock badge
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -15,6 +14,7 @@ import '../providers/calm_stories_provider.dart';
 import '../../player/providers/audio_player_provider.dart';
 import '../../player/domain/media_item_model.dart';
 import '../../downloads/data/services/download_manager.dart';
+import '../../downloads/data/models/download_model.dart';
 import '../../favorites/providers/favorites_provider.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/theme/app_theme.dart';
@@ -65,15 +65,12 @@ class SeriesDetailScreen extends ConsumerWidget {
               }
               return SliverList(
                 delegate: SliverChildBuilderDelegate(
-                  (context, i) {
-                    final ep = episodes[i];
-                    return _EpisodeTile(
-                      episode: ep,
-                      allEpisodes: episodes,
-                      seriesAsync: seriesAsync,
-                      index: i,
-                    );
-                  },
+                  (context, i) => _EpisodeTile(
+                    episode: episodes[i],
+                    allEpisodes: episodes,
+                    seriesAsync: seriesAsync,
+                    index: i,
+                  ),
                   childCount: episodes.length,
                   addAutomaticKeepAlives: false,
                   addRepaintBoundaries: true,
@@ -103,10 +100,7 @@ class _SeriesHeader extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             CoverImage(
-              url: series.coverUrl,
-              size: double.infinity,
-              borderRadius: 0,
-            ),
+                url: series.coverUrl, size: double.infinity, borderRadius: 0),
             Container(
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
@@ -181,20 +175,12 @@ class _EpisodeTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // FIX: select() so this tile only rebuilds when ITS OWN download state
-    // changes — not when any other episode's download progress ticks.
     final dl = ref.watch(
       downloadManagerProvider.select((map) => map[episode.id]),
     );
-
-    // FIX: select() so this tile only rebuilds when ITS OWN favorite state
-    // changes — not on any other episode's toggle.
     final isFav = ref.watch(
       favoritesProvider.select((set) => set.contains(episode.id)),
     );
-
-    final isDownloaded = dl?.isCompleted ?? false;
-    final isDownloading = dl?.isInProgress ?? false;
     final series = seriesAsync.valueOrNull;
 
     return RepaintBoundary(
@@ -230,45 +216,20 @@ class _EpisodeTile extends ConsumerWidget {
             if (episode.duration != null)
               DurationBadge(duration: episode.formattedDuration),
             const SizedBox(width: 6),
-            if (isDownloaded) const EncryptedBadge(),
+            if (dl?.isCompleted == true) const _EncLockBadge(),
           ],
         ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (isDownloading)
-              SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(
-                  value: dl?.progress,
-                  strokeWidth: 2,
-                  color: AppColors.primary,
-                ),
-              )
-            else if (!isDownloaded)
-              IconButton(
-                icon: const Icon(Icons.download_rounded, size: 20),
-                color: AppColors.textTertiary,
-                onPressed: () {
-                  ref.read(downloadManagerProvider.notifier).startDownload(
-                        mediaId: episode.id,
-                        title: episode.title,
-                        mediaType: 'episode',
-                        partCount: episode.isMultiPart ? 2 : 1,
-                        artworkUrl: series?.coverUrl,
-                        subtitle: series?.title,
-                      );
-                },
-              )
-            else
-              const Icon(Icons.check_circle_rounded,
-                  color: AppColors.success, size: 20),
+            _DownloadButton(
+              episode: episode,
+              series: series,
+              dl: dl,
+            ),
             IconButton(
               icon: Icon(
-                isFav
-                    ? Icons.favorite_rounded
-                    : Icons.favorite_border_rounded,
+                isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
                 size: 20,
               ),
               color: isFav ? AppColors.error : AppColors.textTertiary,
@@ -285,6 +246,186 @@ class _EpisodeTile extends ConsumerWidget {
               .playItem(queue[index], queue: queue, index: index);
           AppRouter.navigateToPlayer(context);
         },
+      ),
+    );
+  }
+}
+
+// ── Download button ────────────────────────────────────────────────────────────
+
+class _DownloadButton extends ConsumerWidget {
+  final EpisodeModel episode;
+  final SeriesModel? series;
+  final DownloadModel? dl;
+
+  const _DownloadButton({
+    required this.episode,
+    required this.series,
+    required this.dl,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Completed
+    if (dl?.isCompleted == true) {
+      return const Padding(
+        padding: EdgeInsets.all(8.0),
+        child: Icon(Icons.check_circle_rounded,
+            color: AppColors.success, size: 22),
+      );
+    }
+
+    // In progress — ring with percentage
+    if (dl?.isInProgress == true) {
+      final progress = dl!.progress.clamp(0.0, 1.0);
+      final pct = (progress * 100).round();
+
+      final Color ringColor;
+      final String label;
+      if (dl!.status == 'merging' || dl!.status == 'encrypting') {
+        ringColor = AppColors.accentGold;
+        label = dl!.status == 'encrypting' ? '🔒' : '⚙';
+      } else {
+        ringColor = AppColors.primary;
+        label = '$pct%';
+      }
+
+      return SizedBox(
+        width: 44,
+        height: 44,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(
+                value: progress > 0 ? progress : null,
+                strokeWidth: 2.5,
+                backgroundColor: AppColors.surfaceVariant,
+                color: ringColor,
+              ),
+            ),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 8,
+                fontWeight: FontWeight.w700,
+                color: ringColor,
+                letterSpacing: -0.3,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Failed — retry button
+    if (dl?.isFailed == true) {
+      return IconButton(
+        icon: const Icon(Icons.refresh_rounded, size: 20),
+        color: AppColors.error,
+        tooltip: 'Retry download',
+        onPressed: () {
+          ref.read(downloadManagerProvider.notifier).retryDownload(episode.id);
+        },
+      );
+    }
+
+    // Not downloaded
+    return IconButton(
+      icon: const Icon(Icons.download_rounded, size: 20),
+      color: AppColors.textTertiary,
+      onPressed: () {
+        ref.read(downloadManagerProvider.notifier).startDownload(
+              mediaId: episode.id,
+              title: episode.title,
+              mediaType: 'episode',
+              partCount: episode.isMultiPart ? 2 : 1,
+              artworkUrl: series?.coverUrl,
+              subtitle: series?.title,
+            );
+
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.download_rounded,
+                    color: Colors.white, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Downloading "${episode.title}"…',
+                    style: const TextStyle(fontSize: 13),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            backgroundColor: AppColors.surfaceVariant,
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ── Polished ENC lock badge ────────────────────────────────────────────────────
+
+class _EncLockBadge extends StatelessWidget {
+  const _EncLockBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.accentGold.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+          color: AppColors.accentGold.withOpacity(0.55),
+          width: 0.8,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.accentGold.withOpacity(0.25),
+            blurRadius: 6,
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.lock_rounded,
+            size: 9,
+            color: AppColors.accentGold,
+            shadows: [
+              Shadow(
+                  color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4),
+            ],
+          ),
+          const SizedBox(width: 3),
+          Text(
+            'ENC',
+            style: TextStyle(
+              color: AppColors.accentGold,
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.6,
+              shadows: [
+                Shadow(
+                    color: AppColors.accentGold.withOpacity(0.5),
+                    blurRadius: 4),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
