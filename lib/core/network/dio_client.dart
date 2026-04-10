@@ -7,7 +7,6 @@ import '../errors/app_exceptions.dart';
 class DioClient {
   late final Dio _dio;
 
-  // Shared singleton instance to reuse the HTTP connection pool
   static DioClient? _instance;
   factory DioClient() {
     _instance ??= DioClient._internal();
@@ -18,31 +17,43 @@ class DioClient {
     _dio = Dio(
       BaseOptions(
         baseUrl: ApiConstants.baseUrl,
-        // PERF FIX: Reduced from 30s → 10s connect, 120s → 15s receive for JSON
-        // Stream endpoints use their own Dio instance with longer timeouts
         connectTimeout: const Duration(milliseconds: ApiConstants.connectTimeout),
         receiveTimeout: const Duration(milliseconds: ApiConstants.receiveTimeout),
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
-          // PERF FIX: Keep TCP connections alive across requests
           'Connection': 'keep-alive',
         },
-        // PERF FIX: Enable response compression
         responseType: ResponseType.json,
       ),
     );
 
-    // PERF FIX: Only log in debug mode, never log response bodies (huge JSON kills perf)
+    // FIX: Replace LogInterceptor entirely in debug mode.
+    // LogInterceptor always prints "*** Request ***" / "*** Response ***" banners
+    // even when requestBody/responseBody are false — this floods logcat and
+    // contributes to BLASTBufferQueue frame pressure on low-end devices.
+    // Use a minimal custom interceptor that only logs the URI + status code.
     assert(() {
-      _dio.interceptors.add(LogInterceptor(
-        requestBody: false,
-        responseBody: false, // was true — logging full JSON response is very slow
-        responseHeader: false,
-        requestHeader: false,
-        error: true,
-        logPrint: (obj) => print('[DioClient] $obj'),
-      ));
+      _dio.interceptors.add(
+        InterceptorsWrapper(
+          onRequest: (options, handler) {
+            // Single compact line per request — no multi-line banner spam
+            // ignore: avoid_print
+            print('[HTTP →] ${options.method} ${options.uri}');
+            handler.next(options);
+          },
+          onResponse: (response, handler) {
+            // ignore: avoid_print
+            print('[HTTP ←] ${response.statusCode} ${response.realUri}');
+            handler.next(response);
+          },
+          onError: (err, handler) {
+            // ignore: avoid_print
+            print('[HTTP ✗] ${err.requestOptions.uri} — ${err.message}');
+            handler.next(err);
+          },
+        ),
+      );
       return true;
     }());
 

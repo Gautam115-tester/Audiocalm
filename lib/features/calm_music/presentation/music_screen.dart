@@ -1,4 +1,8 @@
 // lib/features/calm_music/presentation/music_screen.dart
+//
+// SMART PREFETCH: Uses a ScrollController to detect which albums are visible,
+// then tells AlbumPrefetchController to warm exactly those + the next 5.
+// For a library of 1,000,000 albums, only ~10 items are ever prefetched at once.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,11 +11,88 @@ import '../providers/calm_music_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/shared_widgets.dart';
 
-class MusicScreen extends ConsumerWidget {
+// Grid constants — must match the GridView delegate below
+const _kCrossAxisCount = 2;
+const _kItemAspectRatio = 0.72;
+const _kSpacing = 14.0;
+const _kPadding = 16.0;
+
+class MusicScreen extends ConsumerStatefulWidget {
   const MusicScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<MusicScreen> createState() => _MusicScreenState();
+}
+
+class _MusicScreenState extends ConsumerState<MusicScreen> {
+  final _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_onScroll);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    final albums = ref.read(albumsListProvider).valueOrNull;
+    if (albums == null || albums.isEmpty) return;
+    _triggerPrefetch(albums);
+  }
+
+  /// Computes which album indices are currently visible in the grid,
+  /// then asks the prefetch controller to warm those + the next 5.
+  void _triggerPrefetch(List albums) {
+    final controller = ref.read(albumPrefetchControllerProvider);
+    final screenHeight = MediaQuery.of(context).size.height;
+    final scrollOffset = _scrollController.hasClients
+        ? _scrollController.offset
+        : 0.0;
+
+    // Item height derived from aspect ratio + spacing
+    final itemWidth =
+        (MediaQuery.of(context).size.width - _kPadding * 2 - _kSpacing) /
+            _kCrossAxisCount;
+    final itemHeight = itemWidth / _kItemAspectRatio + _kSpacing;
+
+    // Row index range that is visible on screen
+    final firstVisibleRow = (scrollOffset / itemHeight).floor();
+    final lastVisibleRow =
+        ((scrollOffset + screenHeight) / itemHeight).ceil();
+
+    // Convert rows → flat album indices
+    final firstIdx = (firstVisibleRow * _kCrossAxisCount).clamp(0, albums.length - 1);
+    final lastIdx = ((lastVisibleRow + 1) * _kCrossAxisCount - 1)
+        .clamp(0, albums.length - 1);
+
+    final visibleIds = albums
+        .sublist(firstIdx, lastIdx + 1)
+        .map<String>((a) => a.id as String)
+        .toList();
+
+    // Next 5 beyond the visible window
+    final aheadEnd = (lastIdx + 1 + 5).clamp(0, albums.length);
+    final upcomingIds = lastIdx + 1 < albums.length
+        ? albums
+            .sublist(lastIdx + 1, aheadEnd)
+            .map<String>((a) => a.id as String)
+            .toList()
+        : <String>[];
+
+    controller.warmRange(
+      visibleIds: visibleIds,
+      upcomingIds: upcomingIds,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final albumsAsync = ref.watch(albumsListProvider);
 
     return Scaffold(
@@ -19,12 +100,12 @@ class MusicScreen extends ConsumerWidget {
       appBar: AppBar(title: const Text('Calm Music')),
       body: albumsAsync.when(
         loading: () => GridView.builder(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(_kPadding),
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            mainAxisSpacing: 14,
-            crossAxisSpacing: 14,
-            childAspectRatio: 0.72,
+            crossAxisCount: _kCrossAxisCount,
+            mainAxisSpacing: _kSpacing,
+            crossAxisSpacing: _kSpacing,
+            childAspectRatio: _kItemAspectRatio,
           ),
           itemCount: 6,
           itemBuilder: (_, __) =>
@@ -42,20 +123,25 @@ class MusicScreen extends ConsumerWidget {
               subtitle: 'Albums will appear here once synced',
             );
           }
+
+          // Trigger initial prefetch for whatever is visible on first render
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _triggerPrefetch(albums);
+          });
+
           return GridView.builder(
-            padding: const EdgeInsets.all(16),
-            // PERF FIX: Pre-render 300px of off-screen items for smooth scroll
+            controller: _scrollController,
+            padding: const EdgeInsets.all(_kPadding),
             cacheExtent: 300,
             gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              mainAxisSpacing: 14,
-              crossAxisSpacing: 14,
-              childAspectRatio: 0.72,
+              crossAxisCount: _kCrossAxisCount,
+              mainAxisSpacing: _kSpacing,
+              crossAxisSpacing: _kSpacing,
+              childAspectRatio: _kItemAspectRatio,
             ),
             itemCount: albums.length,
             itemBuilder: (context, i) {
               final a = albums[i];
-              // PERF FIX: RepaintBoundary per card — GPU only repaints touched card
               return RepaintBoundary(
                 child: _AlbumCard(
                   title: a.title,
@@ -110,8 +196,6 @@ class _AlbumCard extends StatelessWidget {
                     url: coverUrl,
                     size: double.infinity,
                     borderRadius: 0,
-                    // PERF FIX: Grid thumbnails decode at 300px max — 
-                    // saves ~70% RAM vs decoding full-size Telegram images
                     memCacheWidth: 300,
                     memCacheHeight: 300,
                     placeholder: Container(

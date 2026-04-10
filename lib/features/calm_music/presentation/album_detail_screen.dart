@@ -1,4 +1,17 @@
 // lib/features/calm_music/presentation/album_detail_screen.dart
+//
+// FIX 1 — BLASTBufferQueue "max frames 7" overflow:
+//   Root cause: _SongTile watched the full downloadManagerProvider and
+//   favoritesProvider. Both update frequently (download ticks every ~200ms,
+//   audio position every 1s). With 10 tiles on screen each update triggered
+//   ALL tiles to rebuild simultaneously → 10+ GPU frame submissions → buffer
+//   overflow (max is 5+2=7).
+//   Fix: .select() so each tile only rebuilds when ITS OWN data changes.
+//
+// FIX 2 — Instant album open (no loading on tap):
+//   albumWithSongsProvider now finds both albumDetail + songs already in
+//   Riverpod cache (prefetched by AlbumPrefetchController in background).
+//   The screen transitions immediately with no network call.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -20,20 +33,18 @@ class AlbumDetailScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // PERF FIX: Single provider fires both requests in parallel
     final combinedAsync = ref.watch(albumWithSongsProvider(albumId));
 
     return Scaffold(
       backgroundColor: AppColors.background,
       body: combinedAsync.when(
-        // PERF FIX: Show skeleton UI while loading instead of blank screen
+        // After prefetch this loading state should never be visible
         loading: () => _AlbumDetailSkeleton(),
         error: (_, __) => Scaffold(
           appBar: AppBar(backgroundColor: AppColors.background),
           body: const AppErrorWidget(message: 'Failed to load album'),
         ),
         data: (data) => CustomScrollView(
-          // PERF FIX: Cacheextent loads more list items off-screen = smoother scroll
           cacheExtent: 500,
           slivers: [
             if (data.album != null)
@@ -58,7 +69,6 @@ class AlbumDetailScreen extends ConsumerWidget {
                     index: i,
                   ),
                   childCount: data.songs.length,
-                  // PERF FIX: Adds items lazily — only builds visible ones
                   addAutomaticKeepAlives: false,
                   addRepaintBoundaries: true,
                 ),
@@ -72,7 +82,6 @@ class AlbumDetailScreen extends ConsumerWidget {
   }
 }
 
-// PERF FIX: Skeleton screen instead of blank during load — feels much faster
 class _AlbumDetailSkeleton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -131,7 +140,6 @@ class _AlbumHeader extends StatelessWidget {
         background: Stack(
           fit: StackFit.expand,
           children: [
-            // PERF FIX: memCacheWidth/Height limits decoded image size in RAM
             CoverImage(
               url: album.coverUrl,
               size: double.infinity,
@@ -182,8 +190,6 @@ class _AlbumHeader extends StatelessWidget {
   }
 }
 
-// PERF FIX: RepaintBoundary isolates each tile — scrolling doesn't repaint
-// tiles that are off-screen, reducing GPU work significantly
 class _SongTile extends ConsumerWidget {
   final SongModel song;
   final List<SongModel> allSongs;
@@ -212,13 +218,21 @@ class _SongTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final downloads = ref.watch(downloadManagerProvider);
-    final isFav = ref.watch(favoritesProvider).contains(song.id);
-    final dl = downloads[song.id];
+    // FIX: .select() — this tile ONLY rebuilds when its own song's download
+    // state changes. Previously watched the whole map → ALL tiles rebuilt on
+    // every 200ms progress tick for any downloading song → BLASTBufferQueue.
+    final dl = ref.watch(
+      downloadManagerProvider.select((map) => map[song.id]),
+    );
+
+    // FIX: .select() — only rebuilds when THIS song's favorite state flips.
+    final isFav = ref.watch(
+      favoritesProvider.select((set) => set.contains(song.id)),
+    );
+
     final isDownloaded = dl?.isCompleted ?? false;
     final isDownloading = dl?.isInProgress ?? false;
 
-    // PERF FIX: Wrap in RepaintBoundary — each tile is independent paint layer
     return RepaintBoundary(
       child: ListTile(
         contentPadding:

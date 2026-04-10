@@ -1,4 +1,11 @@
 // lib/features/calm_stories/presentation/series_detail_screen.dart
+//
+// FIX: BLASTBufferQueue "acquired max frames" error — same root cause as
+// album_detail_screen.dart. _EpisodeTile was watching the full
+// downloadManagerProvider (rebuilds ALL tiles on every progress tick for
+// ANY episode) and favoritesProvider (rebuilds ALL tiles on any toggle).
+//
+// Solution: use select() so each tile only rebuilds when its OWN data changes.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -31,7 +38,8 @@ class SeriesDetailScreen extends ConsumerWidget {
             loading: () => const SliverToBoxAdapter(
               child: SizedBox(height: 280, child: ShimmerBox(height: 280)),
             ),
-            error: (_, __) => const SliverToBoxAdapter(child: SizedBox.shrink()),
+            error: (_, __) =>
+                const SliverToBoxAdapter(child: SizedBox.shrink()),
             data: (series) => series != null
                 ? _SeriesHeader(series: series)
                 : const SliverToBoxAdapter(child: SizedBox.shrink()),
@@ -67,6 +75,8 @@ class SeriesDetailScreen extends ConsumerWidget {
                     );
                   },
                   childCount: episodes.length,
+                  addAutomaticKeepAlives: false,
+                  addRepaintBoundaries: true,
                 ),
               );
             },
@@ -171,96 +181,111 @@ class _EpisodeTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final downloads = ref.watch(downloadManagerProvider);
-    final isFav = ref.watch(favoritesProvider).contains(episode.id);
-    final dl = downloads[episode.id];
+    // FIX: select() so this tile only rebuilds when ITS OWN download state
+    // changes — not when any other episode's download progress ticks.
+    final dl = ref.watch(
+      downloadManagerProvider.select((map) => map[episode.id]),
+    );
+
+    // FIX: select() so this tile only rebuilds when ITS OWN favorite state
+    // changes — not on any other episode's toggle.
+    final isFav = ref.watch(
+      favoritesProvider.select((set) => set.contains(episode.id)),
+    );
+
     final isDownloaded = dl?.isCompleted ?? false;
     final isDownloading = dl?.isInProgress ?? false;
     final series = seriesAsync.valueOrNull;
 
-    return ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-      leading: Container(
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Center(
-          child: Text(
-            episode.episodeNumber.toString().padLeft(2, '0'),
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: AppColors.primary,
-                  fontWeight: FontWeight.w700,
-                ),
+    return RepaintBoundary(
+      child: ListTile(
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+        leading: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Center(
+            child: Text(
+              episode.episodeNumber.toString().padLeft(2, '0'),
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
           ),
         ),
-      ),
-      title: Text(episode.title,
+        title: Text(
+          episode.title,
           style: Theme.of(context)
               .textTheme
               .titleMedium
-              ?.copyWith(fontSize: 14)),
-      subtitle: Row(
-        children: [
-          if (episode.duration != null)
-            DurationBadge(duration: episode.formattedDuration),
-          const SizedBox(width: 6),
-          if (isDownloaded) const EncryptedBadge(),
-        ],
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isDownloading)
-            SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(
-                value: dl?.progress,
-                strokeWidth: 2,
-                color: AppColors.primary,
-              ),
-            )
-          else if (!isDownloaded)
+              ?.copyWith(fontSize: 14),
+        ),
+        subtitle: Row(
+          children: [
+            if (episode.duration != null)
+              DurationBadge(duration: episode.formattedDuration),
+            const SizedBox(width: 6),
+            if (isDownloaded) const EncryptedBadge(),
+          ],
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isDownloading)
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  value: dl?.progress,
+                  strokeWidth: 2,
+                  color: AppColors.primary,
+                ),
+              )
+            else if (!isDownloaded)
+              IconButton(
+                icon: const Icon(Icons.download_rounded, size: 20),
+                color: AppColors.textTertiary,
+                onPressed: () {
+                  ref.read(downloadManagerProvider.notifier).startDownload(
+                        mediaId: episode.id,
+                        title: episode.title,
+                        mediaType: 'episode',
+                        partCount: episode.isMultiPart ? 2 : 1,
+                        artworkUrl: series?.coverUrl,
+                        subtitle: series?.title,
+                      );
+                },
+              )
+            else
+              const Icon(Icons.check_circle_rounded,
+                  color: AppColors.success, size: 20),
             IconButton(
-              icon: const Icon(Icons.download_rounded, size: 20),
-              color: AppColors.textTertiary,
-              onPressed: () {
-  ref.read(downloadManagerProvider.notifier).startDownload(
-    mediaId: episode.id,
-    title: episode.title,
-    mediaType: 'episode',
-    partCount: episode.isMultiPart ? 2 : 1, // actual count fetched during download
-    artworkUrl: series?.coverUrl,
-    subtitle: series?.title,
-  );
-},
-            )
-          else
-            const Icon(Icons.check_circle_rounded,
-                color: AppColors.success, size: 20),
-          IconButton(
-            icon: Icon(
-              isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-              size: 20,
+              icon: Icon(
+                isFav
+                    ? Icons.favorite_rounded
+                    : Icons.favorite_border_rounded,
+                size: 20,
+              ),
+              color: isFav ? AppColors.error : AppColors.textTertiary,
+              onPressed: () =>
+                  ref.read(favoritesProvider.notifier).toggle(episode.id),
             ),
-            color: isFav ? AppColors.error : AppColors.textTertiary,
-            onPressed: () =>
-                ref.read(favoritesProvider.notifier).toggle(episode.id),
-          ),
-        ],
+          ],
+        ),
+        onTap: () {
+          final queue =
+              allEpisodes.map((ep) => _toPlayable(ep, series)).toList();
+          ref
+              .read(audioPlayerProvider.notifier)
+              .playItem(queue[index], queue: queue, index: index);
+          AppRouter.navigateToPlayer(context);
+        },
       ),
-      onTap: () {
-        final queue = allEpisodes
-            .map((ep) => _toPlayable(ep, series))
-            .toList();
-        ref
-            .read(audioPlayerProvider.notifier)
-            .playItem(queue[index], queue: queue, index: index);
-        AppRouter.navigateToPlayer(context);
-      },
     );
   }
 }
