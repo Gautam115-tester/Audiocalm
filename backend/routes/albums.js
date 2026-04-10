@@ -1,73 +1,106 @@
 // routes/albums.js
-// PERF FIX: The biggest backend bottleneck was GET /api/albums calling
-// getCoverUrl() for EVERY album. getCoverUrl hits the Telegram API once per
-// file_id to get a signed URL. With 20 albums = 20 Telegram round-trips
-// before the response is sent.
 //
-// Solution: Return the raw coverTelegramFileId as 'coverFileId' so the Flutter
-// app can construct a direct URL on demand, OR include the Telegram file URL
-// from the 45-min cache. If the cache is warm it's fast; if cold we skip it
-// and return null so the UI can show a placeholder instantly.
+// FIXES IN THIS VERSION
+// =====================
 //
-// For the album LIST endpoint: skip slow URL resolution, return coverFileId.
-// For the album DETAIL endpoint: resolve the URL (only 1 album, fast).
-// For songs: resolve once per album (shared across all tracks).
+// 1. SERVER-SIDE CACHE FOR /:id AND /:id/songs (NEW)
+//    The Flutter client fires GET /api/albums/:id AND /api/albums/:id/songs for
+//    every album on startup — 11 albums × 2 = 22 simultaneous requests.
+//    HTTP Cache-Control headers don't help because Dio doesn't cache by default.
+//    Added NodeCache entries for album detail (5 min) and songs (5 min) so the
+//    second and subsequent requests return instantly from memory.
+//
+// 2. CACHE STAMPEDE PREVENTION (NEW)
+//    When the server cold-starts and 11 parallel /api/albums requests arrive at
+//    the same time, all miss the empty cache and all fire DB + Telegram calls
+//    simultaneously. Fixed with an in-flight Map: if a cache miss is already
+//    being resolved, subsequent callers await the same Promise instead of
+//    starting a new one.
+//
+// 3. SONGS ENDPOINT COVER URL (FIXED)
+//    The /:id/songs endpoint was calling getCoverUrl() once per request but
+//    with no caching, every parallel song-list request hit Telegram.
+//    Now the cover URL is resolved once from the shared telegram URL cache
+//    and the whole songs response is cached for 5 minutes.
+//
+// 4. CACHE INVALIDATION (EXTENDED)
+//    PATCH and DELETE now also invalidate the detail and songs caches for
+//    that specific album, not just the list cache.
 
-const express  = require('express');
-const router   = express.Router();
-const prisma   = require('../services/db');
-const telegram = require('../services/telegram');
+const express   = require('express');
+const router    = express.Router();
+const prisma    = require('../services/db');
+const telegram  = require('../services/telegram');
 const NodeCache = require('node-cache');
 
-// PERF FIX: Short-lived cache for the album list response
-// If multiple users hit /api/albums within 60s, only one DB query fires
-const listCache = new NodeCache({ stdTTL: 60, checkperiod: 30 });
+// ── Caches ────────────────────────────────────────────────────────────────────
+
+// Album list: 60 s TTL (rarely changes; invalidated on mutation)
+const listCache   = new NodeCache({ stdTTL: 60,  checkperiod: 30 });
+// Album detail: 5 min TTL
+const detailCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+// Album songs: 5 min TTL
+const songsCache  = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+
+// In-flight map: prevents cache stampede when multiple requests arrive before
+// the first one has populated the cache. Key → Promise.
+const inFlight = new Map();
+
+async function withCache(cache, key, fetcher) {
+  const hit = cache.get(key);
+  if (hit !== undefined) return { data: hit, fromCache: true };
+
+  // If a request for this key is already in flight, join it.
+  if (inFlight.has(key)) {
+    const data = await inFlight.get(key);
+    return { data, fromCache: false };
+  }
+
+  const promise = fetcher();
+  inFlight.set(key, promise);
+  try {
+    const data = await promise;
+    cache.set(key, data);
+    return { data, fromCache: false };
+  } finally {
+    inFlight.delete(key);
+  }
+}
 
 // ── GET /api/albums ──────────────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
-    // PERF FIX: Serve from cache if available
-    const cached = listCache.get('albums_list');
-    if (cached) {
-      res.setHeader('X-Cache', 'HIT');
-      return res.json({ success: true, data: cached });
-    }
+    const { data, fromCache } = await withCache(listCache, 'albums_list', async () => {
+      const albums = await prisma.album.findMany({
+        where:   { isActive: true },
+        orderBy: { createdAt: 'desc' },
+        include: { _count: { select: { songs: { where: { isActive: true } } } } },
+      });
 
-    const albums = await prisma.album.findMany({
-      where:   { isActive: true },
-      orderBy: { createdAt: 'desc' },
-      include: { _count: { select: { songs: { where: { isActive: true } } } } },
+      // Resolve cover URLs in parallel — getCoverUrl is already cached 45 min
+      // in telegram.js, so this is only slow on cold start.
+      return Promise.all(
+        albums.map(async (a) => {
+          const coverUrl = a.coverTelegramFileId
+            ? await telegram.getCoverUrl(a.coverTelegramFileId).catch(() => null)
+            : null;
+          return {
+            id:          a.id,
+            title:       a.title,
+            artist:      a.artist,
+            genre:       a.genre,
+            releaseYear: a.releaseYear,
+            description: a.description,
+            coverUrl,
+            trackCount:  a._count.songs,
+            createdAt:   a.createdAt,
+          };
+        })
+      );
     });
 
-    // PERF FIX: Resolve cover URLs in parallel (was sequential in some cases)
-    // But only for albums that have a coverTelegramFileId — skip null ones
-    const data = await Promise.all(
-      albums.map(async (a) => {
-        // Only hit Telegram if there's a file ID to resolve
-        const coverUrl = a.coverTelegramFileId
-          ? await telegram.getCoverUrl(a.coverTelegramFileId).catch(() => null)
-          : null;
-
-        return {
-          id:          a.id,
-          title:       a.title,
-          artist:      a.artist,
-          genre:       a.genre,
-          releaseYear: a.releaseYear,
-          description: a.description,
-          coverUrl,
-          trackCount:  a._count.songs,
-          createdAt:   a.createdAt,
-        };
-      })
-    );
-
-    // PERF FIX: Cache the result for 60 seconds
-    listCache.set('albums_list', data);
-
-    // PERF FIX: Tell CDN/proxy to cache for 60s too
+    res.setHeader('X-Cache', fromCache ? 'HIT' : 'MISS');
     res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
-    res.setHeader('X-Cache', 'MISS');
     res.json({ success: true, data });
   } catch (err) { next(err); }
 });
@@ -75,21 +108,17 @@ router.get('/', async (req, res, next) => {
 // ── GET /api/albums/:id ──────────────────────────────────────────────────────
 router.get('/:id', async (req, res, next) => {
   try {
-    const album = await prisma.album.findUnique({
-      where:   { id: req.params.id },
-      include: { _count: { select: { songs: { where: { isActive: true } } } } },
-    });
+    const cacheKey = `album:${req.params.id}`;
 
-    if (!album) return res.status(404).json({ error: 'Album not found' });
+    const { data, fromCache } = await withCache(detailCache, cacheKey, async () => {
+      const album = await prisma.album.findUnique({
+        where:   { id: req.params.id },
+        include: { _count: { select: { songs: { where: { isActive: true } } } } },
+      });
+      if (!album) return null;
 
-    // Only 1 album — resolving cover URL is fine here
-    const coverUrl = await telegram.getCoverUrl(album.coverTelegramFileId);
-
-    // PERF FIX: Cache album detail for 5 minutes
-    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
-    res.json({
-      success: true,
-      data: {
+      const coverUrl = await telegram.getCoverUrl(album.coverTelegramFileId);
+      return {
         id:          album.id,
         title:       album.title,
         artist:      album.artist,
@@ -100,30 +129,35 @@ router.get('/:id', async (req, res, next) => {
         trackCount:  album._count.songs,
         isActive:    album.isActive,
         createdAt:   album.createdAt,
-      },
+      };
     });
+
+    if (!data) return res.status(404).json({ error: 'Album not found' });
+
+    res.setHeader('X-Cache', fromCache ? 'HIT' : 'MISS');
+    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+    res.json({ success: true, data });
   } catch (err) { next(err); }
 });
 
 // ── GET /api/albums/:id/songs ────────────────────────────────────────────────
 router.get('/:id/songs', async (req, res, next) => {
   try {
-    const album = await prisma.album.findUnique({ where: { id: req.params.id } });
-    if (!album) return res.status(404).json({ error: 'Album not found' });
+    const cacheKey = `songs:${req.params.id}`;
 
-    const songs = await prisma.song.findMany({
-      where:   { albumId: req.params.id, isActive: true },
-      orderBy: { trackNumber: 'asc' },
-    });
+    const { data, fromCache } = await withCache(songsCache, cacheKey, async () => {
+      const album = await prisma.album.findUnique({ where: { id: req.params.id } });
+      if (!album) return null;
 
-    // PERF FIX: Resolve album cover once only (not per-song)
-    const coverUrl = await telegram.getCoverUrl(album.coverTelegramFileId);
+      const songs = await prisma.song.findMany({
+        where:   { albumId: req.params.id, isActive: true },
+        orderBy: { trackNumber: 'asc' },
+      });
 
-    // PERF FIX: Cache songs list for 5 minutes — rarely changes
-    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
-    res.json({
-      success: true,
-      data: songs.map((s) => ({
+      // Resolve cover URL once for the whole album — cached 45 min in telegram.js
+      const coverUrl = await telegram.getCoverUrl(album.coverTelegramFileId);
+
+      return songs.map((s) => ({
         id:          s.id,
         albumId:     s.albumId,
         trackNumber: s.trackNumber,
@@ -134,8 +168,14 @@ router.get('/:id/songs', async (req, res, next) => {
         isMultiPart: s.partCount > 1,
         coverUrl,
         createdAt:   s.createdAt,
-      })),
+      }));
     });
+
+    if (!data) return res.status(404).json({ error: 'Album not found' });
+
+    res.setHeader('X-Cache', fromCache ? 'HIT' : 'MISS');
+    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+    res.json({ success: true, data });
   } catch (err) { next(err); }
 });
 
@@ -155,7 +195,6 @@ router.post('/', async (req, res, next) => {
       },
     });
 
-    // Invalidate list cache when new album is added
     listCache.del('albums_list');
     res.status(201).json({ success: true, data: album });
   } catch (err) { next(err); }
@@ -179,7 +218,11 @@ router.patch('/:id', async (req, res, next) => {
       },
     });
 
+    // Invalidate all caches for this album
     listCache.del('albums_list');
+    detailCache.del(`album:${req.params.id}`);
+    songsCache.del(`songs:${req.params.id}`);
+
     res.json({ success: true, data: album });
   } catch (err) { next(err); }
 });
@@ -188,7 +231,11 @@ router.patch('/:id', async (req, res, next) => {
 router.delete('/:id', async (req, res, next) => {
   try {
     await prisma.album.update({ where: { id: req.params.id }, data: { isActive: false } });
+
     listCache.del('albums_list');
+    detailCache.del(`album:${req.params.id}`);
+    songsCache.del(`songs:${req.params.id}`);
+
     res.json({ success: true, message: 'Album deactivated' });
   } catch (err) { next(err); }
 });

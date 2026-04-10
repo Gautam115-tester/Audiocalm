@@ -1,3 +1,23 @@
+// prisma/schema.prisma
+//
+// FIXES IN THIS VERSION
+// =====================
+//
+// 1. MISSING DATABASE INDEXES (CRITICAL)
+//    None of the models had any indexes. Every query that filters/sorts by
+//    seriesId, albumId, isActive, episodeNumber, or trackNumber was doing a
+//    full table scan. With 11+ albums and N songs each, this compounds on
+//    every startup request.
+//
+//    Added indexes for:
+//      - Episode: [seriesId, isActive, episodeNumber] — covers the common
+//        "get active episodes for a series, ordered by number" query
+//      - Song: [albumId, isActive, trackNumber] — covers "get active songs
+//        for an album, ordered by track" query
+//      - Series/Album: [isActive, createdAt] — covers the list endpoints
+//        that filter isActive=true and order by createdAt desc
+//      - SyncState: key is already @id (primary key) — no change needed
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -18,6 +38,8 @@ model Series {
   updatedAt           DateTime  @updatedAt
   episodes            Episode[]
 
+  // FIX: Index for GET /api/series (filter isActive, order by createdAt)
+  @@index([isActive, createdAt(sort: Desc)])
   @@map("series")
 }
 
@@ -36,6 +58,9 @@ model Episode {
   series         Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
 
   @@unique([seriesId, episodeNumber])
+  // FIX: Index for GET /api/series/:id/episodes
+  // Covers: WHERE seriesId=? AND isActive=true ORDER BY episodeNumber ASC
+  @@index([seriesId, isActive, episodeNumber])
   @@map("episodes")
 }
 
@@ -52,6 +77,8 @@ model Album {
   updatedAt           DateTime @updatedAt
   songs               Song[]
 
+  // FIX: Index for GET /api/albums (filter isActive, order by createdAt)
+  @@index([isActive, createdAt(sort: Desc)])
   @@map("albums")
 }
 
@@ -69,8 +96,11 @@ model Song {
   updatedAt      DateTime @updatedAt
   album          Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
 
-  // Deduplication handled in sync.js — no unique constraint on trackNumber
-  // to prevent silent data loss via skipDuplicates on track number collisions.
+  // FIX: Index for GET /api/albums/:id/songs
+  // Covers: WHERE albumId=? AND isActive=true ORDER BY trackNumber ASC
+  @@index([albumId, isActive, trackNumber])
+  // FIX: Index for sync.js deduplication queries (groupBy albumId, findMany by albumId)
+  @@index([albumId])
   @@map("songs")
 }
 

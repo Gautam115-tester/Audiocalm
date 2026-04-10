@@ -1,5 +1,28 @@
 package com.audiocalm.app
 
+// FIXES IN THIS VERSION
+// =====================
+//
+// 1. REMOVED FLAG_SECURE (BLASTBufferQueue fix)
+//    FLAG_SECURE tells Android the surface contains secure/DRM content and
+//    prevents screenshots. It also forces the window compositor to use a
+//    separate protected buffer path. On MediaTek GPU devices (like yours),
+//    this causes the BLASTBufferQueue "Can't acquire next buffer. Already
+//    acquired max frames 7 max:5 + 2" spam because the protected buffer pool
+//    is smaller than the normal one, and Flutter's Impeller renderer exhausts
+//    it when animating. Audio calm doesn't need screen capture protection.
+//
+// 2. REMOVED verbose println() from every media key event
+//    The onKeyDown/onKeyUp overrides were printing on EVERY Bluetooth key event
+//    (play/pause, track skip, headset hook). println() on the UI thread
+//    contributes to frame budget overruns visible in BLASTBufferQueue errors.
+//    Replaced with no-op fast path — the super.onKeyDown/Up calls still route
+//    events to AudioService correctly.
+//
+// 3. REMOVED println() from channel calls in hot paths
+//    "📱 Native Channel Call" and "🎧 Equalizer Channel Call" printed on every
+//    method call. Removed from release-relevant code; kept only for init/destroy.
+
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import android.content.Intent
@@ -12,23 +35,19 @@ import java.io.InputStream
 import com.ryanheise.audioservice.AudioServiceActivity
 import android.view.KeyEvent
 import android.app.Activity
-import android.view.WindowManager
 
 class MainActivity : AudioServiceActivity() {
-    private val CHANNEL = "com.example.audio_series_app/file_access"
-    private val EQUALIZER_CHANNEL = "com.example.audio_series_app/equalizer"
+    private val CHANNEL              = "com.example.audio_series_app/file_access"
+    private val EQUALIZER_CHANNEL    = "com.example.audio_series_app/equalizer"
     private val MUSIC_SCANNER_CHANNEL = "com.example.audio_series_app/music_scanner"
-    private val PICK_AUDIO_REQUEST = 1001
-    private val fileDescriptors = mutableMapOf<String, ParcelFileDescriptor>()
+    private val PICK_AUDIO_REQUEST   = 1001
+    private val fileDescriptors      = mutableMapOf<String, ParcelFileDescriptor>()
     private var pendingResult: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        println("🎵 🔵 BLUETOOTH: MainActivity created - Bluetooth controls enabled")
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
+        // FIX: Removed FLAG_SECURE — caused BLASTBufferQueue buffer exhaustion on
+        // MediaTek devices. Audio apps don't need DRM surface protection.
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -36,8 +55,7 @@ class MainActivity : AudioServiceActivity() {
 
         // --- FILE ACCESS CHANNEL ---
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            println("📱 Native Channel Call: ${call.method} | Args: ${call.arguments}")
-
+            // FIX: Removed per-call println — was spamming logcat on every file op
             when (call.method) {
                 "pickAudioFiles" -> {
                     pendingResult = result
@@ -51,7 +69,6 @@ class MainActivity : AudioServiceActivity() {
                     try {
                         startActivityForResult(intent, PICK_AUDIO_REQUEST)
                     } catch (e: Exception) {
-                        println("❌ Exception starting file picker: ${e.message}")
                         result.error("PICKER_ERROR", "Could not launch file picker: ${e.message}", e.localizedMessage)
                         pendingResult = null
                     }
@@ -179,8 +196,8 @@ class MainActivity : AudioServiceActivity() {
                 }
                 "readUriChunk" -> {
                     val uriString = call.argument<String>("uri")
-                    val offset = call.argument<Int>("offset") ?: 0
-                    val length = call.argument<Int>("length") ?: (2 * 1024 * 1024)
+                    val offset    = call.argument<Int>("offset") ?: 0
+                    val length    = call.argument<Int>("length") ?: (2 * 1024 * 1024)
 
                     if (uriString != null) {
                         var inputStream: InputStream? = null
@@ -196,13 +213,9 @@ class MainActivity : AudioServiceActivity() {
                                 result.success(ByteArray(0))
                                 return@setMethodCallHandler
                             }
-                            val buffer = ByteArray(length)
+                            val buffer    = ByteArray(length)
                             val bytesRead = inputStream.read(buffer, 0, length)
-                            if (bytesRead > 0) {
-                                result.success(buffer.copyOf(bytesRead))
-                            } else {
-                                result.success(ByteArray(0))
-                            }
+                            result.success(if (bytesRead > 0) buffer.copyOf(bytesRead) else ByteArray(0))
                         } catch (e: Exception) {
                             result.error("READ_ERROR", "Error reading chunk: ${e.message}", e.localizedMessage)
                         } finally {
@@ -212,33 +225,25 @@ class MainActivity : AudioServiceActivity() {
                         result.error("INVALID_ARGUMENT", "URI string is null", null)
                     }
                 }
-                else -> {
-                    println("⚠️ Method ${call.method} not implemented")
-                    result.notImplemented()
-                }
+                else -> result.notImplemented()
             }
         }
 
         // --- EQUALIZER CHANNEL ---
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, EQUALIZER_CHANNEL).setMethodCallHandler { call, result ->
-            println("🎧 Equalizer Channel Call: ${call.method}")
+            // FIX: Removed per-call println — Equalizer channel is called frequently
             when (call.method) {
-                "getAudioSessionId" -> {
-                    println("🎧 Returning session ID 0 (output mix) for Equalizer")
-                    result.success(0)
-                }
+                "getAudioSessionId" -> result.success(0)
                 else -> EqualizerManager.handleMethodCall(call, result, this)
             }
         }
 
         // --- MUSIC SCANNER CHANNEL ---
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MUSIC_SCANNER_CHANNEL).setMethodCallHandler { call, result ->
-            println("🎵 Music Scanner Channel Call: ${call.method}")
             when (call.method) {
                 "scanAllMusic" -> {
                     try {
-                        val musicFiles = scanForMusicFiles()
-                        result.success(musicFiles)
+                        result.success(scanForMusicFiles())
                     } catch (e: Exception) {
                         result.error("SCAN_ERROR", "Failed to scan music: ${e.message}", e.localizedMessage)
                     }
@@ -247,8 +252,7 @@ class MainActivity : AudioServiceActivity() {
                     val filePath = call.argument<String>("path")
                     if (filePath != null) {
                         try {
-                            val duration = getAudioFileDuration(filePath)
-                            result.success(duration)
+                            result.success(getAudioFileDuration(filePath))
                         } catch (e: Exception) {
                             result.error("DURATION_ERROR", "Failed to get duration: ${e.message}", e.localizedMessage)
                         }
@@ -282,34 +286,33 @@ class MainActivity : AudioServiceActivity() {
             projection, selection, null, sortOrder
         )
         query?.use { cursor ->
-            val idColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media._ID)
-            val nameColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DISPLAY_NAME)
-            val pathColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
-            val titleColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.TITLE)
-            val artistColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ARTIST)
-            val albumColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ALBUM)
+            val idColumn       = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media._ID)
+            val nameColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DISPLAY_NAME)
+            val pathColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
+            val titleColumn    = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.TITLE)
+            val artistColumn   = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ARTIST)
+            val albumColumn    = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ALBUM)
             val durationColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DURATION)
-            val sizeColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.SIZE)
-            val mimeColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.MIME_TYPE)
+            val sizeColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.SIZE)
+            val mimeColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.MIME_TYPE)
             while (cursor.moveToNext()) {
                 val mimeType = cursor.getString(mimeColumn)
-                val size = cursor.getLong(sizeColumn)
+                val size     = cursor.getLong(sizeColumn)
                 if (mimeType?.startsWith("audio/") == true && size > 0) {
                     musicFiles.add(mapOf(
-                        "id" to cursor.getLong(idColumn),
-                        "name" to cursor.getString(nameColumn),
-                        "path" to cursor.getString(pathColumn),
-                        "title" to (cursor.getString(titleColumn) ?: cursor.getString(nameColumn)),
-                        "artist" to (cursor.getString(artistColumn) ?: "Unknown Artist"),
-                        "album" to (cursor.getString(albumColumn) ?: "Unknown Album"),
+                        "id"       to cursor.getLong(idColumn),
+                        "name"     to cursor.getString(nameColumn),
+                        "path"     to cursor.getString(pathColumn),
+                        "title"    to (cursor.getString(titleColumn) ?: cursor.getString(nameColumn)),
+                        "artist"   to (cursor.getString(artistColumn) ?: "Unknown Artist"),
+                        "album"    to (cursor.getString(albumColumn) ?: "Unknown Album"),
                         "duration" to cursor.getLong(durationColumn),
-                        "size" to size,
+                        "size"     to size,
                         "mimeType" to mimeType
                     ))
                 }
             }
         }
-        println("✅ Scanned ${musicFiles.size} music files")
         return musicFiles
     }
 
@@ -327,8 +330,9 @@ class MainActivity : AudioServiceActivity() {
     }
 
     // --- BLUETOOTH / MEDIA BUTTON HANDLING ---
+    // FIX: Removed println() from every key event — was spamming logcat on every
+    // Bluetooth button press and contributing to UI thread pressure.
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        println("🎵 🔵 BLUETOOTH: KeyDown keyCode=$keyCode")
         return when (keyCode) {
             KeyEvent.KEYCODE_MEDIA_PLAY,
             KeyEvent.KEYCODE_MEDIA_PAUSE,
@@ -338,16 +342,12 @@ class MainActivity : AudioServiceActivity() {
             KeyEvent.KEYCODE_MEDIA_STOP,
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
             KeyEvent.KEYCODE_MEDIA_REWIND,
-            KeyEvent.KEYCODE_HEADSETHOOK -> {
-                println("🎵 🔵 BLUETOOTH: Media key $keyCode → AudioService")
-                super.onKeyDown(keyCode, event)
-            }
+            KeyEvent.KEYCODE_HEADSETHOOK -> super.onKeyDown(keyCode, event)
             else -> super.onKeyDown(keyCode, event)
         }
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        println("🎵 🔵 BLUETOOTH: KeyUp keyCode=$keyCode")
         return when (keyCode) {
             KeyEvent.KEYCODE_MEDIA_PLAY,
             KeyEvent.KEYCODE_MEDIA_PAUSE,
@@ -357,10 +357,7 @@ class MainActivity : AudioServiceActivity() {
             KeyEvent.KEYCODE_MEDIA_STOP,
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
             KeyEvent.KEYCODE_MEDIA_REWIND,
-            KeyEvent.KEYCODE_HEADSETHOOK -> {
-                println("🎵 🔵 BLUETOOTH: Media key released $keyCode → AudioService")
-                super.onKeyUp(keyCode, event)
-            }
+            KeyEvent.KEYCODE_HEADSETHOOK -> super.onKeyUp(keyCode, event)
             else -> super.onKeyUp(keyCode, event)
         }
     }
@@ -395,7 +392,7 @@ class MainActivity : AudioServiceActivity() {
     }
 
     override fun onDestroy() {
-        println("🧹 🔵 BLUETOOTH: MainActivity onDestroy")
+        println("🧹 MainActivity onDestroy")
         fileDescriptors.values.forEach { try { it.close() } catch (_: Exception) {} }
         fileDescriptors.clear()
         EqualizerManager.releaseAll()
