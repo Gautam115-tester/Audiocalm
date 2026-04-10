@@ -1,18 +1,16 @@
 // lib/features/calm_music/presentation/album_detail_screen.dart
 //
-// FIX 1 — Instant "queued" feedback on download tap
-//   DownloadManager now sets status='downloading' before the async work starts,
-//   so the icon flips to a progress ring immediately on tap.
+// FIX: Download progress ring was frozen / not updating.
 //
-// FIX 2 — Progress % shown inside the ring while downloading
-//   _SongTile reads dl.progress and shows "XX%" text overlaid on the ring.
+// ROOT CAUSE: DownloadModel is mutable — its fields (status, progress) are
+// mutated in-place inside DownloadManager. Riverpod's `.select((map) => map[id])`
+// returns the SAME object reference before and after the mutation, so
+// `identical(prev, next)` is true → Riverpod skips the rebuild → the ring
+// never moved.
 //
-// FIX 3 — Retry button on failed downloads
-//   If status == failed, show a red retry icon instead of the download arrow.
-//
-// FIX 4 — Polished ENC lock badge with glow
-//   Replaced the plain EncryptedBadge with an inline lock icon + "ENC" text
-//   that glows gold to make it obviously mean "offline-encrypted".
+// FIX: _DownloadButton is now a ConsumerWidget that watches the provider
+// directly and selects the specific scalar fields it needs (status + progress).
+// Because scalars are compared by value, any change triggers a rebuild.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,7 +20,6 @@ import '../providers/calm_music_provider.dart';
 import '../../player/providers/audio_player_provider.dart';
 import '../../player/domain/media_item_model.dart';
 import '../../downloads/data/services/download_manager.dart';
-import '../../downloads/data/models/download_model.dart';
 import '../../favorites/providers/favorites_provider.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/theme/app_theme.dart';
@@ -219,8 +216,10 @@ class _SongTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final dl = ref.watch(
-      downloadManagerProvider.select((map) => map[song.id]),
+    // FIX: only watch the scalar `isCompleted` bool — this selects by VALUE
+    // so Riverpod correctly detects the change when the download finishes.
+    final isCompleted = ref.watch(
+      downloadManagerProvider.select((map) => map[song.id]?.isCompleted == true),
     );
     final isFav = ref.watch(
       favoritesProvider.select((set) => set.contains(song.id)),
@@ -259,16 +258,19 @@ class _SongTile extends ConsumerWidget {
             if (song.duration != null)
               DurationBadge(duration: song.formattedDuration),
             const SizedBox(width: 6),
-            if (dl?.isCompleted == true) const _EncLockBadge(),
+            if (isCompleted) const _EncLockBadge(),
           ],
         ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // FIX: pass IDs not the model — _DownloadButton watches internally
             _DownloadButton(
-              song: song,
-              album: album,
-              dl: dl,
+              songId: song.id,
+              songTitle: song.title,
+              isMultiPart: song.isMultiPart,
+              albumTitle: album?.title,
+              coverUrl: song.coverUrl ?? album?.coverUrl,
             ),
             IconButton(
               icon: Icon(
@@ -294,24 +296,40 @@ class _SongTile extends ConsumerWidget {
   }
 }
 
-// ── Download button widget ────────────────────────────────────────────────────
-// Shows: download arrow → animated ring with % → check/lock → retry on fail
+// ── Download button — watches provider directly by songId ─────────────────────
+//
+// KEY FIX: We select individual scalar fields (status string + progress double)
+// rather than the whole DownloadModel object. Because DownloadModel is mutable,
+// selecting the object itself returns the same reference every time (no rebuild).
+// Selecting scalars lets Riverpod compare by value → rebuilds on every tick.
 
 class _DownloadButton extends ConsumerWidget {
-  final SongModel song;
-  final AlbumModel? album;
-  final DownloadModel? dl;
+  final String songId;
+  final String songTitle;
+  final bool isMultiPart;
+  final String? albumTitle;
+  final String? coverUrl;
 
   const _DownloadButton({
-    required this.song,
-    required this.album,
-    required this.dl,
+    required this.songId,
+    required this.songTitle,
+    required this.isMultiPart,
+    this.albumTitle,
+    this.coverUrl,
   });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // Watch scalar fields so Riverpod can detect value-level changes.
+    final status = ref.watch(
+      downloadManagerProvider.select((map) => map[songId]?.status),
+    );
+    final progress = ref.watch(
+      downloadManagerProvider.select((map) => map[songId]?.progress ?? 0.0),
+    );
+
     // ── Completed ──────────────────────────────────────────────────────────
-    if (dl?.isCompleted == true) {
+    if (status == 'completed') {
       return const Padding(
         padding: EdgeInsets.all(8.0),
         child: Icon(
@@ -323,16 +341,15 @@ class _DownloadButton extends ConsumerWidget {
     }
 
     // ── Downloading / merging / encrypting ──────────────────────────────────
-    if (dl?.isInProgress == true) {
-      final progress = dl!.progress.clamp(0.0, 1.0);
-      final pct = (progress * 100).round();
+    if (status == 'downloading' || status == 'merging' || status == 'encrypting') {
+      final clampedProgress = progress.clamp(0.0, 1.0);
+      final pct = (clampedProgress * 100).round();
 
-      // Color by phase
       final Color ringColor;
       final String label;
-      if (dl!.status == 'merging' || dl!.status == 'encrypting') {
+      if (status == 'merging' || status == 'encrypting') {
         ringColor = AppColors.accentGold;
-        label = dl!.status == 'encrypting' ? '🔒' : '⚙';
+        label = status == 'encrypting' ? '🔒' : '⚙';
       } else {
         ringColor = AppColors.primary;
         label = '$pct%';
@@ -344,18 +361,16 @@ class _DownloadButton extends ConsumerWidget {
         child: Stack(
           alignment: Alignment.center,
           children: [
-            // Background track
             SizedBox(
               width: 28,
               height: 28,
               child: CircularProgressIndicator(
-                value: progress > 0 ? progress : null,
+                value: clampedProgress > 0.01 ? clampedProgress : null,
                 strokeWidth: 2.5,
                 backgroundColor: AppColors.surfaceVariant,
                 color: ringColor,
               ),
             ),
-            // Percentage label inside ring
             Text(
               label,
               style: TextStyle(
@@ -371,13 +386,13 @@ class _DownloadButton extends ConsumerWidget {
     }
 
     // ── Failed — show retry ────────────────────────────────────────────────
-    if (dl?.isFailed == true) {
+    if (status == 'failed') {
       return IconButton(
         icon: const Icon(Icons.refresh_rounded, size: 20),
         color: AppColors.error,
         tooltip: 'Retry download',
         onPressed: () {
-          ref.read(downloadManagerProvider.notifier).retryDownload(song.id);
+          ref.read(downloadManagerProvider.notifier).retryDownload(songId);
         },
       );
     }
@@ -388,15 +403,14 @@ class _DownloadButton extends ConsumerWidget {
       color: AppColors.textTertiary,
       onPressed: () {
         ref.read(downloadManagerProvider.notifier).startDownload(
-              mediaId: song.id,
-              title: song.title,
+              mediaId: songId,
+              title: songTitle,
               mediaType: 'song',
-              partCount: song.isMultiPart ? 2 : 1,
-              artworkUrl: song.coverUrl ?? album?.coverUrl,
-              subtitle: album?.title,
+              partCount: isMultiPart ? 2 : 1,
+              artworkUrl: coverUrl,
+              subtitle: albumTitle,
             );
 
-        // Show snackbar so user knows it started
         ScaffoldMessenger.of(context).clearSnackBars();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -407,7 +421,7 @@ class _DownloadButton extends ConsumerWidget {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Downloading "${song.title}"…',
+                    'Downloading "$songTitle"…',
                     style: const TextStyle(fontSize: 13),
                     overflow: TextOverflow.ellipsis,
                   ),
