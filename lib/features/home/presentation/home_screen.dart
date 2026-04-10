@@ -304,11 +304,28 @@ class _StoriesSection extends ConsumerWidget {
       padding: const EdgeInsets.symmetric(horizontal: 20),
       itemCount: 4,
       separatorBuilder: (_, __) => const SizedBox(width: 14),
-      itemBuilder: (_, __) => const ShimmerBox(width: 130, height: 180, borderRadius: 16),
+      itemBuilder: (_, __) =>
+          const ShimmerBox(width: 130, height: 180, borderRadius: 16),
     );
   }
 }
 
+// FIX: _SeriesCard — the Column was overflowing its 180px height because
+// the image (130px) + SizedBox(8) + two Text lines exceeded the container.
+//
+// Root cause: CoverImage with size: 130 consumed 130px, leaving only 50px
+// for spacing + two text lines. With the Sora font at 12–11px, line heights
+// push past the boundary when titles wrap to 2 lines.
+//
+// Fix applied:
+//   1. Reduced image height to 110px (was 130) so text has 62px breathing room.
+//   2. Reduced SizedBox gap from 8 → 6px.
+//   3. Added mainAxisSize: MainAxisSize.min so the Column doesn't try to
+//      expand beyond its natural content height.
+//   4. Added overflow: TextOverflow.ellipsis to the subtitle line (was missing).
+//
+// The outer SizedBox(height: 180) on the ListView constrains the list row;
+// each card column now fits comfortably within that space.
 class _SeriesCard extends StatelessWidget {
   final String title;
   final String? coverUrl;
@@ -330,16 +347,20 @@ class _SeriesCard extends StatelessWidget {
         width: 130,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          // FIX: min so the column doesn't try to fill 180px and overflow
+          mainAxisSize: MainAxisSize.min,
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(14),
               child: CoverImage(
+                // FIX: reduced from 130 → 110 to leave room for text
                 url: coverUrl,
-                size: 130,
+                size: 110,
                 borderRadius: 14,
               ),
             ),
-            const SizedBox(height: 8),
+            // FIX: reduced from 8 → 6
+            const SizedBox(height: 6),
             Text(
               title,
               style: Theme.of(context).textTheme.titleSmall?.copyWith(
@@ -352,6 +373,9 @@ class _SeriesCard extends StatelessWidget {
             Text(
               '$episodeCount episodes',
               style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 1,
+              // FIX: was missing overflow on this line
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
@@ -407,7 +431,8 @@ class _MusicSection extends ConsumerWidget {
       padding: const EdgeInsets.symmetric(horizontal: 20),
       itemCount: 4,
       separatorBuilder: (_, __) => const SizedBox(width: 14),
-      itemBuilder: (_, __) => const ShimmerBox(width: 130, height: 180, borderRadius: 16),
+      itemBuilder: (_, __) =>
+          const ShimmerBox(width: 130, height: 180, borderRadius: 16),
     );
   }
 }
