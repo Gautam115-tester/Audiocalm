@@ -306,6 +306,22 @@ async function runMusicSync() {
 }
 
 // ── runStoriesSync ────────────────────────────────────────────────────────────
+// ── runStoriesSync ────────────────────────────────────────────────────────────
+// FIXED: Groups _part01, _part02 ... _partN files into a single episode.
+// - telegramFileId stored as JSON array when multi-part: ["fileId1","fileId2"]
+// - duration = sum of all parts
+// - partCount = number of parts
+// - App shows "Episode 1" with total duration, plays parts sequentially (already supported)
+//
+// Filename patterns supported:
+//   KarnaPishachini_Ep1_part01.mp3   → series=KarnaPishachini, ep=1, part=1
+//   KarnaPishachini_Ep01_part02.mp3  → series=KarnaPishachini, ep=1, part=2
+//   SeriesName_EP3_part1.mp3         → series=SeriesName, ep=3, part=1
+//   SeriesName — EP3: Title.mp3      → caption-based, no parts (single file)
+//
+// Caption patterns supported (unchanged):
+//   "Series Title — EP1: Episode Title"
+
 async function runStoriesSync() {
   const state        = await readState();
   const fromUpdateId = state.storiesLastUpdateId || 0;
@@ -329,28 +345,69 @@ async function runStoriesSync() {
   const existingEpisodes = await prisma.episode.findMany({
     select: { telegramFileId: true, seriesId: true, episodeNumber: true },
   });
-  const seenFileIds = new Set(existingEpisodes.map((e) => e.telegramFileId).filter(Boolean));
-  const seenEpKeys  = new Set(existingEpisodes.map((e) => `${e.seriesId}::${e.episodeNumber}`));
+  const seenEpKeys = new Set(existingEpisodes.map((e) => `${e.seriesId}::${e.episodeNumber}`));
 
-  const episodesToCreate = [];
-  let   skipped          = 0;
+  // ── Collect all file IDs already stored (including those inside JSON arrays) ──
+  const seenFileIds = new Set();
+  for (const ep of existingEpisodes) {
+    if (!ep.telegramFileId) continue;
+    if (ep.telegramFileId.startsWith('[')) {
+      try {
+        const ids = JSON.parse(ep.telegramFileId);
+        ids.forEach((id) => seenFileIds.add(id));
+      } catch { seenFileIds.add(ep.telegramFileId); }
+    } else {
+      seenFileIds.add(ep.telegramFileId);
+    }
+  }
+
+  // ── Parse each audio post into a structured object ────────────────────────
+  // Result shape: { seriesTitle, episodeNum, partNum, fileId, duration, title }
+  // partNum = null means it's a non-part file (treat as single episode)
+
+  const parsed = [];
+  let skipped = 0;
 
   for (const msg of audioPosts) {
     const audio   = msg.audio;
     const fileId  = audio.file_id;
     const caption = msg.caption || '';
+    const fileName = audio.file_name || '';
 
     if (seenFileIds.has(fileId)) { skipped++; continue; }
 
-    // Caption format: "Series Title — EP1: Episode Title"
-    // Filename format: SeriesTitle_EP01_EpisodeTitle.m4a
+    // ── Try filename-based part pattern first ──────────────────────────────
+    // Matches: AnySeriesName_Ep1_part01.mp3  or  AnySeriesName_EP01_part2.m4a
+    // Group 1 = series name, Group 2 = episode number, Group 3 = part number
+    const partMatch = fileName.match(
+      /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
+    );
+
+    if (partMatch) {
+      const seriesTitle  = partMatch[1].replace(/[_\-]+/g, ' ').trim();
+      const episodeNum   = parseInt(partMatch[2]);
+      const partNum      = parseInt(partMatch[3]);
+      const episodeTitle = `Episode ${episodeNum}`; // parts don't have individual titles
+      parsed.push({
+        seriesTitle,
+        episodeNum,
+        partNum,
+        episodeTitle,
+        fileId,
+        duration: audio.duration ?? 0,
+      });
+      continue;
+    }
+
+    // ── Try caption format: "Series Title — EP1: Episode Title" ───────────
     const captionMatch  = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
-    const fileNameMatch = audio.file_name?.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
+    // ── Try filename format (no parts): SeriesTitle_EP01_EpisodeTitle.mp3 ──
+    const fileNameMatch = fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
     const match         = captionMatch || fileNameMatch;
 
     if (!match) {
       console.warn(
-        `⚠️  [Stories] Cannot parse series/episode from: "${caption || audio.file_name}"`
+        `⚠️  [Stories] Cannot parse series/episode from: "${caption || fileName}"`
       );
       skipped++;
       continue;
@@ -360,27 +417,88 @@ async function runStoriesSync() {
     const episodeNum   = parseInt(match[2]);
     const episodeTitle = match[3].trim();
 
-    // Find or auto-create series
-    let series = seriesMap.get(seriesTitle.toLowerCase());
-    if (!series) {
-      series = await prisma.series.create({ data: { title: seriesTitle } });
-      seriesMap.set(seriesTitle.toLowerCase(), series);
-      console.log(`📚 [Stories] Created new series: "${seriesTitle}"`);
+    parsed.push({
+      seriesTitle,
+      episodeNum,
+      partNum: null, // single-file episode
+      episodeTitle,
+      fileId,
+      duration: audio.duration ?? 0,
+    });
+  }
+
+  // ── Group parts together: key = "seriesTitle::episodeNum" ─────────────────
+  // For non-part files (partNum = null), each is its own group.
+  // For part files, collect all parts under the same key and sort by partNum.
+
+  const groups = new Map(); // key → { seriesTitle, episodeNum, episodeTitle, parts: [{partNum, fileId, duration}] }
+
+  for (const item of parsed) {
+    const key = `${item.seriesTitle.toLowerCase()}::${item.episodeNum}`;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        seriesTitle:  item.seriesTitle,
+        episodeNum:   item.episodeNum,
+        episodeTitle: item.episodeTitle,
+        parts: [],
+      });
     }
 
-    const epKey = `${series.id}::${episodeNum}`;
-    if (seenEpKeys.has(epKey)) { skipped++; continue; }
+    groups.get(key).parts.push({
+      partNum:  item.partNum ?? 1, // single-file = part 1
+      fileId:   item.fileId,
+      duration: item.duration,
+    });
+  }
 
-    seenFileIds.add(fileId);
+  // ── Build episodes from groups ────────────────────────────────────────────
+
+  const episodesToCreate = [];
+  const episodesToUpdate = []; // for groups where ep exists but new parts arrived
+
+  for (const [, group] of groups) {
+    // Sort parts by part number so JSON array is in order
+    group.parts.sort((a, b) => a.partNum - b.partNum);
+
+    // Ensure / create series
+    let series = seriesMap.get(group.seriesTitle.toLowerCase());
+    if (!series) {
+      series = await prisma.series.create({ data: { title: group.seriesTitle } });
+      seriesMap.set(group.seriesTitle.toLowerCase(), series);
+      console.log(`📚 [Stories] Created new series: "${group.seriesTitle}"`);
+    }
+
+    const epKey = `${series.id}::${group.episodeNum}`;
+
+    // Total duration = sum of all parts
+    const totalDuration = group.parts.reduce((sum, p) => sum + (p.duration || 0), 0);
+    const partCount     = group.parts.length;
+
+    // telegramFileId: single string for 1 part, JSON array for multiple
+    const telegramFileId = partCount === 1
+      ? group.parts[0].fileId
+      : JSON.stringify(group.parts.map((p) => p.fileId));
+
+    if (seenEpKeys.has(epKey)) {
+      // Episode already exists — could be that only some parts were new.
+      // For safety just skip (idempotent). To support incremental part
+      // addition you'd PATCH here, but that's an edge case.
+      skipped++;
+      continue;
+    }
+
     seenEpKeys.add(epKey);
+    // Mark all file IDs as seen
+    group.parts.forEach((p) => seenFileIds.add(p.fileId));
 
     episodesToCreate.push({
       seriesId:       series.id,
-      episodeNumber:  episodeNum,
-      title:          episodeTitle,
-      telegramFileId: fileId,
-      duration:       audio.duration ?? null,
-      partCount:      1,
+      episodeNumber:  group.episodeNum,
+      title:          group.episodeTitle,
+      telegramFileId,
+      duration:       totalDuration || null,
+      partCount,
     });
   }
 
@@ -392,7 +510,9 @@ async function runStoriesSync() {
         skipDuplicates: true,
       });
     }
-    console.log(`🎙️  [Stories] Inserted ${episodesToCreate.length} episodes, skipped ${skipped}`);
+    console.log(`🎙️  [Stories] Inserted ${episodesToCreate.length} episodes (${
+      episodesToCreate.filter(e => e.partCount > 1).length
+    } multi-part), skipped ${skipped}`);
   }
 
   if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
