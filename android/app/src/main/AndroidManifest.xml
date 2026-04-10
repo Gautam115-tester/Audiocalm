@@ -33,6 +33,7 @@
         android:label="Audio Calm"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="true"
         android:hardwareAccelerated="true"
         android:largeHeap="true">

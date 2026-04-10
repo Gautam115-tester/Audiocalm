@@ -48,18 +48,8 @@ class HomeScreen extends ConsumerWidget {
         titlePadding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
         title: Row(
           children: [
-            Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [AppColors.primary, AppColors.primaryDark],
-                ),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Icon(Icons.waves_rounded,
-                  color: Colors.white, size: 18),
-            ),
+            // Adaptive logo: dark logo in dark mode, light logo in light mode
+            AppLogo(size: 32),
             const SizedBox(width: 10),
             Text(
               'Audio Calm',
@@ -186,7 +176,6 @@ class _FeaturedBanner extends StatelessWidget {
       ),
       child: Stack(
         children: [
-          // Background decoration
           Positioned(
             right: -20,
             top: -20,
@@ -211,7 +200,6 @@ class _FeaturedBanner extends StatelessWidget {
               ),
             ),
           ),
-          // Content
           Padding(
             padding: const EdgeInsets.all(24),
             child: Column(
@@ -310,22 +298,6 @@ class _StoriesSection extends ConsumerWidget {
   }
 }
 
-// FIX: _SeriesCard — the Column was overflowing its 180px height because
-// the image (130px) + SizedBox(8) + two Text lines exceeded the container.
-//
-// Root cause: CoverImage with size: 130 consumed 130px, leaving only 50px
-// for spacing + two text lines. With the Sora font at 12–11px, line heights
-// push past the boundary when titles wrap to 2 lines.
-//
-// Fix applied:
-//   1. Reduced image height to 110px (was 130) so text has 62px breathing room.
-//   2. Reduced SizedBox gap from 8 → 6px.
-//   3. Added mainAxisSize: MainAxisSize.min so the Column doesn't try to
-//      expand beyond its natural content height.
-//   4. Added overflow: TextOverflow.ellipsis to the subtitle line (was missing).
-//
-// The outer SizedBox(height: 180) on the ListView constrains the list row;
-// each card column now fits comfortably within that space.
 class _SeriesCard extends StatelessWidget {
   final String title;
   final String? coverUrl;
@@ -347,19 +319,16 @@ class _SeriesCard extends StatelessWidget {
         width: 130,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          // FIX: min so the column doesn't try to fill 180px and overflow
           mainAxisSize: MainAxisSize.min,
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(14),
               child: CoverImage(
-                // FIX: reduced from 130 → 110 to leave room for text
                 url: coverUrl,
                 size: 110,
                 borderRadius: 14,
               ),
             ),
-            // FIX: reduced from 8 → 6
             const SizedBox(height: 6),
             Text(
               title,
@@ -374,7 +343,6 @@ class _SeriesCard extends StatelessWidget {
               '$episodeCount episodes',
               style: Theme.of(context).textTheme.bodySmall,
               maxLines: 1,
-              // FIX: was missing overflow on this line
               overflow: TextOverflow.ellipsis,
             ),
           ],

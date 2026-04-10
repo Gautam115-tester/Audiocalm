@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Path: android/app/src/main/res/values/styles.xml
+  Path: android/app/src/main/res/values-night/styles.xml
 
-  Light mode styles (default).
-  LaunchTheme uses light launch_background (#F4F7FA) from values/colors.xml
+  Dark mode styles — Android picks this folder automatically in dark mode.
+  LaunchTheme uses dark launch_background (#080F1A) from values-night/colors.xml
 -->
 <resources>
     <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">

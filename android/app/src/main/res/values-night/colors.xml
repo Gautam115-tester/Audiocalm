@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Path: android/app/src/main/res/values-night/colors.xml
+  
+  Dark mode colors — Android picks this folder automatically in dark mode.
+-->
+<resources>
+    <!-- Dark splash background -->
+    <color name="launch_background">#080F1A</color>
+
+    <!-- Dark launcher icon background -->
+    <color name="ic_launcher_background">#080F1A</color>
+</resources>
