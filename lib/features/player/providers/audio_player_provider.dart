@@ -1,4 +1,8 @@
 // lib/features/player/providers/audio_player_provider.dart
+//
+// Unchanged except: durationStream and positionStream now emit UNIFIED values
+// (handler accumulates part offsets), so the seekbar shows the correct total
+// duration and continuous position across all parts automatically.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -9,8 +13,6 @@ import '../domain/media_item_model.dart';
 import '../services/audio_handler.dart';
 import '../../../../core/constants/app_constants.dart';
 
-/// Renamed from PlayerState → AudioPlayerState to avoid collision with
-/// just_audio's PlayerState.
 class AudioPlayerState {
   final PlayableItem? currentItem;
   final bool isPlaying;
@@ -77,13 +79,17 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   void _init() {
+    // positionStream now emits UNIFIED position (handler adds part offsets)
     _subs.add(_handler.positionStream.listen((pos) {
       state = state.copyWith(position: pos);
       _savePosition();
     }));
 
+    // durationStream now emits UNIFIED duration (DB total or accumulated)
     _subs.add(_handler.durationStream.listen((dur) {
-      state = state.copyWith(duration: dur);
+      if (dur != null && dur > Duration.zero) {
+        state = state.copyWith(duration: dur);
+      }
     }));
 
     _subs.add(_handler.playerStateStream.listen((ps) {
@@ -95,7 +101,7 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     }));
 
     _subs.add(_handler.mediaItem.listen((item) {
-      if (item != null && state.queue.isNotEmpty) {
+      if (item != null) {
         final idx = _handler.currentIndex;
         if (idx < state.queue.length) {
           state = state.copyWith(currentItem: state.queue[idx]);
@@ -116,12 +122,16 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   Future<void> playItem(PlayableItem item,
       {List<PlayableItem>? queue, int index = 0}) async {
+    final q = queue ?? [item];
     state = state.copyWith(
       currentItem: item,
-      queue: queue ?? [item],
+      queue: q,
       currentIndex: index,
       isLoading: true,
       error: null,
+      // Reset position/duration immediately so the old values don't flash
+      position: Duration.zero,
+      duration: item.duration != null ? Duration(seconds: item.duration!) : null,
     );
     try {
       await _handler.playItem(item, queue: queue, index: index);
@@ -138,10 +148,8 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
       final json = item.toJson();
       json['lastPlayedAt'] = DateTime.now().toIso8601String();
       box.put(key, json);
-
       if (box.length > AppConstants.continueListeningMaxItems) {
-        final keys = box.keys.toList();
-        box.delete(keys.first);
+        box.delete(box.keys.first);
       }
     } catch (_) {}
   }
@@ -156,11 +164,10 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   Future<void> seek(Duration position) => _handler.seek(position);
 
-  /// Uses the renamed convenience wrapper (not the override).
-  Future<void> skipForward() => _handler.seekForwardOnce();
+  Future<void> skipForward()  => _handler.seekForwardOnce();
   Future<void> skipBackward() => _handler.seekBackwardOnce();
 
-  Future<void> skipToNext() => _handler.skipToNext();
+  Future<void> skipToNext()     => _handler.skipToNext();
   Future<void> skipToPrevious() => _handler.skipToPrevious();
 
   Future<void> setSpeed(double speed) async {
@@ -185,14 +192,12 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   @override
   void dispose() {
-    for (final sub in _subs) {
-      sub.cancel();
-    }
+    for (final sub in _subs) { sub.cancel(); }
     super.dispose();
   }
 }
 
-// ── Providers ─────────────────────────────────────────────────────────────
+// ── Providers ──────────────────────────────────────────────────────────────
 
 final audioHandlerProvider = Provider<AudioCalmHandler>((ref) {
   throw UnimplementedError('Must be initialized in main');
