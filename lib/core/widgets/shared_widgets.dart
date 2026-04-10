@@ -68,19 +68,25 @@ class CoverImage extends StatelessWidget {
   }
 
   Widget _buildPlaceholder() {
-    return placeholder ??
-        Container(
-          width: size,
-          height: size,
-          decoration: BoxDecoration(
-            gradient: AppColors.cardGradient,
-          ),
-          child: Icon(
-            Icons.music_note_rounded,
-            color: AppColors.textTertiary,
-            size: size * 0.4,
-          ),
-        );
+    if (placeholder != null) return placeholder!;
+
+    // FIX: When size is double.infinity (used inside Expanded/SizedBox.expand),
+    // computing size * 0.4 yields Infinity, which crashes Flutter's icon/text
+    // layout with 'fontSize.isFinite' assertion. Clamp to a safe finite value.
+    final double iconSize = size.isFinite ? size * 0.4 : 40.0;
+
+    return Container(
+      width: size.isFinite ? size : null,
+      height: size.isFinite ? size : null,
+      decoration: const BoxDecoration(
+        gradient: AppColors.cardGradient,
+      ),
+      child: Icon(
+        Icons.music_note_rounded,
+        color: AppColors.textTertiary,
+        size: iconSize,
+      ),
+    );
   }
 }
 
