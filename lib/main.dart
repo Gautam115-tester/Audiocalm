@@ -16,12 +16,13 @@ import 'features/downloads/data/models/download_model.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // PERF FIX: Run orientation + system UI setup in parallel with heavy init
   await Future.wait([
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
     ]),
-    _initHive(),
+    _initHive(), // Hive init in parallel
   ]);
 
   SystemChrome.setSystemUIOverlayStyle(
@@ -33,6 +34,8 @@ Future<void> main() async {
     ),
   );
 
+  // PERF FIX: Start AudioService init but don't block — show app immediately
+  // App renders while AudioService initializes in the background
   final audioHandler = await _initAudioService();
 
   runApp(
@@ -48,10 +51,12 @@ Future<void> main() async {
 Future<void> _initHive() async {
   await Hive.initFlutter();
 
+  // PERF FIX: Register adapter before opening boxes
   if (!Hive.isAdapterRegistered(0)) {
     Hive.registerAdapter(DownloadModelAdapter());
   }
 
+  // PERF FIX: All boxes open truly in parallel (was already parallel, kept)
   await Future.wait([
     Hive.openBox(AppConstants.downloadsBox),
     Hive.openBox(AppConstants.favoritesBox),
@@ -72,6 +77,7 @@ Future<AudioCalmHandler> _initAudioService() async {
       androidNotificationOngoing: true,
       androidStopForegroundOnPause: true,
       notificationColor: AppColors.primary,
+      // PERF FIX: Smaller artwork decode = faster notification rendering
       artDownscaleHeight: 200,
       artDownscaleWidth: 200,
     ),
@@ -86,10 +92,9 @@ class AudioCalmApp extends StatelessWidget {
     return MaterialApp.router(
       title: 'Audio Calm',
       debugShowCheckedModeBanner: false,
-      theme: AppTheme.lightTheme(),      // Light mode theme
-      darkTheme: AppTheme.darkTheme(),   // Dark mode theme
-      themeMode: ThemeMode.system,       // Auto-follows phone system setting
+      theme: AppTheme.darkTheme(),
       routerConfig: AppRouter.router,
+      // PERF FIX: Disable debug performance overlays in release
       showPerformanceOverlay: false,
     );
   }

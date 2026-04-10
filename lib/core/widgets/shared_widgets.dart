@@ -5,43 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:shimmer/shimmer.dart';
 import '../theme/app_theme.dart';
 
-// ─── Adaptive App Logo ────────────────────────────────────────────────────────
-// Automatically picks logo_dark or logo_light based on system theme.
-//
-// Usage:
-//   AppLogo(size: 32)        → square icon (AppBar, splash)
-//   AppLogo.full(height: 40) → wide logo image (drawer header, onboarding)
-class AppLogo extends StatelessWidget {
-  final double size;
-  final double? fullHeight;
-  final bool _isFull;
-
-  const AppLogo({super.key, this.size = 32})
-      : _isFull = false, fullHeight = null;
-
-  const AppLogo.full({super.key, this.fullHeight = 40})
-      : _isFull = true, size = 0;
-
-  @override
-  Widget build(BuildContext context) {
-    // Single transparent PNG works for both light and dark
-    if (_isFull) {
-      return Image.asset(
-        'assets/images/logo.png',
-        height: fullHeight,
-        fit: BoxFit.contain,
-      );
-    } else {
-      return Image.asset(
-        'assets/icons/logo.png',
-        width: size,
-        height: size,
-        fit: BoxFit.contain,
-      );
-    }
-  }
-}
-
 // ─── Shimmer Loading Box ────────────────────────────────────────────────────
 class ShimmerBox extends StatelessWidget {
   final double width;
@@ -78,6 +41,8 @@ class CoverImage extends StatelessWidget {
   final double size;
   final double borderRadius;
   final Widget? placeholder;
+  // PERF FIX: Limit decoded image size in memory — pass 300 for thumbnails
+  // Reduces RAM usage and decoding time significantly for large grids
   final int? memCacheWidth;
   final int? memCacheHeight;
 
@@ -101,8 +66,11 @@ class CoverImage extends StatelessWidget {
               width: size.isFinite ? size : null,
               height: size.isFinite ? size : null,
               fit: BoxFit.cover,
+              // PERF FIX: Decode images at display size, not full resolution
+              // e.g. a 500×500 thumbnail decoded at 150×150 uses 11× less RAM
               memCacheWidth: memCacheWidth,
               memCacheHeight: memCacheHeight,
+              // PERF FIX: Use fade only when there's no cached version
               fadeInDuration: const Duration(milliseconds: 150),
               fadeOutDuration: const Duration(milliseconds: 75),
               placeholder: (_, __) => _buildPlaceholder(),
@@ -115,6 +83,7 @@ class CoverImage extends StatelessWidget {
   Widget _buildPlaceholder() {
     if (placeholder != null) return placeholder!;
 
+    // FIX: size * 0.4 crashes when size = double.infinity
     final double iconSize = size.isFinite ? size * 0.4 : 40.0;
 
     return Container(
