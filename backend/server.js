@@ -86,4 +86,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`  🗑️  Dump chat: ${configured('TELEGRAM_DUMP_CHAT_ID')}`);
 });
 
+const path = require('path');
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 module.exports = app;
