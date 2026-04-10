@@ -1,7 +1,6 @@
 // lib/features/downloads/data/services/download_manager.dart
 
 import 'dart:io';
-import 'dart:isolate';
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -65,7 +64,7 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
     final id = _uuid.v4();
     final dir = await _getDownloadsDir();
-    final encryptedPath = '${dir.path}/${mediaId}_enc.m4a';
+    final encryptedPath = '${dir.path}/${mediaId}_enc.bin';
 
     final model = DownloadModel(
       id: id,
@@ -80,101 +79,109 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     );
 
     _updateState(model);
-
-    // Run download in background
     _runDownload(model, mediaType, partCount);
   }
 
   Future<void> _runDownload(
-    DownloadModel model, String mediaType, int partCount) async {
-  try {
-    final dir = await _getDownloadsDir();
+      DownloadModel model, String mediaType, int partCount) async {
+    try {
+      final dir = await _getDownloadsDir();
+      final List<String> partPaths = [];
 
-    // Step 1: Get download info (returns JSON with part URLs)
-    final endpoint = mediaType == 'episode'
-        ? ApiConstants.episodeDownload(model.mediaId)
-        : ApiConstants.songDownload(model.mediaId);
+      // ── Build stream URLs for each part ──────────────────────────────────
+      // The backend /stream endpoint supports ?part=N for multi-part files.
+      // The /download endpoint is a direct binary stream (no JSON wrapper).
+      // We use /stream?part=N for downloading since it supports Range headers
+      // and works for both single and multi-part content.
+      final List<String> downloadUrls = [];
 
-    final downloadInfo = await _dio.get<Map<String, dynamic>>(
-      '${ApiConstants.baseUrl}$endpoint',
-    );
-    final data = downloadInfo.data!;
-    final isMultiPart = data['isMultiPart'] as bool? ?? false;
-
-    // Step 2: Build list of stream URLs to download
-    final List<String> downloadUrls = [];
-    if (isMultiPart) {
-      final parts = data['parts'] as List? ?? [];
-      for (final part in parts) {
-        downloadUrls.add(part['streamUrl'] as String);
+      if (partCount <= 1) {
+        // Single part: use the download endpoint for the cleanest binary stream
+        final endpoint = mediaType == 'episode'
+            ? ApiConstants.episodeDownload(model.mediaId)
+            : ApiConstants.songDownload(model.mediaId);
+        downloadUrls.add('${ApiConstants.baseUrl}$endpoint');
+      } else {
+        // Multi-part: use ?part=N on the stream endpoint
+        final streamEndpoint = mediaType == 'episode'
+            ? ApiConstants.episodeStream(model.mediaId)
+            : ApiConstants.songStream(model.mediaId);
+        for (int i = 1; i <= partCount; i++) {
+          downloadUrls
+              .add('${ApiConstants.baseUrl}$streamEndpoint?part=$i');
+        }
       }
-    } else {
-      // Single part — stream URL is in 'url' field
-      downloadUrls.add(data['url'] as String);
-    }
 
-    if (downloadUrls.isEmpty) {
-      throw Exception('No download URLs available');
-    }
+      // ── Download each part directly as binary ─────────────────────────────
+      for (int i = 0; i < downloadUrls.length; i++) {
+        final partPath = '${dir.path}/${model.mediaId}_part$i.tmp';
+        partPaths.add(partPath);
 
-    // Step 3: Download each part
-    final List<String> partPaths = [];
-    for (int i = 0; i < downloadUrls.length; i++) {
-      final partPath = '${dir.path}/${model.mediaId}_part$i.tmp';
-      partPaths.add(partPath);
+        await _dio.download(
+          downloadUrls[i],
+          partPath,
+          onReceiveProgress: (received, total) {
+            if (total > 0) {
+              final partProgress = received / total;
+              final overallProgress =
+                  (i + partProgress) / downloadUrls.length * 0.80;
+              _updateProgress(model, 'downloading', overallProgress, i + 1);
+            }
+          },
+          options: Options(
+            // Force binary response — don't let Dio try to decode as JSON
+            responseType: ResponseType.bytes,
+            followRedirects: true,
+            receiveTimeout: const Duration(minutes: 10),
+          ),
+        );
 
-      await _dio.download(
-        downloadUrls[i],
-        partPath,
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            final partProgress = received / total;
-            final overallProgress =
-                (i + partProgress) / downloadUrls.length * 0.8;
-            _updateProgress(model, 'downloading', overallProgress, i + 1);
-          }
-        },
-      );
-      model.downloadedParts = i + 1;
+        model.downloadedParts = i + 1;
+        _updateState(model);
+      }
+
+      // ── Merge if multiple parts ───────────────────────────────────────────
+      String mergedPath;
+      if (partPaths.length > 1) {
+        _updateProgress(model, 'merging', 0.82, downloadUrls.length);
+        mergedPath = '${dir.path}/${model.mediaId}_merged.tmp';
+        await _mergeParts(partPaths, mergedPath);
+      } else {
+        mergedPath = partPaths.first;
+      }
+
+      // ── Encrypt ───────────────────────────────────────────────────────────
+      _updateProgress(model, 'encrypting', 0.90, downloadUrls.length);
+      await _encryptionService.encryptFile(
+          mergedPath, model.encryptedFilePath);
+
+      // ── Cleanup temp files ────────────────────────────────────────────────
+      for (final path in partPaths) {
+        try {
+          await File(path).delete();
+        } catch (_) {}
+      }
+      if (partPaths.length > 1) {
+        try {
+          await File(mergedPath).delete();
+        } catch (_) {}
+      }
+
+      // ── Done ──────────────────────────────────────────────────────────────
+      final encFile = File(model.encryptedFilePath);
+      final size =
+          await encFile.exists() ? await encFile.length() : 0;
+      model.fileSizeBytes = size;
+      model.status = 'completed';
+      model.progress = 1.0;
+      _updateState(model);
+    } catch (e) {
+      model.status = 'failed';
+      model.errorMessage = e.toString();
+      model.progress = 0.0;
       _updateState(model);
     }
-
-    // Step 4: Merge if multiple parts
-    String mergedPath;
-    if (partPaths.length > 1) {
-      _updateProgress(model, 'merging', 0.82, downloadUrls.length);
-      mergedPath = '${dir.path}/${model.mediaId}_merged.tmp';
-      await _mergeParts(partPaths, mergedPath);
-    } else {
-      mergedPath = partPaths.first;
-    }
-
-    // Step 5: Encrypt
-    _updateProgress(model, 'encrypting', 0.90, downloadUrls.length);
-    await _encryptionService.encryptFile(mergedPath, model.encryptedFilePath);
-
-    // Step 6: Cleanup temp files
-    for (final path in partPaths) {
-      try { await File(path).delete(); } catch (_) {}
-    }
-    if (partPaths.length > 1) {
-      try { await File(mergedPath).delete(); } catch (_) {}
-    }
-
-    // Step 7: Done
-    final encFile = File(model.encryptedFilePath);
-    final size = await encFile.exists() ? await encFile.length() : 0;
-    model.fileSizeBytes = size;
-    model.status = 'completed';
-    model.progress = 1.0;
-    _updateState(model);
-  } catch (e) {
-    model.status = 'failed';
-    model.errorMessage = e.toString();
-    model.progress = 0.0;
-    _updateState(model);
   }
-}
 
   Future<void> _mergeParts(List<String> partPaths, String outputPath) async {
     final outputFile = File(outputPath);
@@ -212,7 +219,8 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     if (download == null || !download.isCompleted) return null;
 
     try {
-      return await _encryptionService.decryptToTemp(download.encryptedFilePath);
+      return await _encryptionService
+          .decryptToTemp(download.encryptedFilePath);
     } catch (_) {
       return null;
     }
@@ -258,7 +266,9 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
   String formatStorageSize(int bytes) {
     if (bytes < 1024) return '${bytes}B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    }
     if (bytes < 1024 * 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
     }
@@ -267,7 +277,8 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
   Future<Directory> _getDownloadsDir() async {
     final appDir = await getApplicationDocumentsDirectory();
-    final dir = Directory('${appDir.path}/${AppConstants.downloadsDir}');
+    final dir =
+        Directory('${appDir.path}/${AppConstants.downloadsDir}');
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
@@ -281,7 +292,8 @@ final encryptionServiceProvider = Provider<EncryptionService>((ref) {
 });
 
 final downloadManagerProvider =
-    StateNotifierProvider<DownloadManager, Map<String, DownloadModel>>((ref) {
+    StateNotifierProvider<DownloadManager, Map<String, DownloadModel>>(
+        (ref) {
   final encService = ref.watch(encryptionServiceProvider);
   return DownloadManager(encService);
 });
