@@ -75,9 +75,35 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Duration get _unifiedPosition => _partOffset + _player.position;
 
   Duration get _unifiedDuration {
+    // Fast path: use the DB-supplied total (set from item.duration on load).
+    // This is the primary fix — once durationSeconds is stored in DownloadModel
+    // and passed through PlayableItem, this branch always fires for offline
+    // multi-part episodes and the seekbar never jumps or overflows.
     if (_knownTotalDuration != null && _knownTotalDuration! > Duration.zero) {
       return _knownTotalDuration!;
     }
+
+    // Fallback for online playback or older downloads without stored duration:
+    // Sum ALL known part durations collected so far, substituting the live
+    // player duration for the currently-playing part.
+    // Old code was: _partOffset + cur  which was wrong because:
+    //   • On part 1: offset=0, shows only part 1 length
+    //   • On part 2: shows offset + part2 length (jumps when part 2 loads)
+    // New code sums every part we know about, so the estimate only grows
+    // monotonically as more part durations are discovered.
+    if (_partDurations.isNotEmpty) {
+      Duration sum = Duration.zero;
+      for (int i = 0; i < _partDurations.length; i++) {
+        final d = (i == _currentPartIndex)
+            ? (_player.duration ?? _partDurations[i]) // live value for current
+            : _partDurations[i];
+        sum += d;
+      }
+      if (sum > Duration.zero) return sum;
+    }
+
+    // Last resort: offset + current part duration (same as old code, only
+    // reached if _partDurations is still empty i.e. very first buffering tick).
     final cur = _player.duration;
     if (cur != null) return _partOffset + cur;
     return Duration.zero;
@@ -134,6 +160,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       {Duration startAt = Duration.zero}) async {
     _currentPartIndex = partIndex;
 
+    // _partDurations is pre-populated in _loadItem for all parts.
+    // Only extend if somehow the index is out of range (seek into a part
+    // beyond what was pre-populated, which should not happen in practice).
     while (_partDurations.length <= partIndex) {
       _partDurations.add(Duration.zero);
     }
@@ -286,6 +315,15 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _preloadReady = false;
     _knownTotalDuration =
         item.duration != null ? Duration(seconds: item.duration!) : null;
+
+    // FIX: Pre-populate _partDurations with Duration.zero for every part so
+    // the _unifiedDuration fallback loop can iterate all slots immediately,
+    // even before just_audio reports each part's real duration. Without this,
+    // _partDurations.length == 0 on the first buffering tick and the fallback
+    // falls through to the old (wrong) _partOffset + cur formula.
+    for (int i = 0; i < _partUrls.length; i++) {
+      _partDurations.add(Duration.zero);
+    }
 
     mediaItem.add(_playableToMediaItem(item));
     debugPrint('[AudioHandler] Loading "${item.title}" — '

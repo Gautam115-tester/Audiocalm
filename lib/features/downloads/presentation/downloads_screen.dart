@@ -521,6 +521,12 @@ class _CompletedTile extends ConsumerWidget {
         title: download.title,
         subtitle: download.subtitle,
         artworkUrl: download.artworkUrl,
+        // FIX: Pass stored total duration so AudioHandler sets
+        // _knownTotalDuration from the start. Without this, the handler
+        // only knows part 1's duration, causing:
+        //   • seekbar max = 06:58 (part 1 only) while position grows to 13:56
+        //   • duration jumping when part 2 loads
+        duration: download.durationSeconds,
         type: download.mediaType == 'episode'
             ? MediaType.episode
             : MediaType.song,

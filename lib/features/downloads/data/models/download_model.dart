@@ -50,6 +50,12 @@ class DownloadModel extends HiveObject {
   @HiveField(13)
   late int fileSizeBytes;
 
+  // FIX: Store total combined duration so offline playback can pass it to
+  // AudioHandler as _knownTotalDuration — preventing the seekbar from
+  // showing only part 1's duration and position overflowing it.
+  @HiveField(14)
+  final int? durationSeconds;
+
   DownloadModel({
     required this.id,
     required this.mediaId,
@@ -65,22 +71,23 @@ class DownloadModel extends HiveObject {
     this.errorMessage,
     this.subtitle,
     this.fileSizeBytes = 0,
+    this.durationSeconds,  // nullable — older downloads won't have it
   });
 
   DownloadStatus get downloadStatus {
     return switch (status) {
-      'pending' => DownloadStatus.pending,
+      'pending'     => DownloadStatus.pending,
       'downloading' => DownloadStatus.downloading,
-      'merging' => DownloadStatus.merging,
-      'encrypting' => DownloadStatus.encrypting,
-      'completed' => DownloadStatus.completed,
-      'failed' => DownloadStatus.failed,
-      _ => DownloadStatus.pending,
+      'merging'     => DownloadStatus.merging,
+      'encrypting'  => DownloadStatus.encrypting,
+      'completed'   => DownloadStatus.completed,
+      'failed'      => DownloadStatus.failed,
+      _             => DownloadStatus.pending,
     };
   }
 
-  bool get isCompleted => status == 'completed';
-  bool get isFailed => status == 'failed';
+  bool get isCompleted  => status == 'completed';
+  bool get isFailed     => status == 'failed';
   bool get isInProgress =>
       status == 'downloading' || status == 'merging' || status == 'encrypting';
 

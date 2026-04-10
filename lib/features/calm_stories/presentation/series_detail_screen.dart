@@ -222,12 +222,13 @@ class _EpisodeTile extends ConsumerWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             _DownloadButton(
-              episodeId:    episode.id,
-              episodeTitle: episode.title,
-              isMultiPart:  episode.isMultiPart,
-              partCount:    episode.partCount,
-              seriesTitle:  series?.title,
-              coverUrl:     series?.coverUrl,
+              episodeId:       episode.id,
+              episodeTitle:    episode.title,
+              isMultiPart:     episode.isMultiPart,
+              partCount:       episode.partCount,
+              seriesTitle:     series?.title,
+              coverUrl:        series?.coverUrl,
+              durationSeconds: episode.duration, // FIX: needed for offline seekbar
             ),
             IconButton(
               icon: Icon(
@@ -315,6 +316,9 @@ class _DownloadButton extends ConsumerWidget {
   final int     partCount;
   final String? seriesTitle;
   final String? coverUrl;
+  // FIX: pass combined duration so it's stored in DownloadModel and available
+  // for offline playback — prevents position > duration on the seekbar.
+  final int?    durationSeconds;
 
   const _DownloadButton({
     required this.episodeId,
@@ -323,6 +327,7 @@ class _DownloadButton extends ConsumerWidget {
     required this.partCount,
     this.seriesTitle,
     this.coverUrl,
+    this.durationSeconds,
   });
 
   @override
@@ -398,9 +403,10 @@ class _DownloadButton extends ConsumerWidget {
           mediaId:    episodeId,
           title:      episodeTitle,
           mediaType:  'episode',
-          partCount:  partCount,   // pass actual part count for correct download
-          artworkUrl: coverUrl,
-          subtitle:   seriesTitle,
+          partCount:        partCount,   // pass actual part count for correct download
+          artworkUrl:       coverUrl,
+          subtitle:         seriesTitle,
+          durationSeconds:  durationSeconds, // FIX: store for offline seekbar
         );
 
         ScaffoldMessenger.of(context)

@@ -130,6 +130,9 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     required int partCount,
     String? artworkUrl,
     String? subtitle,
+    // FIX: Store total combined duration so offline playback knows the full
+    // length from the start, preventing position > duration on the seekbar.
+    int? durationSeconds,
   }) async {
     if (isDownloaded(mediaId) || isDownloading(mediaId)) return;
 
@@ -150,6 +153,7 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
       subtitle: subtitle,
       status: 'downloading',
       progress: 0.01,
+      durationSeconds: durationSeconds,
     );
 
     _updateState(model);
