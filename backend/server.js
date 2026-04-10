@@ -6,6 +6,8 @@ const cors      = require('cors');
 const helmet    = require('helmet');
 const morgan    = require('morgan');
 const rateLimit = require('express-rate-limit');
+const path      = require('path');
+const fs        = require('fs');
 
 const healthRoutes  = require('./routes/health');
 const seriesRoutes  = require('./routes/series');
@@ -25,7 +27,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 // ── Trust proxy (required on Render / behind Cloudflare) ─────────────────────
 app.set('trust proxy', 1);
 
-// ── CORS — before helmet so preflight OPTIONS is never blocked ────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = process.env.ALLOWED_ORIGINS || '*';
 const corsOptions = {
   origin:         allowedOrigins,
@@ -34,7 +36,7 @@ const corsOptions = {
   exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Type'],
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // explicit preflight handler
+app.options('*', cors(corsOptions));
 
 // ── Security & logging ────────────────────────────────────────────────────────
 app.use(helmet());
@@ -42,13 +44,54 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const path = require('path');
+// ── Dashboard (index.html) ────────────────────────────────────────────────────
+// Render deploys to /opt/render/project/src by default.
+// Try multiple locations so it works locally AND on Render.
+//
+// Layout options:
+//   Option A: backend/index.html   (index.html next to server.js)
+//   Option B: ../index.html        (index.html one level up from backend/)
+//   Option C: ./public/index.html  (in a public/ folder)
+
+function findDashboardHtml() {
+  const candidates = [
+    path.resolve(__dirname, 'index.html'),           // same dir as server.js
+    path.resolve(__dirname, '..', 'index.html'),     // one level up
+    path.resolve(__dirname, 'public', 'index.html'), // public/ subdirectory
+    path.resolve(process.cwd(), 'index.html'),       // CWD (Render root)
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      console.log(`📊 Dashboard found at: ${candidate}`);
+      return candidate;
+    }
+  }
+
+  console.warn('⚠️  Dashboard index.html not found. Checked:');
+  candidates.forEach((c) => console.warn('   ', c));
+  return null;
+}
+
+const dashboardPath = findDashboardHtml();
 
 app.get('/dashboard', (req, res) => {
-  res.sendFile(path.resolve(__dirname, '../index.html'));
+  if (dashboardPath) {
+    res.sendFile(dashboardPath);
+  } else {
+    res.status(404).send(`
+      <html><body style="font-family:sans-serif;padding:40px">
+        <h2>Dashboard not found</h2>
+        <p>Place <code>index.html</code> next to <code>server.js</code> 
+           (i.e. inside the <code>backend/</code> folder) and redeploy.</p>
+        <p>Server working directory: <code>${process.cwd()}</code></p>
+        <p>server.js location: <code>${__dirname}</code></p>
+      </body></html>
+    `);
+  }
 });
 
-// ── Rate limiting — skip streaming/download endpoints (long-lived connections) ─
+// ── Rate limiting ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS)    || 15 * 60 * 1000,
   max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 300,
@@ -65,7 +108,7 @@ app.use('/api/albums',   albumRoutes);
 app.use('/api/songs',    songRoutes);
 app.use('/api/search',   searchRoutes);
 
-// ── Protected routes (x-api-key required) ────────────────────────────────────
+// ── Protected routes ──────────────────────────────────────────────────────────
 app.use('/api/upload', requireApiKey, uploadRoutes);
 app.use('/api/sync',   requireApiKey, syncRoutes);
 
@@ -83,15 +126,14 @@ app.listen(PORT, '0.0.0.0', () => {
 ║   Env  : ${(process.env.NODE_ENV || 'development').padEnd(32)}║
 ╚══════════════════════════════════════════╝
   `);
-  console.log(`  📡 Health  : http://localhost:${PORT}/health`);
-  console.log(`  🤖 Telegram: ${configured('TELEGRAM_BOT_TOKEN')}`);
-  console.log(`  🗄️  Database: ${configured('DATABASE_URL')}`);
-  console.log(`  🔑 API Key : ${configured('API_SECRET_KEY')}`);
-  console.log(`  🔄 Music ch: ${configured('TELEGRAM_MUSIC_CHANNEL_ID')}`);
-  console.log(`  🖼️  Covers ch: ${configured('TELEGRAM_COVERS_CHANNEL_ID')}`);
-  console.log(`  🗑️  Dump chat: ${configured('TELEGRAM_DUMP_CHAT_ID')}`);
+  console.log(`  📡 Health    : http://localhost:${PORT}/health`);
+  console.log(`  📊 Dashboard : http://localhost:${PORT}/dashboard`);
+  console.log(`  🤖 Telegram  : ${configured('TELEGRAM_BOT_TOKEN')}`);
+  console.log(`  🗄️  Database  : ${configured('DATABASE_URL')}`);
+  console.log(`  🔑 API Key   : ${configured('API_SECRET_KEY')}`);
+  console.log(`  🔄 Music ch  : ${configured('TELEGRAM_MUSIC_CHANNEL_ID')}`);
+  console.log(`  🎙️  Stories ch: ${configured('TELEGRAM_STORIES_CHANNEL_ID')}`);
+  console.log(`  🖼️  Covers ch : ${configured('TELEGRAM_COVERS_CHANNEL_ID')}`);
 });
-
-
 
 module.exports = app;

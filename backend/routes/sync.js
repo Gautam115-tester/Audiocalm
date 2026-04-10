@@ -1,11 +1,17 @@
 // routes/sync.js
 // Syncs music, audio stories, and cover images from Telegram channels into the DB.
 //
-// FIX: Full pagination — fetches ALL updates across multiple getUpdates calls,
-//      not just the first 100. Uses offset cursor stored in DB so nothing is missed.
+// MULTI-PART FIX:
+//   - Groups _part01, _part02 ... _partN files into a single episode row.
+//   - telegramFileId stored as JSON array: ["fileId1","fileId2",...,"fileIdN"]
+//   - duration = SUM of all parts (446 + 347 = 793 seconds → shown as 13:13)
+//   - partCount = number of parts
+//   - If episode already exists but new parts arrive later, PATCH it with the
+//     merged fileId array and updated duration (incremental part addition).
+//   - UI shows "Episode 1" with combined duration; player streams part1→part2→…
 //
-// FIX: Routes now respond synchronously (200 with results) so the dashboard HTML
-//      and Flutter app both receive created/updated counts immediately.
+// index.html FIX:
+//   - server.js path fix documented here — see server.js.
 
 const express = require('express');
 const router  = express.Router();
@@ -82,16 +88,7 @@ const syncStatus = {
 };
 
 // ── fetchAllUpdates ───────────────────────────────────────────────────────────
-// Fetches EVERY pending update from Telegram for a given channel using full
-// pagination. Telegram returns max 100 per call, so we loop with an increasing
-// offset until we get fewer than 100 (meaning we've reached the end).
-//
-// Key fix: we do NOT break on the first batch; we keep calling until Telegram
-// returns an empty result or fewer than 100 updates.
-//
-// @param {string|number} channelId  — the channel to filter posts for
-// @param {number}        fromUpdateId — last seen update_id (0 = start from oldest)
-// @returns {{ messages: object[], lastUpdateId: number }}
+// Fetches ALL pending updates from Telegram using full pagination.
 async function fetchAllUpdates(channelId, fromUpdateId = 0) {
   const messages      = [];
   let   offset        = fromUpdateId > 0 ? fromUpdateId + 1 : 0;
@@ -108,8 +105,8 @@ async function fetchAllUpdates(channelId, fromUpdateId = 0) {
       const res = await axios.get(`${TELEGRAM_API}/getUpdates`, {
         params: {
           offset,
-          limit:           100,          // Telegram's hard maximum per call
-          timeout:         0,            // long-poll disabled (we want immediate)
+          limit:           100,
+          timeout:         0,
           allowed_updates: ['channel_post'],
         },
         timeout: 30_000,
@@ -119,31 +116,23 @@ async function fetchAllUpdates(channelId, fromUpdateId = 0) {
       const status = err.response?.status;
       const desc   = err.response?.data?.description || err.message;
       console.error(`  ❌ getUpdates page ${pageNum} error (HTTP ${status}): ${desc}`);
-      // Don't break the whole sync on a transient error — return what we have
       break;
     }
 
     totalFetched += updates.length;
     console.log(`  📦 Page ${pageNum}: ${updates.length} updates (total so far: ${totalFetched})`);
 
-    if (updates.length === 0) break; // nothing left in Telegram's queue
+    if (updates.length === 0) break;
 
     for (const update of updates) {
       const post = update.channel_post;
-      // Telegram returns channel IDs as negative numbers; env vars may be
-      // stored as strings. Normalize both sides for a safe comparison.
       if (post && String(post.chat.id) === String(channelId)) {
         messages.push({ update_id: update.update_id, ...post });
       }
-      // Always advance offset past every update we've seen, even non-matching ones,
-      // otherwise we'll re-process them on the next sync run.
       offset = update.update_id + 1;
     }
 
-    // Fewer than 100 means this was the last page
     if (updates.length < 100) break;
-
-    // Brief pause between pages to be polite to the Telegram API
     await new Promise((r) => setTimeout(r, 300));
   }
 
@@ -189,7 +178,6 @@ async function runMusicSync() {
     return { created: 0, skipped: 0, scanned: raw.length, albums: 0 };
   }
 
-  // ── Pre-load for deduplication ──────────────────────────────────────────────
   const existingAlbums = await prisma.album.findMany({ select: { id: true, title: true } });
   const albumMap       = new Map(existingAlbums.map((a) => [a.title.toLowerCase(), a]));
 
@@ -199,7 +187,6 @@ async function runMusicSync() {
   const seenFileIds    = new Set(existingSongs.map((s) => s.telegramFileId).filter(Boolean));
   const seenTitleAlbum = new Set(existingSongs.map((s) => `${s.title.toLowerCase()}::${s.albumId}`));
 
-  // ── Determine albums to create ──────────────────────────────────────────────
   const albumsToCreate = new Map();
   for (const msg of audioPosts) {
     const a    = msg.audio;
@@ -220,10 +207,9 @@ async function runMusicSync() {
     fresh.forEach((a) => albumMap.set(a.title.toLowerCase(), a));
   }
 
-  // ── Track-number helpers ────────────────────────────────────────────────────
   const trackAgg    = await prisma.song.groupBy({ by: ['albumId'], _max: { trackNumber: true } });
   const maxTrackMap = new Map(trackAgg.map((r) => [r.albumId, r._max.trackNumber || 0]));
-  const sessionMax  = new Map(); // tracks numbers assigned this run
+  const sessionMax  = new Map();
 
   const songsToCreate = [];
   let   skipped       = 0;
@@ -235,7 +221,6 @@ async function runMusicSync() {
     const fileId    = audio.file_id;
     const duration  = audio.duration ?? null;
 
-    // Skip if we've already stored this exact file
     if (seenFileIds.has(fileId)) { skipped++; continue; }
 
     const albumName = cleanAlbumName(audio.file_name, performer);
@@ -246,16 +231,14 @@ async function runMusicSync() {
       continue;
     }
 
-    // Skip if this title already exists in the same album
     const titleKey = `${title.toLowerCase()}::${album.id}`;
     if (seenTitleAlbum.has(titleKey)) { skipped++; continue; }
 
-    // Determine track number (from filename TR01 pattern or auto-increment)
     const trMatch  = audio.file_name?.match(/TR(\d+)/i);
     let   trackNum = trMatch ? parseInt(trMatch[1]) : null;
 
     if (trackNum !== null && sessionMax.has(`${album.id}::${trackNum}`)) {
-      trackNum = null; // collision within this sync run — fall through to auto
+      trackNum = null;
     }
 
     if (trackNum === null) {
@@ -284,7 +267,6 @@ async function runMusicSync() {
   }
 
   if (songsToCreate.length > 0) {
-    // Insert in batches of 100 to avoid hitting Prisma/DB limits
     const BATCH = 100;
     for (let i = 0; i < songsToCreate.length; i += BATCH) {
       await prisma.song.createMany({
@@ -306,21 +288,26 @@ async function runMusicSync() {
 }
 
 // ── runStoriesSync ────────────────────────────────────────────────────────────
-// ── runStoriesSync ────────────────────────────────────────────────────────────
-// FIXED: Groups _part01, _part02 ... _partN files into a single episode.
-// - telegramFileId stored as JSON array when multi-part: ["fileId1","fileId2"]
-// - duration = sum of all parts
-// - partCount = number of parts
-// - App shows "Episode 1" with total duration, plays parts sequentially (already supported)
 //
-// Filename patterns supported:
-//   KarnaPishachini_Ep1_part01.mp3   → series=KarnaPishachini, ep=1, part=1
-//   KarnaPishachini_Ep01_part02.mp3  → series=KarnaPishachini, ep=1, part=2
-//   SeriesName_EP3_part1.mp3         → series=SeriesName, ep=3, part=1
-//   SeriesName — EP3: Title.mp3      → caption-based, no parts (single file)
+// MULTI-PART FIX — full logic:
 //
-// Caption patterns supported (unchanged):
-//   "Series Title — EP1: Episode Title"
+// 1. Parse every audio post → extract seriesTitle, episodeNum, partNum, fileId, duration
+// 2. Group by (seriesTitle, episodeNum) — collect all parts for each episode
+// 3. Sort parts by partNum within each group
+// 4. For NEW episodes  → CREATE with JSON array fileId + summed duration
+// 5. For EXISTING episodes that are getting NEW parts (incremental upload):
+//    → PATCH: merge new fileIds into existing JSON array, add new duration
+//
+// Example result in DB for a 2-part episode:
+//   telegramFileId = '["fileId1","fileId2"]'
+//   duration       = 793   (446 + 347)
+//   partCount      = 2
+//   title          = "Episode 1"
+//
+// The Flutter app then calls /api/episodes/:id/parts which returns:
+//   parts[0].streamUrl = .../stream?part=1
+//   parts[1].streamUrl = .../stream?part=2
+// just_audio ConcatenatingAudioSource plays them seamlessly end-to-end.
 
 async function runStoriesSync() {
   const state        = await readState();
@@ -336,49 +323,51 @@ async function runStoriesSync() {
 
   if (audioPosts.length === 0) {
     if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
-    return { created: 0, skipped: 0, scanned: raw.length };
+    return { created: 0, updated: 0, skipped: 0, scanned: raw.length };
   }
 
+  // ── Load existing data ─────────────────────────────────────────────────────
   const allSeries  = await prisma.series.findMany({ select: { id: true, title: true } });
   const seriesMap  = new Map(allSeries.map((s) => [s.title.toLowerCase(), s]));
 
   const existingEpisodes = await prisma.episode.findMany({
-    select: { telegramFileId: true, seriesId: true, episodeNumber: true },
+    select: { id: true, telegramFileId: true, seriesId: true, episodeNumber: true, duration: true, partCount: true },
   });
-  const seenEpKeys = new Set(existingEpisodes.map((e) => `${e.seriesId}::${e.episodeNumber}`));
 
-  // ── Collect all file IDs already stored (including those inside JSON arrays) ──
+  // Map: "seriesId::episodeNumber" → episode row
+  const existingEpMap = new Map(
+    existingEpisodes.map((e) => [`${e.seriesId}::${e.episodeNumber}`, e])
+  );
+
+  // All file IDs already stored (expand JSON arrays)
   const seenFileIds = new Set();
   for (const ep of existingEpisodes) {
     if (!ep.telegramFileId) continue;
     if (ep.telegramFileId.startsWith('[')) {
-      try {
-        const ids = JSON.parse(ep.telegramFileId);
-        ids.forEach((id) => seenFileIds.add(id));
-      } catch { seenFileIds.add(ep.telegramFileId); }
+      try { JSON.parse(ep.telegramFileId).forEach((id) => seenFileIds.add(id)); }
+      catch { seenFileIds.add(ep.telegramFileId); }
     } else {
       seenFileIds.add(ep.telegramFileId);
     }
   }
 
-  // ── Parse each audio post into a structured object ────────────────────────
-  // Result shape: { seriesTitle, episodeNum, partNum, fileId, duration, title }
-  // partNum = null means it's a non-part file (treat as single episode)
-
+  // ── Parse each audio post ─────────────────────────────────────────────────
+  // Result: { seriesTitle, episodeNum, partNum, episodeTitle, fileId, duration }
   const parsed = [];
-  let skipped = 0;
+  let globalSkipped = 0;
 
   for (const msg of audioPosts) {
-    const audio   = msg.audio;
-    const fileId  = audio.file_id;
-    const caption = msg.caption || '';
+    const audio    = msg.audio;
+    const fileId   = audio.file_id;
+    const caption  = msg.caption || '';
     const fileName = audio.file_name || '';
 
-    if (seenFileIds.has(fileId)) { skipped++; continue; }
+    if (seenFileIds.has(fileId)) { globalSkipped++; continue; }
 
-    // ── Try filename-based part pattern first ──────────────────────────────
-    // Matches: AnySeriesName_Ep1_part01.mp3  or  AnySeriesName_EP01_part2.m4a
-    // Group 1 = series name, Group 2 = episode number, Group 3 = part number
+    // ── Filename pattern: SeriesName_Ep01_part01.mp3 ──────────────────────
+    // Group 1 = series name (may have spaces/underscores)
+    // Group 2 = episode number
+    // Group 3 = part number
     const partMatch = fileName.match(
       /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
     );
@@ -387,51 +376,42 @@ async function runStoriesSync() {
       const seriesTitle  = partMatch[1].replace(/[_\-]+/g, ' ').trim();
       const episodeNum   = parseInt(partMatch[2]);
       const partNum      = parseInt(partMatch[3]);
-      const episodeTitle = `Episode ${episodeNum}`; // parts don't have individual titles
       parsed.push({
         seriesTitle,
         episodeNum,
         partNum,
-        episodeTitle,
+        episodeTitle: `Episode ${episodeNum}`,
         fileId,
         duration: audio.duration ?? 0,
       });
       continue;
     }
 
-    // ── Try caption format: "Series Title — EP1: Episode Title" ───────────
+    // ── Caption: "Series Title — EP1: Episode Title" ───────────────────────
     const captionMatch  = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
-    // ── Try filename format (no parts): SeriesTitle_EP01_EpisodeTitle.mp3 ──
+    // ── Filename (no parts): SeriesTitle_EP01_EpisodeTitle.mp3 ──────────────
     const fileNameMatch = fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
     const match         = captionMatch || fileNameMatch;
 
     if (!match) {
-      console.warn(
-        `⚠️  [Stories] Cannot parse series/episode from: "${caption || fileName}"`
-      );
-      skipped++;
+      console.warn(`⚠️  [Stories] Cannot parse: "${caption || fileName}"`);
+      globalSkipped++;
       continue;
     }
 
-    const seriesTitle  = match[1].trim();
-    const episodeNum   = parseInt(match[2]);
-    const episodeTitle = match[3].trim();
-
     parsed.push({
-      seriesTitle,
-      episodeNum,
-      partNum: null, // single-file episode
-      episodeTitle,
+      seriesTitle:  match[1].trim(),
+      episodeNum:   parseInt(match[2]),
+      partNum:      null,           // single-file episode → treat as part 1
+      episodeTitle: match[3].trim(),
       fileId,
       duration: audio.duration ?? 0,
     });
   }
 
-  // ── Group parts together: key = "seriesTitle::episodeNum" ─────────────────
-  // For non-part files (partNum = null), each is its own group.
-  // For part files, collect all parts under the same key and sort by partNum.
-
-  const groups = new Map(); // key → { seriesTitle, episodeNum, episodeTitle, parts: [{partNum, fileId, duration}] }
+  // ── Group by "seriesTitle::episodeNum" ─────────────────────────────────────
+  // Each group accumulates all parts for one episode.
+  const groups = new Map();
 
   for (const item of parsed) {
     const key = `${item.seriesTitle.toLowerCase()}::${item.episodeNum}`;
@@ -446,22 +426,22 @@ async function runStoriesSync() {
     }
 
     groups.get(key).parts.push({
-      partNum:  item.partNum ?? 1, // single-file = part 1
+      partNum:  item.partNum ?? 1,
       fileId:   item.fileId,
       duration: item.duration,
     });
   }
 
-  // ── Build episodes from groups ────────────────────────────────────────────
-
+  // ── Process each group ─────────────────────────────────────────────────────
   const episodesToCreate = [];
-  const episodesToUpdate = []; // for groups where ep exists but new parts arrived
+  const episodesToUpdate = []; // incremental part additions
+  let skipped = 0;
 
   for (const [, group] of groups) {
-    // Sort parts by part number so JSON array is in order
+    // Sort parts so JSON array is always in ascending order
     group.parts.sort((a, b) => a.partNum - b.partNum);
 
-    // Ensure / create series
+    // Ensure series exists
     let series = seriesMap.get(group.seriesTitle.toLowerCase());
     if (!series) {
       series = await prisma.series.create({ data: { title: group.seriesTitle } });
@@ -469,39 +449,94 @@ async function runStoriesSync() {
       console.log(`📚 [Stories] Created new series: "${group.seriesTitle}"`);
     }
 
-    const epKey = `${series.id}::${group.episodeNum}`;
+    const dbKey    = `${series.id}::${group.episodeNum}`;
+    const existing = existingEpMap.get(dbKey);
 
-    // Total duration = sum of all parts
-    const totalDuration = group.parts.reduce((sum, p) => sum + (p.duration || 0), 0);
-    const partCount     = group.parts.length;
+    // ── Compute new combined values ────────────────────────────────────────
+    const newPartDuration = group.parts.reduce((s, p) => s + (p.duration || 0), 0);
+    const newPartCount    = group.parts.length;
+    const newFileIds      = group.parts.map((p) => p.fileId);
 
-    // telegramFileId: single string for 1 part, JSON array for multiple
-    const telegramFileId = partCount === 1
-      ? group.parts[0].fileId
-      : JSON.stringify(group.parts.map((p) => p.fileId));
+    if (existing) {
+      // Episode exists — check if these are truly new parts not yet stored
+      let storedFileIds = [];
+      if (existing.telegramFileId) {
+        if (existing.telegramFileId.startsWith('[')) {
+          try { storedFileIds = JSON.parse(existing.telegramFileId); } catch {}
+        } else {
+          storedFileIds = [existing.telegramFileId];
+        }
+      }
 
-    if (seenEpKeys.has(epKey)) {
-      // Episode already exists — could be that only some parts were new.
-      // For safety just skip (idempotent). To support incremental part
-      // addition you'd PATCH here, but that's an edge case.
-      skipped++;
+      // Find file IDs from this sync that aren't already stored
+      const trulyNewIds = newFileIds.filter((id) => !storedFileIds.includes(id));
+
+      if (trulyNewIds.length === 0) {
+        // All parts already stored → skip
+        skipped++;
+        continue;
+      }
+
+      // Merge: existing parts first, then new ones
+      // Sort by partNum mapping: existing stored IDs keep their order,
+      // new ones append after.
+      const mergedIds = [...storedFileIds, ...trulyNewIds];
+      const mergedTelegramFileId = mergedIds.length === 1
+        ? mergedIds[0]
+        : JSON.stringify(mergedIds);
+
+      // Add the new parts' duration to the existing stored duration
+      const additionalDuration = group.parts
+        .filter((p) => trulyNewIds.includes(p.fileId))
+        .reduce((s, p) => s + (p.duration || 0), 0);
+
+      const mergedDuration = (existing.duration || 0) + additionalDuration;
+      const mergedPartCount = mergedIds.length;
+
+      episodesToUpdate.push({
+        id:             existing.id,
+        telegramFileId: mergedTelegramFileId,
+        duration:       mergedDuration || null,
+        partCount:      mergedPartCount,
+      });
+
+      console.log(
+        `🔄 [Stories] Merging ${trulyNewIds.length} new part(s) into ` +
+        `"${group.seriesTitle}" EP${group.episodeNum} ` +
+        `(now ${mergedPartCount} parts, ${mergedDuration}s total)`
+      );
+
+      // Mark newly-seen file IDs
+      trulyNewIds.forEach((id) => seenFileIds.add(id));
       continue;
     }
 
-    seenEpKeys.add(epKey);
-    // Mark all file IDs as seen
-    group.parts.forEach((p) => seenFileIds.add(p.fileId));
+    // ── Brand new episode ──────────────────────────────────────────────────
+    const telegramFileId = newPartCount === 1
+      ? newFileIds[0]
+      : JSON.stringify(newFileIds);
+
+    const totalDuration = newPartDuration || null;
+
+    console.log(
+      `✨ [Stories] New episode: "${group.seriesTitle}" EP${group.episodeNum} ` +
+      `— ${newPartCount} part(s), ${totalDuration}s total`
+    );
+
+    newFileIds.forEach((id) => seenFileIds.add(id));
+    existingEpMap.set(dbKey, { id: 'pending', seriesId: series.id, episodeNumber: group.episodeNum });
 
     episodesToCreate.push({
       seriesId:       series.id,
       episodeNumber:  group.episodeNum,
       title:          group.episodeTitle,
       telegramFileId,
-      duration:       totalDuration || null,
-      partCount,
+      duration:       totalDuration,
+      partCount:      newPartCount,
     });
   }
 
+  // ── Batch CREATE ────────────────────────────────────────────────────────────
   if (episodesToCreate.length > 0) {
     const BATCH = 100;
     for (let i = 0; i < episodesToCreate.length; i += BATCH) {
@@ -510,14 +545,33 @@ async function runStoriesSync() {
         skipDuplicates: true,
       });
     }
-    console.log(`🎙️  [Stories] Inserted ${episodesToCreate.length} episodes (${
-      episodesToCreate.filter(e => e.partCount > 1).length
-    } multi-part), skipped ${skipped}`);
+    console.log(
+      `🎙️  [Stories] Created ${episodesToCreate.length} episode(s) ` +
+      `(${episodesToCreate.filter(e => e.partCount > 1).length} multi-part)`
+    );
+  }
+
+  // ── Batch UPDATE (incremental part additions) ───────────────────────────────
+  if (episodesToUpdate.length > 0) {
+    await Promise.all(
+      episodesToUpdate.map(({ id, telegramFileId, duration, partCount }) =>
+        prisma.episode.update({
+          where: { id },
+          data:  { telegramFileId, duration, partCount },
+        })
+      )
+    );
+    console.log(`🔄 [Stories] Updated ${episodesToUpdate.length} episode(s) with new parts`);
   }
 
   if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
 
-  return { created: episodesToCreate.length, skipped, scanned: raw.length };
+  return {
+    created: episodesToCreate.length,
+    updated: episodesToUpdate.length,
+    skipped: skipped + globalSkipped,
+    scanned: raw.length,
+  };
 }
 
 // ── runCoversSync ─────────────────────────────────────────────────────────────
@@ -551,7 +605,7 @@ async function runCoversSync() {
 
   for (const msg of photoMessages) {
     const caption = msg.caption || '';
-    const fileId  = msg.photo[msg.photo.length - 1].file_id; // highest resolution
+    const fileId  = msg.photo[msg.photo.length - 1].file_id;
 
     const albumMatch  = caption.match(/COVER_ALBUM:(.+)/i);
     const seriesMatch = caption.match(/COVER_SERIES:(.+)/i);
@@ -583,7 +637,6 @@ async function runCoversSync() {
     }
   }
 
-  // Run DB updates in parallel
   await Promise.all([
     ...albumUpdates.map(({ id, fileId }) =>
       prisma.album.update({ where: { id }, data: { coverTelegramFileId: fileId } })
@@ -602,33 +655,14 @@ async function runCoversSync() {
 }
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
-// All sync routes now respond SYNCHRONOUSLY with full results.
-// The dashboard HTML and Flutter app both expect { created, skipped, albums }
-// or { updated } in the response body — so we await the sync before replying.
-//
-// For very large channels (1000+ files) consider the async pattern with polling,
-// but for typical usage (< 2000 files) a synchronous response is fine because
-// Render's request timeout is 30 s and each sync run completes well within that.
 
-// POST /api/sync/music
 router.post('/music', async (req, res, next) => {
   if (syncStatus.music.running) {
-    return res.status(409).json({
-      error:   'Music sync already running',
-      message: 'Poll GET /api/sync/status for the current result',
-    });
+    return res.status(409).json({ error: 'Music sync already running' });
   }
-
-  syncStatus.music = {
-    ...syncStatus.music,
-    running:     true,
-    lastError:   null,
-    lastRun:     new Date().toISOString(),
-    lastResult:  null,
-  };
-
+  syncStatus.music = { ...syncStatus.music, running: true, lastError: null, lastRun: new Date().toISOString(), lastResult: null };
   try {
-    const result               = await runMusicSync();
+    const result = await runMusicSync();
     syncStatus.music.lastResult = result;
     res.json({ success: true, ...result });
   } catch (err) {
@@ -640,26 +674,14 @@ router.post('/music', async (req, res, next) => {
   }
 });
 
-// POST /api/sync/stories
 router.post('/stories', async (req, res, next) => {
   if (syncStatus.stories.running) {
-    return res.status(409).json({
-      error:   'Stories sync already running',
-      message: 'Poll GET /api/sync/status for the current result',
-    });
+    return res.status(409).json({ error: 'Stories sync already running' });
   }
-
-  syncStatus.stories = {
-    ...syncStatus.stories,
-    running:     true,
-    lastError:   null,
-    lastRun:     new Date().toISOString(),
-    lastResult:  null,
-  };
-
+  syncStatus.stories = { ...syncStatus.stories, running: true, lastError: null, lastRun: new Date().toISOString(), lastResult: null };
   try {
-    const result                  = await runStoriesSync();
-    syncStatus.stories.lastResult  = result;
+    const result = await runStoriesSync();
+    syncStatus.stories.lastResult = result;
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.stories.lastError = err.message;
@@ -670,26 +692,14 @@ router.post('/stories', async (req, res, next) => {
   }
 });
 
-// POST /api/sync/covers
 router.post('/covers', async (req, res, next) => {
   if (syncStatus.covers.running) {
-    return res.status(409).json({
-      error:   'Covers sync already running',
-      message: 'Poll GET /api/sync/status for the current result',
-    });
+    return res.status(409).json({ error: 'Covers sync already running' });
   }
-
-  syncStatus.covers = {
-    ...syncStatus.covers,
-    running:     true,
-    lastError:   null,
-    lastRun:     new Date().toISOString(),
-    lastResult:  null,
-  };
-
+  syncStatus.covers = { ...syncStatus.covers, running: true, lastError: null, lastRun: new Date().toISOString(), lastResult: null };
   try {
-    const result                 = await runCoversSync();
-    syncStatus.covers.lastResult  = result;
+    const result = await runCoversSync();
+    syncStatus.covers.lastResult = result;
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.covers.lastError = err.message;
@@ -700,42 +710,21 @@ router.post('/covers', async (req, res, next) => {
   }
 });
 
-// GET /api/sync/status
 router.get('/status', async (req, res, next) => {
   try {
     const state = await readState();
-    res.json({
-      success: true,
-      data:    {
-        music:   syncStatus.music,
-        stories: syncStatus.stories,
-        covers:  syncStatus.covers,
-        state,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
+    res.json({ success: true, data: { music: syncStatus.music, stories: syncStatus.stories, covers: syncStatus.covers, state } });
+  } catch (err) { next(err); }
 });
 
-// POST /api/sync/reset — re-scans everything from the beginning (offset = 0)
 router.post('/reset', async (req, res, next) => {
   try {
-    await saveState({
-      musicLastUpdateId:   0,
-      storiesLastUpdateId: 0,
-      coversLastUpdateId:  0,
-    });
+    await saveState({ musicLastUpdateId: 0, storiesLastUpdateId: 0, coversLastUpdateId: 0 });
     syncStatus.music.lastResult   = null;
     syncStatus.stories.lastResult = null;
     syncStatus.covers.lastResult  = null;
-    res.json({
-      success: true,
-      message: 'Sync state reset. Next run will fetch ALL updates from the beginning.',
-    });
-  } catch (err) {
-    next(err);
-  }
+    res.json({ success: true, message: 'Sync state reset. Next run will fetch ALL updates from the beginning.' });
+  } catch (err) { next(err); }
 });
 
 module.exports = router;

@@ -1,16 +1,18 @@
 // lib/features/calm_stories/presentation/series_detail_screen.dart
 //
-// FIX: Download progress ring was frozen / not updating.
+// MULTI-PART DISPLAY FIX:
+// Episodes can be single-file or multi-part (partCount > 1).
+// The DB stores:
+//   duration  = TOTAL seconds across all parts (e.g. 446+347 = 793)
+//   partCount = number of parts
+//   title     = "Episode 1"  (NOT "Episode 1 Part 1/2")
 //
-// ROOT CAUSE: DownloadModel is mutable — its fields (status, progress) are
-// mutated in-place inside DownloadManager. Riverpod's `.select((map) => map[id])`
-// returns the SAME object reference before and after the mutation, so
-// `identical(prev, next)` is true → Riverpod skips the rebuild → the ring
-// never moved.
+// This screen shows:
+//   • "Episode 1"  as the title (clean, no part suffix)
+//   • "13:13"      as the duration (combined)
+//   • No visual indication of parts — the player handles seamless playback
 //
-// FIX: _DownloadButton is now a ConsumerWidget that watches the provider
-// directly and selects the specific scalar fields it needs (status + progress).
-// Because scalars are compared by value, any change triggers a rebuild.
+// Download / favorites / progress ring fixes are unchanged from previous version.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -32,7 +34,7 @@ class SeriesDetailScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final seriesAsync = ref.watch(seriesDetailProvider(seriesId));
+    final seriesAsync  = ref.watch(seriesDetailProvider(seriesId));
     final episodesAsync = ref.watch(episodesProvider(seriesId));
 
     return Scaffold(
@@ -64,21 +66,22 @@ class SeriesDetailScreen extends ConsumerWidget {
                 return const SliverToBoxAdapter(
                   child: EmptyStateWidget(
                     icon: Icons.headphones_rounded,
-                    title: 'No Episodes',
+                    title: 'No Episodes Yet',
+                    subtitle: 'Episodes will appear here after syncing',
                   ),
                 );
               }
               return SliverList(
                 delegate: SliverChildBuilderDelegate(
                   (context, i) => _EpisodeTile(
-                    episode: episodes[i],
+                    episode:     episodes[i],
                     allEpisodes: episodes,
                     seriesAsync: seriesAsync,
-                    index: i,
+                    index:       i,
                   ),
-                  childCount: episodes.length,
+                  childCount:            episodes.length,
                   addAutomaticKeepAlives: false,
-                  addRepaintBoundaries: true,
+                  addRepaintBoundaries:   true,
                 ),
               );
             },
@@ -90,6 +93,8 @@ class SeriesDetailScreen extends ConsumerWidget {
   }
 }
 
+// ── Series header ─────────────────────────────────────────────────────────────
+
 class _SeriesHeader extends StatelessWidget {
   final SeriesModel series;
   const _SeriesHeader({required this.series});
@@ -98,27 +103,26 @@ class _SeriesHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return SliverAppBar(
       expandedHeight: 260,
-      pinned: true,
+      pinned:          true,
       backgroundColor: AppColors.background,
       flexibleSpace: FlexibleSpaceBar(
         background: Stack(
           fit: StackFit.expand,
           children: [
-            CoverImage(
-                url: series.coverUrl, size: double.infinity, borderRadius: 0),
+            CoverImage(url: series.coverUrl, size: double.infinity, borderRadius: 0),
             Container(
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
+                  end:   Alignment.bottomCenter,
                   colors: [Colors.transparent, AppColors.background],
                 ),
               ),
             ),
             Positioned(
               bottom: 16,
-              left: 20,
-              right: 20,
+              left:   20,
+              right:  20,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -136,7 +140,7 @@ class _SeriesHeader extends StatelessWidget {
                     ),
                   const SizedBox(height: 8),
                   Text(
-                    '${series.episodeCount} episodes',
+                    '${series.episodeCount} episode${series.episodeCount == 1 ? '' : 's'}',
                     style: Theme.of(context)
                         .textTheme
                         .labelMedium
@@ -152,11 +156,13 @@ class _SeriesHeader extends StatelessWidget {
   }
 }
 
+// ── Episode tile ──────────────────────────────────────────────────────────────
+
 class _EpisodeTile extends ConsumerWidget {
-  final EpisodeModel episode;
-  final List<EpisodeModel> allEpisodes;
+  final EpisodeModel         episode;
+  final List<EpisodeModel>   allEpisodes;
   final AsyncValue<SeriesModel?> seriesAsync;
-  final int index;
+  final int                  index;
 
   const _EpisodeTile({
     required this.episode,
@@ -167,23 +173,21 @@ class _EpisodeTile extends ConsumerWidget {
 
   PlayableItem _toPlayable(EpisodeModel ep, SeriesModel? series) {
     return PlayableItem(
-      id: ep.id,
-      title: ep.title,
-      subtitle: series?.title,
+      id:         ep.id,
+      title:      ep.title,
+      subtitle:   series?.title,
       artworkUrl: series?.coverUrl,
-      duration: ep.duration,
-      partCount: ep.partCount,
-      type: MediaType.episode,
-      streamUrl: '${ApiConstants.baseUrl}${ApiConstants.episodeStream(ep.id)}',
+      duration:   ep.duration,      // COMBINED duration already in DB
+      partCount:  ep.partCount,     // tells audio_handler how many ?part=N URLs
+      type:       MediaType.episode,
+      streamUrl:  '${ApiConstants.baseUrl}${ApiConstants.episodeStream(ep.id)}',
     );
   }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // FIX: only watch the scalar `isCompleted` bool — value comparison works.
     final isCompleted = ref.watch(
-      downloadManagerProvider
-          .select((map) => map[episode.id]?.isCompleted == true),
+      downloadManagerProvider.select((map) => map[episode.id]?.isCompleted == true),
     );
     final isFav = ref.watch(
       favoritesProvider.select((set) => set.contains(episode.id)),
@@ -192,36 +196,24 @@ class _EpisodeTile extends ConsumerWidget {
 
     return RepaintBoundary(
       child: ListTile(
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-        leading: Container(
-          width: 44,
-          height: 44,
-          decoration: BoxDecoration(
-            color: AppColors.surfaceVariant,
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: Center(
-            child: Text(
-              episode.episodeNumber.toString().padLeft(2, '0'),
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: AppColors.primary,
-                    fontWeight: FontWeight.w700,
-                  ),
-            ),
-          ),
-        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+        leading: _EpisodeNumberBadge(number: episode.episodeNumber),
         title: Text(
           episode.title,
-          style: Theme.of(context)
-              .textTheme
-              .titleMedium
-              ?.copyWith(fontSize: 14),
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontSize: 14),
         ),
         subtitle: Row(
           children: [
+            // Show combined duration (already summed in DB)
             if (episode.duration != null)
               DurationBadge(duration: episode.formattedDuration),
+
+            // Multi-part indicator — subtle, just shows part count
+            if (episode.isMultiPart) ...[
+              const SizedBox(width: 6),
+              _PartBadge(count: episode.partCount),
+            ],
+
             const SizedBox(width: 6),
             if (isCompleted) const _EncLockBadge(),
           ],
@@ -229,13 +221,13 @@ class _EpisodeTile extends ConsumerWidget {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // FIX: pass IDs not the model — _DownloadButton watches internally
             _DownloadButton(
-              episodeId: episode.id,
+              episodeId:    episode.id,
               episodeTitle: episode.title,
-              isMultiPart: episode.isMultiPart,
-              seriesTitle: series?.title,
-              coverUrl: series?.coverUrl,
+              isMultiPart:  episode.isMultiPart,
+              partCount:    episode.partCount,
+              seriesTitle:  series?.title,
+              coverUrl:     series?.coverUrl,
             ),
             IconButton(
               icon: Icon(
@@ -249,8 +241,7 @@ class _EpisodeTile extends ConsumerWidget {
           ],
         ),
         onTap: () {
-          final queue =
-              allEpisodes.map((ep) => _toPlayable(ep, series)).toList();
+          final queue = allEpisodes.map((ep) => _toPlayable(ep, series)).toList();
           ref
               .read(audioPlayerProvider.notifier)
               .playItem(queue[index], queue: queue, index: index);
@@ -261,17 +252,67 @@ class _EpisodeTile extends ConsumerWidget {
   }
 }
 
-// ── Download button — watches provider directly by episodeId ──────────────────
-//
-// KEY FIX: We select individual scalar fields (status string + progress double)
-// rather than the whole DownloadModel object. Because DownloadModel is mutable,
-// selecting the object itself returns the same reference every time (no rebuild).
-// Selecting scalars lets Riverpod compare by value → rebuilds on every tick.
+// ── Episode number badge ──────────────────────────────────────────────────────
+
+class _EpisodeNumberBadge extends StatelessWidget {
+  final int number;
+  const _EpisodeNumberBadge({required this.number});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width:  44,
+      height: 44,
+      decoration: BoxDecoration(
+        color:        AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Center(
+        child: Text(
+          number.toString().padLeft(2, '0'),
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+            color:      AppColors.primary,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Part count badge (subtle) ─────────────────────────────────────────────────
+
+class _PartBadge extends StatelessWidget {
+  final int count;
+  const _PartBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color:        AppColors.primary.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        '$count parts',
+        style: TextStyle(
+          color:      AppColors.primary,
+          fontSize:   9,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+// ── Download button ───────────────────────────────────────────────────────────
 
 class _DownloadButton extends ConsumerWidget {
-  final String episodeId;
-  final String episodeTitle;
-  final bool isMultiPart;
+  final String  episodeId;
+  final String  episodeTitle;
+  final bool    isMultiPart;
+  final int     partCount;
   final String? seriesTitle;
   final String? coverUrl;
 
@@ -279,13 +320,13 @@ class _DownloadButton extends ConsumerWidget {
     required this.episodeId,
     required this.episodeTitle,
     required this.isMultiPart,
+    required this.partCount,
     this.seriesTitle,
     this.coverUrl,
   });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Watch scalar fields so Riverpod can detect value-level changes.
     final status = ref.watch(
       downloadManagerProvider.select((map) => map[episodeId]?.status),
     );
@@ -293,21 +334,18 @@ class _DownloadButton extends ConsumerWidget {
       downloadManagerProvider.select((map) => map[episodeId]?.progress ?? 0.0),
     );
 
-    // ── Completed ──────────────────────────────────────────────────────────
     if (status == 'completed') {
       return const Padding(
         padding: EdgeInsets.all(8.0),
-        child: Icon(Icons.check_circle_rounded,
-            color: AppColors.success, size: 22),
+        child: Icon(Icons.check_circle_rounded, color: AppColors.success, size: 22),
       );
     }
 
-    // ── Downloading / merging / encrypting ──────────────────────────────────
     if (status == 'downloading' || status == 'merging' || status == 'encrypting') {
-      final clampedProgress = progress.clamp(0.0, 1.0);
-      final pct = (clampedProgress * 100).round();
+      final clamped = progress.clamp(0.0, 1.0);
+      final pct = (clamped * 100).round();
 
-      final Color ringColor;
+      final Color  ringColor;
       final String label;
       if (status == 'merging' || status == 'encrypting') {
         ringColor = AppColors.accentGold;
@@ -318,91 +356,78 @@ class _DownloadButton extends ConsumerWidget {
       }
 
       return SizedBox(
-        width: 44,
-        height: 44,
+        width: 44, height: 44,
         child: Stack(
           alignment: Alignment.center,
           children: [
             SizedBox(
-              width: 28,
-              height: 28,
+              width: 28, height: 28,
               child: CircularProgressIndicator(
-                value: clampedProgress > 0.01 ? clampedProgress : null,
-                strokeWidth: 2.5,
+                value:           clamped > 0.01 ? clamped : null,
+                strokeWidth:     2.5,
                 backgroundColor: AppColors.surfaceVariant,
-                color: ringColor,
+                color:           ringColor,
               ),
             ),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 8,
-                fontWeight: FontWeight.w700,
-                color: ringColor,
-                letterSpacing: -0.3,
-              ),
-            ),
+            Text(label, style: TextStyle(
+              fontSize:   8,
+              fontWeight: FontWeight.w700,
+              color:      ringColor,
+              letterSpacing: -0.3,
+            )),
           ],
         ),
       );
     }
 
-    // ── Failed — retry button ──────────────────────────────────────────────
     if (status == 'failed') {
       return IconButton(
-        icon: const Icon(Icons.refresh_rounded, size: 20),
-        color: AppColors.error,
+        icon:    const Icon(Icons.refresh_rounded, size: 20),
+        color:   AppColors.error,
         tooltip: 'Retry download',
-        onPressed: () {
-          ref.read(downloadManagerProvider.notifier).retryDownload(episodeId);
-        },
+        onPressed: () =>
+            ref.read(downloadManagerProvider.notifier).retryDownload(episodeId),
       );
     }
 
-    // ── Not downloaded — show download arrow ───────────────────────────────
     return IconButton(
-      icon: const Icon(Icons.download_rounded, size: 20),
+      icon:  const Icon(Icons.download_rounded, size: 20),
       color: AppColors.textTertiary,
       onPressed: () {
         ref.read(downloadManagerProvider.notifier).startDownload(
-              mediaId: episodeId,
-              title: episodeTitle,
-              mediaType: 'episode',
-              partCount: isMultiPart ? 2 : 1,
-              artworkUrl: coverUrl,
-              subtitle: seriesTitle,
-            );
-
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.download_rounded,
-                    color: Colors.white, size: 16),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Downloading "$episodeTitle"…',
-                    style: const TextStyle(fontSize: 13),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
-            ),
-            duration: const Duration(seconds: 2),
-            behavior: SnackBarBehavior.floating,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            backgroundColor: AppColors.surfaceVariant,
-          ),
+          mediaId:    episodeId,
+          title:      episodeTitle,
+          mediaType:  'episode',
+          partCount:  partCount,   // pass actual part count for correct download
+          artworkUrl: coverUrl,
+          subtitle:   seriesTitle,
         );
+
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(SnackBar(
+            content: Row(children: [
+              const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Downloading "$episodeTitle"…',
+                  style: const TextStyle(fontSize: 13),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ]),
+            duration:  const Duration(seconds: 2),
+            behavior:  SnackBarBehavior.floating,
+            shape:     RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            backgroundColor: AppColors.surfaceVariant,
+          ));
       },
     );
   }
 }
 
-// ── Polished ENC lock badge ────────────────────────────────────────────────────
+// ── ENC lock badge ────────────────────────────────────────────────────────────
 
 class _EncLockBadge extends StatelessWidget {
   const _EncLockBadge();
@@ -412,51 +437,31 @@ class _EncLockBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: AppColors.accentGold.withOpacity(0.18),
+        color:        AppColors.accentGold.withOpacity(0.18),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: AppColors.accentGold.withOpacity(0.55),
-          width: 0.8,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: AppColors.accentGold.withOpacity(0.25),
-            blurRadius: 6,
-          ),
-        ],
+        border:       Border.all(color: AppColors.accentGold.withOpacity(0.55), width: 0.8),
+        boxShadow: [BoxShadow(color: AppColors.accentGold.withOpacity(0.25), blurRadius: 6)],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.lock_rounded,
-            size: 9,
-            color: AppColors.accentGold,
-            shadows: [
-              Shadow(
-                  color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4),
-            ],
-          ),
+          Icon(Icons.lock_rounded, size: 9, color: AppColors.accentGold,
+              shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4)]),
           const SizedBox(width: 3),
-          Text(
-            'ENC',
-            style: TextStyle(
-              color: AppColors.accentGold,
-              fontSize: 9,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.6,
-              shadows: [
-                Shadow(
-                    color: AppColors.accentGold.withOpacity(0.5),
-                    blurRadius: 4),
-              ],
-            ),
-          ),
+          Text('ENC', style: TextStyle(
+            color:       AppColors.accentGold,
+            fontSize:    9,
+            fontWeight:  FontWeight.w800,
+            letterSpacing: 0.6,
+            shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.5), blurRadius: 4)],
+          )),
         ],
       ),
     );
   }
 }
+
+// ── Shimmer placeholder ───────────────────────────────────────────────────────
 
 class _EpisodeShimmer extends StatelessWidget {
   const _EpisodeShimmer();
