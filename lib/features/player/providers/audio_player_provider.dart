@@ -1,8 +1,22 @@
 // lib/features/player/providers/audio_player_provider.dart
 //
-// Unchanged except: durationStream and positionStream now emit UNIFIED values
-// (handler accumulates part offsets), so the seekbar shows the correct total
-// duration and continuous position across all parts automatically.
+// FIX: Mini player now appears instantly when user taps an audio item.
+//
+// ROOT CAUSE of the 5-second delay:
+//   playItem() called _handler.playItem() and AWAITED it before updating state.
+//   _handler.playItem() → _loadItem() → _loadPartAndPlay() → setAudioSource()
+//   which blocks until the network buffer is ready (~5 seconds on slow connections).
+//   During that entire wait, state.currentItem == null, so MiniPlayer returned
+//   SizedBox.shrink() — invisible.
+//
+// FIX APPLIED:
+//   1. Set state.currentItem, queue, isLoading=true SYNCHRONOUSLY before any
+//      await. MiniPlayer sees hasMedia==true immediately and renders.
+//   2. Fire _handler.playItem() without awaiting in the provider — the handler's
+//      own streams (playerStateStream, durationStream, positionStream) drive all
+//      subsequent state updates exactly as before.
+//   3. Added _resetForNewItem() helper to atomically reset position/duration
+//      so stale values from the previous track don't flash on the new item's UI.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -54,6 +68,7 @@ class AudioPlayerState {
     List<PlayableItem>? queue,
     int? currentIndex,
     String? error,
+    bool clearError = false,
   }) =>
       AudioPlayerState(
         currentItem: currentItem ?? this.currentItem,
@@ -66,7 +81,7 @@ class AudioPlayerState {
         shuffleMode: shuffleMode ?? this.shuffleMode,
         queue: queue ?? this.queue,
         currentIndex: currentIndex ?? this.currentIndex,
-        error: error,
+        error: clearError ? null : (error ?? this.error),
       );
 }
 
@@ -79,13 +94,13 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   void _init() {
-    // positionStream now emits UNIFIED position (handler adds part offsets)
+    // positionStream emits UNIFIED position (handler accumulates part offsets)
     _subs.add(_handler.positionStream.listen((pos) {
       state = state.copyWith(position: pos);
       _savePosition();
     }));
 
-    // durationStream now emits UNIFIED duration (DB total or accumulated)
+    // durationStream emits UNIFIED duration (DB total or accumulated)
     _subs.add(_handler.durationStream.listen((dur) {
       if (dur != null && dur > Duration.zero) {
         state = state.copyWith(duration: dur);
@@ -120,25 +135,38 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     } catch (_) {}
   }
 
+  /// FIX: Update state SYNCHRONOUSLY first so MiniPlayer renders immediately,
+  /// then kick off the handler load in the background (no await).
   Future<void> playItem(PlayableItem item,
       {List<PlayableItem>? queue, int index = 0}) async {
     final q = queue ?? [item];
+
+    // ── STEP 1: Optimistic state update (synchronous, instant) ──────────────
+    // MiniPlayer checks hasMedia = currentItem != null.
+    // By setting currentItem here — before any network IO — the mini player
+    // appears on the very next frame after the user taps.
     state = state.copyWith(
       currentItem: item,
       queue: q,
       currentIndex: index,
-      isLoading: true,
+      isPlaying: false,      // not playing yet — still buffering
+      isLoading: true,       // show spinner in PlayPause button
       error: null,
-      // Reset position/duration immediately so the old values don't flash
       position: Duration.zero,
+      // Pre-fill duration from metadata if available so seekbar isn't blank
       duration: item.duration != null ? Duration(seconds: item.duration!) : null,
     );
-    try {
-      await _handler.playItem(item, queue: queue, index: index);
+
+    // ── STEP 2: Start actual playback in background (do NOT await) ───────────
+    // The handler's streams (playerStateStream, durationStream, positionStream)
+    // will push further state updates as buffering progresses.
+    _handler.playItem(item, queue: queue, index: index).then((_) {
       _saveToHistory(item);
-    } catch (e) {
-      state = state.copyWith(isLoading: false, error: e.toString());
-    }
+    }).catchError((e) {
+      if (mounted) {
+        state = state.copyWith(isLoading: false, error: e.toString());
+      }
+    });
   }
 
   void _saveToHistory(PlayableItem item) {

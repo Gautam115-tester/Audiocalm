@@ -1,4 +1,19 @@
 // lib/features/player/presentation/mini_player.dart
+//
+// FIX: MiniPlayer now renders on the very first frame after the user taps
+// an audio item — before the audio stream has buffered.
+//
+// CHANGES:
+//   • Removed the early `if (!playerState.hasMedia) return SizedBox.shrink()`
+//     guard — it is still there, but now hasMedia becomes true immediately
+//     because AudioPlayerNotifier.playItem() sets currentItem synchronously
+//     (see audio_player_provider.dart fix).
+//   • CoverImage falls back gracefully when artworkUrl is null (shows a
+//     placeholder icon) — no change needed there, it already does this.
+//   • PlayPause button shows a spinner when isLoading==true, which is exactly
+//     what happens during the buffering phase. Users see the mini player
+//     appear instantly with a spinner in the play button.
+//   • Progress bar shows 0 while position/duration are zero — no crash.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,9 +29,18 @@ class MiniPlayer extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final playerState = ref.watch(audioPlayerProvider);
 
+    // hasMedia is true as soon as the user taps an item (optimistic update).
     if (!playerState.hasMedia) return const SizedBox.shrink();
 
     final item = playerState.currentItem!;
+
+    // Safe progress: 0.0 while buffering (duration may still be null)
+    final progress = (playerState.duration != null &&
+            playerState.duration!.inMilliseconds > 0)
+        ? (playerState.position.inMilliseconds /
+                playerState.duration!.inMilliseconds)
+            .clamp(0.0, 1.0)
+        : 0.0;
 
     return GestureDetector(
       onTap: () => AppRouter.navigateToPlayer(context),
@@ -40,27 +64,26 @@ class MiniPlayer extends ConsumerWidget {
         ),
         child: Column(
           children: [
-            // Progress bar
+            // ── Progress bar (shows 0 while buffering — no flicker) ───────
             ClipRRect(
               borderRadius:
                   const BorderRadius.vertical(top: Radius.circular(16)),
               child: LinearProgressIndicator(
-                value: playerState.duration != null &&
-                        playerState.duration!.inMilliseconds > 0
-                    ? playerState.position.inMilliseconds /
-                        playerState.duration!.inMilliseconds
-                    : 0,
+                value: progress,
                 backgroundColor: Colors.transparent,
                 color: AppColors.primary,
                 minHeight: 2,
               ),
             ),
+
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12),
                 child: Row(
                   children: [
-                    // Cover
+                    // ── Cover ─────────────────────────────────────────────
+                    // artworkUrl may be null during initial buffering;
+                    // CoverImage already handles null with a placeholder icon.
                     CoverImage(
                       url: item.artworkUrl,
                       size: 42,
@@ -68,7 +91,7 @@ class MiniPlayer extends ConsumerWidget {
                     ),
                     const SizedBox(width: 12),
 
-                    // Title and subtitle
+                    // ── Title + subtitle ──────────────────────────────────
                     Expanded(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
@@ -97,31 +120,39 @@ class MiniPlayer extends ConsumerWidget {
                       ),
                     ),
 
-                    // Controls
+                    // ── Controls ──────────────────────────────────────────
                     Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         _MiniControlButton(
                           icon: Icons.skip_previous_rounded,
-                          onTap: () => ref
-                              .read(audioPlayerProvider.notifier)
-                              .skipToPrevious(),
+                          // Disable while loading so the user can't queue
+                          // multiple items before the first one is ready.
+                          onTap: playerState.isLoading
+                              ? null
+                              : () => ref
+                                  .read(audioPlayerProvider.notifier)
+                                  .skipToPrevious(),
                           size: 20,
                         ),
                         const SizedBox(width: 4),
                         _PlayPauseButton(
                           isPlaying: playerState.isPlaying,
                           isLoading: playerState.isLoading,
-                          onTap: () => ref
-                              .read(audioPlayerProvider.notifier)
-                              .togglePlayPause(),
+                          onTap: playerState.isLoading
+                              ? null // tapping play while buffering is a no-op
+                              : () => ref
+                                  .read(audioPlayerProvider.notifier)
+                                  .togglePlayPause(),
                         ),
                         const SizedBox(width: 4),
                         _MiniControlButton(
                           icon: Icons.skip_next_rounded,
-                          onTap: () => ref
-                              .read(audioPlayerProvider.notifier)
-                              .skipToNext(),
+                          onTap: playerState.isLoading
+                              ? null
+                              : () => ref
+                                  .read(audioPlayerProvider.notifier)
+                                  .skipToNext(),
                           size: 20,
                         ),
                       ],
@@ -137,10 +168,13 @@ class MiniPlayer extends ConsumerWidget {
   }
 }
 
+// ── Play / Pause button ───────────────────────────────────────────────────────
+
 class _PlayPauseButton extends StatelessWidget {
   final bool isPlaying;
   final bool isLoading;
-  final VoidCallback onTap;
+  // null when loading — disables tap
+  final VoidCallback? onTap;
 
   const _PlayPauseButton({
     required this.isPlaying,
@@ -177,9 +211,12 @@ class _PlayPauseButton extends StatelessWidget {
   }
 }
 
+// ── Skip / Previous button ────────────────────────────────────────────────────
+
 class _MiniControlButton extends StatelessWidget {
   final IconData icon;
-  final VoidCallback onTap;
+  // null when loading — renders as visually dimmed, non-interactive
+  final VoidCallback? onTap;
   final double size;
 
   const _MiniControlButton({
@@ -195,7 +232,14 @@ class _MiniControlButton extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       child: Padding(
         padding: const EdgeInsets.all(6),
-        child: Icon(icon, size: size, color: AppColors.textSecondary),
+        child: Icon(
+          icon,
+          size: size,
+          // Dim the icon while disabled
+          color: onTap == null
+              ? AppColors.textTertiary.withOpacity(0.4)
+              : AppColors.textSecondary,
+        ),
       ),
     );
   }
