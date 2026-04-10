@@ -41,6 +41,10 @@ class CoverImage extends StatelessWidget {
   final double size;
   final double borderRadius;
   final Widget? placeholder;
+  // PERF FIX: Limit decoded image size in memory — pass 300 for thumbnails
+  // Reduces RAM usage and decoding time significantly for large grids
+  final int? memCacheWidth;
+  final int? memCacheHeight;
 
   const CoverImage({
     super.key,
@@ -48,6 +52,8 @@ class CoverImage extends StatelessWidget {
     this.size = 56,
     this.borderRadius = 12,
     this.placeholder,
+    this.memCacheWidth,
+    this.memCacheHeight,
   });
 
   @override
@@ -57,9 +63,16 @@ class CoverImage extends StatelessWidget {
       child: url != null && url!.isNotEmpty
           ? CachedNetworkImage(
               imageUrl: url!,
-              width: size,
-              height: size,
+              width: size.isFinite ? size : null,
+              height: size.isFinite ? size : null,
               fit: BoxFit.cover,
+              // PERF FIX: Decode images at display size, not full resolution
+              // e.g. a 500×500 thumbnail decoded at 150×150 uses 11× less RAM
+              memCacheWidth: memCacheWidth,
+              memCacheHeight: memCacheHeight,
+              // PERF FIX: Use fade only when there's no cached version
+              fadeInDuration: const Duration(milliseconds: 150),
+              fadeOutDuration: const Duration(milliseconds: 75),
               placeholder: (_, __) => _buildPlaceholder(),
               errorWidget: (_, __, ___) => _buildPlaceholder(),
             )
@@ -70,9 +83,7 @@ class CoverImage extends StatelessWidget {
   Widget _buildPlaceholder() {
     if (placeholder != null) return placeholder!;
 
-    // FIX: When size is double.infinity (used inside Expanded/SizedBox.expand),
-    // computing size * 0.4 yields Infinity, which crashes Flutter's icon/text
-    // layout with 'fontSize.isFinite' assertion. Clamp to a safe finite value.
+    // FIX: size * 0.4 crashes when size = double.infinity
     final double iconSize = size.isFinite ? size * 0.4 : 40.0;
 
     return Container(

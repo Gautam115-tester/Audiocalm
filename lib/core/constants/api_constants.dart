@@ -1,3 +1,5 @@
+// lib/core/constants/api_constants.dart
+
 class ApiConstants {
   ApiConstants._();
 
@@ -19,6 +21,8 @@ class ApiConstants {
   static String songParts(String id)      => '/api/songs/$id/parts';
   static String songDownload(String id)   => '/api/songs/$id/download';
 
-  static const int connectTimeout = 30000;
-  static const int receiveTimeout = 120000; // longer for streams
+  // PERF FIX: 10s connect (was 30s), 15s receive for JSON (was 120s)
+  // Streaming uses a separate longer timeout set in audio_handler.dart
+  static const int connectTimeout = 10000;
+  static const int receiveTimeout = 15000;
 }

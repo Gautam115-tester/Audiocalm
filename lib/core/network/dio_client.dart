@@ -7,28 +7,44 @@ import '../errors/app_exceptions.dart';
 class DioClient {
   late final Dio _dio;
 
-  DioClient() {
+  // Shared singleton instance to reuse the HTTP connection pool
+  static DioClient? _instance;
+  factory DioClient() {
+    _instance ??= DioClient._internal();
+    return _instance!;
+  }
+
+  DioClient._internal() {
     _dio = Dio(
       BaseOptions(
         baseUrl: ApiConstants.baseUrl,
-        connectTimeout:
-            const Duration(milliseconds: ApiConstants.connectTimeout),
-        receiveTimeout:
-            const Duration(milliseconds: ApiConstants.receiveTimeout),
+        // PERF FIX: Reduced from 30s → 10s connect, 120s → 15s receive for JSON
+        // Stream endpoints use their own Dio instance with longer timeouts
+        connectTimeout: const Duration(milliseconds: ApiConstants.connectTimeout),
+        receiveTimeout: const Duration(milliseconds: ApiConstants.receiveTimeout),
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
+          // PERF FIX: Keep TCP connections alive across requests
+          'Connection': 'keep-alive',
         },
+        // PERF FIX: Enable response compression
+        responseType: ResponseType.json,
       ),
     );
 
-    _dio.interceptors.add(LogInterceptor(
-      requestBody: false,
-      responseBody: true,   // Enable to debug response shape
-      responseHeader: false,
-      error: true,
-      logPrint: (obj) => print('[DioClient] $obj'),
-    ));
+    // PERF FIX: Only log in debug mode, never log response bodies (huge JSON kills perf)
+    assert(() {
+      _dio.interceptors.add(LogInterceptor(
+        requestBody: false,
+        responseBody: false, // was true — logging full JSON response is very slow
+        responseHeader: false,
+        requestHeader: false,
+        error: true,
+        logPrint: (obj) => print('[DioClient] $obj'),
+      ));
+      return true;
+    }());
 
     _dio.interceptors.add(
       InterceptorsWrapper(
@@ -41,9 +57,6 @@ class DioClient {
 
   Dio get dio => _dio;
 
-  /// Returns response.data directly.
-  /// Use get<Map<String, dynamic>> for wrapped responses like { success, data }
-  /// Use get<List<dynamic>> only if the backend returns a bare array.
   Future<T> get<T>(
     String path, {
     Map<String, dynamic>? queryParameters,

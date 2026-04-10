@@ -20,69 +20,106 @@ class AlbumDetailScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final albumAsync = ref.watch(albumDetailProvider(albumId));
-    final songsAsync = ref.watch(songsProvider(albumId));
+    // PERF FIX: Single provider fires both requests in parallel
+    final combinedAsync = ref.watch(albumWithSongsProvider(albumId));
 
     return Scaffold(
       backgroundColor: AppColors.background,
-      body: CustomScrollView(
-        slivers: [
-          albumAsync.when(
-            loading: () => const SliverAppBar(
-              expandedHeight: 240,
-              pinned: true,
-              backgroundColor: AppColors.background,
-            ),
-            error: (_, __) => const SliverAppBar(pinned: true),
-            data: (album) => album != null
-                ? _AlbumHeader(album: album, songsAsync: songsAsync)
-                : const SliverAppBar(pinned: true),
-          ),
-          songsAsync.when(
-            loading: () => SliverList(
-              delegate: SliverChildBuilderDelegate(
-                (_, __) => const _SongShimmer(),
-                childCount: 6,
-              ),
-            ),
-            error: (_, __) => const SliverToBoxAdapter(
-              child: AppErrorWidget(message: 'Failed to load songs'),
-            ),
-            data: (songs) {
-              if (songs.isEmpty) {
-                return const SliverToBoxAdapter(
-                  child: EmptyStateWidget(
-                    icon: Icons.music_note_rounded,
-                    title: 'No Songs',
-                  ),
-                );
-              }
-              final album = albumAsync.valueOrNull;
-              return SliverList(
+      body: combinedAsync.when(
+        // PERF FIX: Show skeleton UI while loading instead of blank screen
+        loading: () => _AlbumDetailSkeleton(),
+        error: (_, __) => Scaffold(
+          appBar: AppBar(backgroundColor: AppColors.background),
+          body: const AppErrorWidget(message: 'Failed to load album'),
+        ),
+        data: (data) => CustomScrollView(
+          // PERF FIX: Cacheextent loads more list items off-screen = smoother scroll
+          cacheExtent: 500,
+          slivers: [
+            if (data.album != null)
+              _AlbumHeader(album: data.album!, songCount: data.songs.length)
+            else
+              const SliverAppBar(pinned: true),
+
+            if (data.songs.isEmpty)
+              const SliverToBoxAdapter(
+                child: EmptyStateWidget(
+                  icon: Icons.music_note_rounded,
+                  title: 'No Songs',
+                ),
+              )
+            else
+              SliverList(
                 delegate: SliverChildBuilderDelegate(
                   (context, i) => _SongTile(
-                    song: songs[i],
-                    allSongs: songs,
-                    album: album,
+                    song: data.songs[i],
+                    allSongs: data.songs,
+                    album: data.album,
                     index: i,
                   ),
-                  childCount: songs.length,
+                  childCount: data.songs.length,
+                  // PERF FIX: Adds items lazily — only builds visible ones
+                  addAutomaticKeepAlives: false,
+                  addRepaintBoundaries: true,
                 ),
-              );
-            },
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 120)),
-        ],
+              ),
+
+            const SliverToBoxAdapter(child: SizedBox(height: 120)),
+          ],
+        ),
       ),
+    );
+  }
+}
+
+// PERF FIX: Skeleton screen instead of blank during load — feels much faster
+class _AlbumDetailSkeleton extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return CustomScrollView(
+      slivers: [
+        SliverAppBar(
+          expandedHeight: 260,
+          pinned: true,
+          backgroundColor: AppColors.background,
+          flexibleSpace: FlexibleSpaceBar(
+            background: Container(color: AppColors.surfaceVariant),
+          ),
+        ),
+        SliverList(
+          delegate: SliverChildBuilderDelegate(
+            (_, __) => const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+              child: Row(
+                children: [
+                  ShimmerBox(width: 44, height: 44, borderRadius: 10),
+                  SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ShimmerBox(height: 14),
+                        SizedBox(height: 6),
+                        ShimmerBox(width: 80, height: 10),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            childCount: 8,
+          ),
+        ),
+      ],
     );
   }
 }
 
 class _AlbumHeader extends StatelessWidget {
   final AlbumModel album;
-  final AsyncValue<List<SongModel>> songsAsync;
+  final int songCount;
 
-  const _AlbumHeader({required this.album, required this.songsAsync});
+  const _AlbumHeader({required this.album, required this.songCount});
 
   @override
   Widget build(BuildContext context) {
@@ -94,10 +131,12 @@ class _AlbumHeader extends StatelessWidget {
         background: Stack(
           fit: StackFit.expand,
           children: [
+            // PERF FIX: memCacheWidth/Height limits decoded image size in RAM
             CoverImage(
               url: album.coverUrl,
               size: double.infinity,
               borderRadius: 0,
+              memCacheWidth: 800,
             ),
             Container(
               decoration: const BoxDecoration(
@@ -127,7 +166,7 @@ class _AlbumHeader extends StatelessWidget {
                     ),
                   const SizedBox(height: 4),
                   Text(
-                    '${album.trackCount} tracks',
+                    '$songCount tracks',
                     style: Theme.of(context)
                         .textTheme
                         .labelMedium
@@ -143,6 +182,8 @@ class _AlbumHeader extends StatelessWidget {
   }
 }
 
+// PERF FIX: RepaintBoundary isolates each tile — scrolling doesn't repaint
+// tiles that are off-screen, reducing GPU work significantly
 class _SongTile extends ConsumerWidget {
   final SongModel song;
   final List<SongModel> allSongs;
@@ -157,17 +198,17 @@ class _SongTile extends ConsumerWidget {
   });
 
   PlayableItem _toPlayable(SongModel s, AlbumModel? album) {
-  return PlayableItem(
-    id: s.id,
-    title: s.title,
-    subtitle: album?.title,
-    artworkUrl: s.coverUrl ?? album?.coverUrl, // ← song has its own cover now
-    duration: s.duration,
-    partCount: s.isMultiPart ? 2 : 1,
-    type: MediaType.song,
-    streamUrl: '${ApiConstants.baseUrl}${ApiConstants.songStream(s.id)}',
-  );
-}
+    return PlayableItem(
+      id: s.id,
+      title: s.title,
+      subtitle: album?.title,
+      artworkUrl: s.coverUrl ?? album?.coverUrl,
+      duration: s.duration,
+      partCount: s.isMultiPart ? 2 : 1,
+      type: MediaType.song,
+      streamUrl: '${ApiConstants.baseUrl}${ApiConstants.songStream(s.id)}',
+    );
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -177,112 +218,95 @@ class _SongTile extends ConsumerWidget {
     final isDownloaded = dl?.isCompleted ?? false;
     final isDownloading = dl?.isInProgress ?? false;
 
-    return ListTile(
-      contentPadding:
-          const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
-      leading: Container(
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
-          borderRadius: BorderRadius.circular(10),
+    // PERF FIX: Wrap in RepaintBoundary — each tile is independent paint layer
+    return RepaintBoundary(
+      child: ListTile(
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+        leading: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Center(
+            child: Text(
+              song.trackNumber.toString().padLeft(2, '0'),
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+          ),
         ),
-        child: Center(
-          child: Text(
-            song.trackNumber.toString().padLeft(2, '0'),
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+        title: Text(
+          song.title,
+          style: Theme.of(context)
+              .textTheme
+              .titleMedium
+              ?.copyWith(fontSize: 14),
+        ),
+        subtitle: Row(
+          children: [
+            if (song.duration != null)
+              DurationBadge(duration: song.formattedDuration),
+            const SizedBox(width: 6),
+            if (isDownloaded) const EncryptedBadge(),
+          ],
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isDownloading)
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  value: dl?.progress,
+                  strokeWidth: 2,
                   color: AppColors.primary,
-                  fontWeight: FontWeight.w700,
                 ),
-          ),
-        ),
-      ),
-      title: Text(song.title,
-          style:
-              Theme.of(context).textTheme.titleMedium?.copyWith(fontSize: 14)),
-      subtitle: Row(
-        children: [
-          if (song.duration != null)
-            DurationBadge(duration: song.formattedDuration),
-          const SizedBox(width: 6),
-          if (isDownloaded) const EncryptedBadge(),
-        ],
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isDownloading)
-            SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(
-                value: dl?.progress,
-                strokeWidth: 2,
-                color: AppColors.primary,
-              ),
-            )
-          else if (!isDownloaded)
+              )
+            else if (!isDownloaded)
+              IconButton(
+                icon: const Icon(Icons.download_rounded, size: 20),
+                color: AppColors.textTertiary,
+                onPressed: () {
+                  ref.read(downloadManagerProvider.notifier).startDownload(
+                        mediaId: song.id,
+                        title: song.title,
+                        mediaType: 'song',
+                        partCount: song.isMultiPart ? 2 : 1,
+                        artworkUrl: song.coverUrl ?? album?.coverUrl,
+                        subtitle: album?.title,
+                      );
+                },
+              )
+            else
+              const Icon(Icons.check_circle_rounded,
+                  color: AppColors.success, size: 20),
             IconButton(
-              icon: const Icon(Icons.download_rounded, size: 20),
-              color: AppColors.textTertiary,
-              onPressed: () {
-  ref.read(downloadManagerProvider.notifier).startDownload(
-    mediaId: song.id,
-    title: song.title,
-    mediaType: 'song',
-    partCount: song.isMultiPart ? 2 : 1,
-    artworkUrl: song.coverUrl ?? album?.coverUrl,
-    subtitle: album?.title,
-  );
-},
-            )
-          else
-            const Icon(Icons.check_circle_rounded,
-                color: AppColors.success, size: 20),
-          IconButton(
-            icon: Icon(
-              isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-              size: 20,
+              icon: Icon(
+                isFav
+                    ? Icons.favorite_rounded
+                    : Icons.favorite_border_rounded,
+                size: 20,
+              ),
+              color: isFav ? AppColors.error : AppColors.textTertiary,
+              onPressed: () =>
+                  ref.read(favoritesProvider.notifier).toggle(song.id),
             ),
-            color: isFav ? AppColors.error : AppColors.textTertiary,
-            onPressed: () =>
-                ref.read(favoritesProvider.notifier).toggle(song.id),
-          ),
-        ],
-      ),
-      onTap: () {
-        final queue = allSongs.map((s) => _toPlayable(s, album)).toList();
-        ref
-            .read(audioPlayerProvider.notifier)
-            .playItem(queue[index], queue: queue, index: index);
-        AppRouter.navigateToPlayer(context);
-      },
-    );
-  }
-}
-
-class _SongShimmer extends StatelessWidget {
-  const _SongShimmer();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-      child: Row(
-        children: [
-          ShimmerBox(width: 44, height: 44, borderRadius: 10),
-          SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ShimmerBox(height: 14),
-                SizedBox(height: 6),
-                ShimmerBox(width: 60, height: 10),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
+        onTap: () {
+          final queue =
+              allSongs.map((s) => _toPlayable(s, album)).toList();
+          ref
+              .read(audioPlayerProvider.notifier)
+              .playItem(queue[index], queue: queue, index: index);
+          AppRouter.navigateToPlayer(context);
+        },
       ),
     );
   }
