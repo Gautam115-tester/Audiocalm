@@ -42,6 +42,11 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+const path = require('path');
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 // ── Rate limiting — skip streaming/download endpoints (long-lived connections) ─
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS)    || 15 * 60 * 1000,
@@ -86,9 +91,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`  🗑️  Dump chat: ${configured('TELEGRAM_DUMP_CHAT_ID')}`);
 });
 
-const path = require('path');
-app.get('/dashboard', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
+
 
 module.exports = app;
