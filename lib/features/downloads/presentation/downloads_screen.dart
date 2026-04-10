@@ -1,9 +1,19 @@
 // lib/features/downloads/presentation/downloads_screen.dart
 //
-// Changes:
-// - Failed items show a "Retry" button instead of just error text
-// - Error messages are cleaner (no "DioException [unknown]: null")
-// - Active download card shows the correct phase label
+// MULTI-PART OFFLINE PLAYBACK FIX
+// =================================
+// _playOffline now calls getDecryptedPaths() (plural) instead of
+// getDecryptedPath() (singular).  For a 2-part episode this returns
+// ['/path/part0_dec.audio', '/path/part1_dec.audio'].
+//
+// We build a PlayableItem with:
+//   • streamUrl  = first part's file:// URI
+//   • partCount  = actual number of parts
+//   • extras['offlinePartUrls'] = all part URIs joined by '|'
+//
+// AudioHandler._buildPartUrls() reads offlinePartUrls from extras when
+// the item is offline, so all parts are played sequentially with the
+// existing multi-part logic and the seekbar stays unified.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -106,8 +116,7 @@ class DownloadsScreen extends ConsumerWidget {
                       if (completed.isNotEmpty) ...[
                         _SectionLabel(
                             label: 'Completed', count: completed.length),
-                        ...completed
-                            .map((d) => _CompletedTile(download: d)),
+                        ...completed.map((d) => _CompletedTile(download: d)),
                       ],
                     ],
                   ),
@@ -131,9 +140,7 @@ class DownloadsScreen extends ConsumerWidget {
           ),
           TextButton(
             onPressed: () {
-              ref
-                  .read(downloadManagerProvider.notifier)
-                  .clearAllDownloads();
+              ref.read(downloadManagerProvider.notifier).clearAllDownloads();
               Navigator.pop(ctx);
             },
             style: TextButton.styleFrom(foregroundColor: AppColors.error),
@@ -159,8 +166,7 @@ class _SectionLabel extends StatelessWidget {
           Text(label, style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(width: 8),
           Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
             decoration: BoxDecoration(
               color: AppColors.surfaceVariant,
               borderRadius: BorderRadius.circular(20),
@@ -199,13 +205,12 @@ class _ActiveDownloadCard extends ConsumerWidget {
     final String statusLabel;
 
     switch (dl.status) {
-      case 'merging':
-        barColor = const Color(0xFFEF9F27);
-        statusLabel = 'Merging parts…';
-        break;
       case 'encrypting':
         barColor = const Color(0xFFEF9F27);
-        statusLabel = 'Encrypting…';
+        final partInfo = dl.totalParts > 1
+            ? ' part ${dl.downloadedParts}/${dl.totalParts}'
+            : '';
+        statusLabel = 'Encrypting$partInfo…';
         break;
       default:
         barColor = AppColors.primary;
@@ -229,27 +234,7 @@ class _ActiveDownloadCard extends ConsumerWidget {
         children: [
           Row(
             children: [
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: AppColors.surfaceVariant,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: dl.artworkUrl != null
-                    ? ClipRRect(
-                        borderRadius: BorderRadius.circular(10),
-                        child: CoverImage(
-                            url: dl.artworkUrl, size: 48, borderRadius: 10),
-                      )
-                    : Icon(
-                        dl.mediaType == 'episode'
-                            ? Icons.headphones_rounded
-                            : Icons.music_note_rounded,
-                        color: AppColors.textTertiary,
-                        size: 22,
-                      ),
-              ),
+              CoverImage(url: dl.artworkUrl, size: 44, borderRadius: 10),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -266,44 +251,43 @@ class _ActiveDownloadCard extends ConsumerWidget {
                     ),
                     if (dl.subtitle != null) ...[
                       const SizedBox(height: 2),
-                      Text(
-                        dl.subtitle!,
-                        style: Theme.of(context).textTheme.bodySmall,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                      Text(dl.subtitle!,
+                          style: Theme.of(context).textTheme.bodySmall),
                     ],
                   ],
                 ),
               ),
-              Text(
-                '$pct%',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: barColor,
-                ),
-              ),
+              const SizedBox(width: 8),
+              _PulseDot(color: barColor),
             ],
           ),
           const SizedBox(height: 12),
           ClipRRect(
             borderRadius: BorderRadius.circular(4),
             child: LinearProgressIndicator(
-              value: progress > 0 ? progress : null,
+              value: progress,
               backgroundColor: AppColors.surfaceVariant,
               color: barColor,
               minHeight: 5,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              _PulseDot(color: barColor),
-              const SizedBox(width: 6),
               Text(
                 statusLabel,
-                style: TextStyle(fontSize: 11, color: barColor),
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: AppColors.textTertiary),
+              ),
+              Text(
+                '$pct%',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: barColor,
+                      fontWeight: FontWeight.w700,
+                    ),
               ),
             ],
           ),
@@ -313,7 +297,7 @@ class _ActiveDownloadCard extends ConsumerWidget {
   }
 }
 
-// ── Failed tile with retry ─────────────────────────────────────────────────────
+// ── Failed tile ────────────────────────────────────────────────────────────────
 
 class _FailedTile extends ConsumerWidget {
   final DownloadModel download;
@@ -321,100 +305,65 @@ class _FailedTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Clean up the error message — remove class name prefixes
-    String errorMsg = download.errorMessage ?? 'Download failed';
-    errorMsg = errorMsg
-        .replaceAll('DioException [unknown]: ', '')
-        .replaceAll('Exception: ', '');
-    if (errorMsg == 'null' || errorMsg.isEmpty) {
-      errorMsg = 'Network error — tap Retry';
-    }
+    final dl = ref.watch(
+      downloadManagerProvider.select((map) => map[download.mediaId]),
+    );
+    if (dl == null) return const SizedBox.shrink();
 
-    return Dismissible(
-      key: Key('failed_${download.id}'),
-      direction: DismissDirection.endToStart,
-      background: Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        alignment: Alignment.centerRight,
-        padding: const EdgeInsets.only(right: 20),
-        decoration: BoxDecoration(
-          color: AppColors.error.withOpacity(0.12),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: const Icon(Icons.delete_rounded, color: AppColors.error),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.cardColor,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.error.withOpacity(0.25)),
       ),
-      onDismissed: (_) {
-        ref
-            .read(downloadManagerProvider.notifier)
-            .deleteDownload(download.mediaId);
-      },
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: AppColors.cardColor,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: AppColors.error.withOpacity(0.2)),
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: AppColors.error.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: const Icon(Icons.error_outline_rounded,
-                  color: AppColors.error, size: 22),
+      child: Row(
+        children: [
+          CoverImage(url: dl.artworkUrl, size: 44, borderRadius: 10),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  dl.title,
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontSize: 14),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  dl.errorMessage ?? 'Unknown error',
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(color: AppColors.error),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    download.title,
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleMedium
-                        ?.copyWith(fontSize: 14),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    errorMsg,
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodySmall
-                        ?.copyWith(color: AppColors.error),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ),
+          ),
+          const SizedBox(width: 8),
+          TextButton.icon(
+            onPressed: () => ref
+                .read(downloadManagerProvider.notifier)
+                .retryDownload(download.mediaId),
+            icon: const Icon(Icons.refresh_rounded, size: 16),
+            label: const Text('Retry'),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.primary,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
-            const SizedBox(width: 8),
-            // Retry button
-            TextButton.icon(
-              onPressed: () {
-                ref
-                    .read(downloadManagerProvider.notifier)
-                    .retryDownload(download.mediaId);
-              },
-              icon: const Icon(Icons.refresh_rounded, size: 16),
-              label: const Text('Retry'),
-              style: TextButton.styleFrom(
-                foregroundColor: AppColors.primary,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -441,11 +390,9 @@ class _CompletedTile extends ConsumerWidget {
         ),
         child: const Icon(Icons.delete_rounded, color: AppColors.error),
       ),
-      onDismissed: (_) {
-        ref
-            .read(downloadManagerProvider.notifier)
-            .deleteDownload(download.mediaId);
-      },
+      onDismissed: (_) => ref
+          .read(downloadManagerProvider.notifier)
+          .deleteDownload(download.mediaId),
       child: Container(
         margin: const EdgeInsets.only(bottom: 10),
         decoration: BoxDecoration(
@@ -494,45 +441,14 @@ class _CompletedTile extends ConsumerWidget {
               const SizedBox(height: 4),
               Row(
                 children: [
-                  // ENC lock badge
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: AppColors.accentGold.withOpacity(0.18),
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(
-                        color: AppColors.accentGold.withOpacity(0.55),
-                        width: 0.8,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: AppColors.accentGold.withOpacity(0.2),
-                          blurRadius: 6,
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.lock_rounded,
-                            size: 9, color: AppColors.accentGold),
-                        const SizedBox(width: 3),
-                        Text(
-                          'ENC',
-                          style: TextStyle(
-                            color: AppColors.accentGold,
-                            fontSize: 9,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 0.6,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  _EncBadge(),
                   const SizedBox(width: 6),
                   Text(download.formattedSize,
                       style: Theme.of(context).textTheme.bodySmall),
+                  if (download.totalParts > 1) ...[
+                    const SizedBox(width: 6),
+                    _PartsBadge(count: download.totalParts),
+                  ],
                 ],
               ),
             ],
@@ -548,10 +464,58 @@ class _CompletedTile extends ConsumerWidget {
     );
   }
 
+  /// Decrypt ALL part files and hand them to the AudioHandler for
+  /// seamless sequential playback with unified seekbar.
   Future<void> _playOffline(BuildContext context, WidgetRef ref) async {
     final manager = ref.read(downloadManagerProvider.notifier);
-    final decryptedPath = await manager.getDecryptedPath(download.mediaId);
-    if (decryptedPath != null) {
+    final messenger = ScaffoldMessenger.of(context);
+
+    messenger.showSnackBar(
+      SnackBar(
+        content: Row(
+          children: const [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2, color: Colors.white),
+            ),
+            SizedBox(width: 12),
+            Text('Preparing offline playback…'),
+          ],
+        ),
+        duration: const Duration(seconds: 15),
+        backgroundColor: AppColors.surfaceVariant,
+      ),
+    );
+
+    try {
+      // Returns [decryptedPath_part0, decryptedPath_part1, ...] in order
+      final decryptedPaths =
+          await manager.getDecryptedPaths(download.mediaId);
+
+      messenger.hideCurrentSnackBar();
+
+      if (decryptedPaths == null || decryptedPaths.isEmpty) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  'Could not read downloaded file. Try re-downloading.'),
+              backgroundColor: AppColors.error,
+            ),
+          );
+        }
+        return;
+      }
+
+      // Ensure all paths have file:// scheme
+      final partUris = decryptedPaths
+          .map((p) => p.startsWith('file://') ? p : 'file://$p')
+          .toList();
+
+      // AudioHandler reads offlinePartUrls (pipe-separated) from extras
+      // to build its _partUrls list, enabling full multi-part playback.
       final item = PlayableItem(
         id: download.mediaId,
         title: download.title,
@@ -560,11 +524,91 @@ class _CompletedTile extends ConsumerWidget {
         type: download.mediaType == 'episode'
             ? MediaType.episode
             : MediaType.song,
-        streamUrl: 'file://$decryptedPath',
+        partCount: partUris.length,
+        streamUrl: partUris.first, // first part (used for single-part fast path)
+        extras: {
+          'isOffline': true,
+          'offlinePartUrls': partUris.join('|'), // all parts for multi-part
+        },
       );
+
+      if (!context.mounted) return;
       ref.read(audioPlayerProvider.notifier).playItem(item);
-      if (context.mounted) AppRouter.navigateToPlayer(context);
+      AppRouter.navigateToPlayer(context);
+    } catch (e) {
+      messenger.hideCurrentSnackBar();
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Playback error: $e'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
     }
+  }
+}
+
+// ── ENC badge ──────────────────────────────────────────────────────────────────
+
+class _EncBadge extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.accentGold.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+            color: AppColors.accentGold.withOpacity(0.55), width: 0.8),
+        boxShadow: [
+          BoxShadow(
+              color: AppColors.accentGold.withOpacity(0.2), blurRadius: 6)
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.lock_rounded, size: 9, color: AppColors.accentGold),
+          const SizedBox(width: 3),
+          Text(
+            'ENC',
+            style: TextStyle(
+              color: AppColors.accentGold,
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.6,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Parts badge ────────────────────────────────────────────────────────────────
+
+class _PartsBadge extends StatelessWidget {
+  final int count;
+  const _PartsBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.primary.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        '$count parts',
+        style: TextStyle(
+          color: AppColors.primary,
+          fontSize: 9,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
   }
 }
 
@@ -606,7 +650,8 @@ class _PulseDotState extends State<_PulseDot>
       child: Container(
         width: 7,
         height: 7,
-        decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
+        decoration:
+            BoxDecoration(color: widget.color, shape: BoxShape.circle),
       ),
     );
   }
