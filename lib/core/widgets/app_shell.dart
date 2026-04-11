@@ -1,7 +1,34 @@
 // lib/core/widgets/app_shell.dart
-// No direct PlayerState reference here — it reads audioPlayerProvider which
-// now returns AudioPlayerState. No changes needed beyond ensuring the import
-// still works. File reproduced for completeness.
+//
+// BLAST BUFFER QUEUE FIX — GRANULAR PROVIDER SELECTION
+// =====================================================
+//
+// ROOT CAUSE:
+//   ref.watch(audioPlayerProvider) subscribes to the ENTIRE AudioPlayerState.
+//   AudioPlayerState.position updates every ~100ms while audio plays.
+//   This caused AppShell.build() to run every 100ms, triggering a full
+//   widget subtree rebuild including:
+//     - Column (bottomNavigationBar)
+//     - MiniPlayer (which itself watches audioPlayerProvider)
+//     - _BottomNav
+//
+//   Even though AppShell only needs `playerState.hasMedia`, it rebuilt
+//   everything on every position tick. Each rebuild → Flutter schedules
+//   a frame → SurfaceView queues a buffer.
+//
+//   At 10 position ticks/second with a ~16ms frame budget:
+//     10 AppShell rebuilds/sec + 10 MiniPlayer rebuilds/sec = 20 rebuilds/sec
+//     Plus audio_handler.dart notification broadcasts (now fixed to 60fps max)
+//     = total buffer production >> SurfaceFlinger consumption rate
+//
+// FIX:
+//   Use ref.watch(audioPlayerProvider.select((s) => s.hasMedia)) so AppShell
+//   ONLY rebuilds when hasMedia changes (i.e. when audio starts or stops
+//   entirely). This reduces AppShell rebuilds from 10/sec to ~0/sec during
+//   normal playback.
+//
+//   MiniPlayer still watches the full state (it needs position, isPlaying, etc.)
+//   but it's now isolated by RepaintBoundary so its repaints don't cascade up.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,7 +44,13 @@ class AppShell extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final playerState = ref.watch(audioPlayerProvider);
+    // FIX: Only watch hasMedia — not the full state.
+    // AppShell rebuilds ONLY when audio starts or stops (hasMedia changes).
+    // Position ticks (10Hz) no longer cause AppShell to rebuild.
+    final hasMedia = ref.watch(
+      audioPlayerProvider.select((s) => s.hasMedia),
+    );
+
     final location = GoRouterState.of(context).uri.toString();
     final currentIndex = _locationToIndex(location);
 
@@ -27,7 +60,14 @@ class AppShell extends ConsumerWidget {
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (playerState.hasMedia) const MiniPlayer(),
+          // FIX: RepaintBoundary isolates MiniPlayer repaints from the
+          // BottomNav and the rest of the shell. MiniPlayer repaints at
+          // 10Hz (position ticks) but BottomNav only needs to repaint
+          // when the selected tab changes. Without RepaintBoundary, the
+          // BottomNav's RenderObject gets invalidated on every MiniPlayer
+          // rebuild, queuing unnecessary frames.
+          if (hasMedia)
+            const RepaintBoundary(child: MiniPlayer()),
           _BottomNav(currentIndex: currentIndex),
         ],
       ),

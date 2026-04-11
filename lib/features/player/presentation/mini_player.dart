@@ -1,19 +1,30 @@
 // lib/features/player/presentation/mini_player.dart
 //
-// FIX: MiniPlayer now renders on the very first frame after the user taps
-// an audio item — before the audio stream has buffered.
+// BLAST BUFFER QUEUE FIX — SELECTIVE STATE WATCHING + REPAINT ISOLATION
+// ======================================================================
 //
-// CHANGES:
-//   • Removed the early `if (!playerState.hasMedia) return SizedBox.shrink()`
-//     guard — it is still there, but now hasMedia becomes true immediately
-//     because AudioPlayerNotifier.playItem() sets currentItem synchronously
-//     (see audio_player_provider.dart fix).
-//   • CoverImage falls back gracefully when artworkUrl is null (shows a
-//     placeholder icon) — no change needed there, it already does this.
-//   • PlayPause button shows a spinner when isLoading==true, which is exactly
-//     what happens during the buffering phase. Users see the mini player
-//     appear instantly with a spinner in the play button.
-//   • Progress bar shows 0 while position/duration are zero — no crash.
+// ROOT CAUSE:
+//   MiniPlayer.build() ran every 100ms (position stream tick rate).
+//   Each run: recomputed progress ratio, rebuilt 5-6 widgets, scheduled a
+//   Flutter frame. Flutter's rasterizer queued a SurfaceView buffer for
+//   each frame. At 10 rebuilds/sec + notification redraws from AudioService
+//   = total buffer production consistently exceeded SurfaceFlinger's 60fps
+//   consumption rate → BLAST buffer queue overflow.
+//
+// FIX STRATEGY:
+//   1. Separate "structural" state (item, isPlaying, isLoading — changes rarely)
+//      from "positional" state (position, duration — changes at 10Hz).
+//   2. Wrap the progress bar in RepaintBoundary so its 10Hz repaints are
+//      handled as an independent compositing layer — they don't invalidate
+//      the cover image, title text, or control buttons.
+//   3. The cover/title/controls subtree rebuilds only when structural state
+//      changes (~0 times/sec during playback, only on track skip/play/pause).
+//
+// RESULT:
+//   - Progress bar: still repaints at up to 10Hz, but as an isolated layer
+//   - Cover + title + controls: repaints only on actual state changes
+//   - Net frame generation rate drops from ~10 Hz to ~0 Hz for most of the
+//     widget tree, giving SurfaceFlinger ample time to drain the buffer queue
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -27,20 +38,14 @@ class MiniPlayer extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final playerState = ref.watch(audioPlayerProvider);
+    // FIX: Only watch hasMedia — app_shell.dart already guards with hasMedia
+    // but we keep this as a safety check. This widget only rebuilds when the
+    // player goes from no media → has media or vice versa.
+    final hasMedia = ref.watch(
+      audioPlayerProvider.select((s) => s.hasMedia),
+    );
 
-    // hasMedia is true as soon as the user taps an item (optimistic update).
-    if (!playerState.hasMedia) return const SizedBox.shrink();
-
-    final item = playerState.currentItem!;
-
-    // Safe progress: 0.0 while buffering (duration may still be null)
-    final progress = (playerState.duration != null &&
-            playerState.duration!.inMilliseconds > 0)
-        ? (playerState.position.inMilliseconds /
-                playerState.duration!.inMilliseconds)
-            .clamp(0.0, 1.0)
-        : 0.0;
+    if (!hasMedia) return const SizedBox.shrink();
 
     return GestureDetector(
       onTap: () => AppRouter.navigateToPlayer(context),
@@ -62,107 +67,155 @@ class MiniPlayer extends ConsumerWidget {
             ),
           ],
         ),
-        child: Column(
-          children: [
-            // ── Progress bar (shows 0 while buffering — no flicker) ───────
-            ClipRRect(
-              borderRadius:
-                  const BorderRadius.vertical(top: Radius.circular(16)),
-              child: LinearProgressIndicator(
-                value: progress,
-                backgroundColor: Colors.transparent,
-                color: AppColors.primary,
-                minHeight: 2,
-              ),
-            ),
-
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(
-                  children: [
-                    // ── Cover ─────────────────────────────────────────────
-                    // artworkUrl may be null during initial buffering;
-                    // CoverImage already handles null with a placeholder icon.
-                    CoverImage(
-                      url: item.artworkUrl,
-                      size: 42,
-                      borderRadius: 10,
-                    ),
-                    const SizedBox(width: 12),
-
-                    // ── Title + subtitle ──────────────────────────────────
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            item.title,
-                            style: Theme.of(context)
-                                .textTheme
-                                .titleMedium
-                                ?.copyWith(fontSize: 13),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          if (item.subtitle != null)
-                            Text(
-                              item.subtitle!,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
-                                  ?.copyWith(fontSize: 11),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                        ],
-                      ),
-                    ),
-
-                    // ── Controls ──────────────────────────────────────────
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _MiniControlButton(
-                          icon: Icons.skip_previous_rounded,
-                          // Disable while loading so the user can't queue
-                          // multiple items before the first one is ready.
-                          onTap: playerState.isLoading
-                              ? null
-                              : () => ref
-                                  .read(audioPlayerProvider.notifier)
-                                  .skipToPrevious(),
-                          size: 20,
-                        ),
-                        const SizedBox(width: 4),
-                        _PlayPauseButton(
-                          isPlaying: playerState.isPlaying,
-                          isLoading: playerState.isLoading,
-                          onTap: playerState.isLoading
-                              ? null // tapping play while buffering is a no-op
-                              : () => ref
-                                  .read(audioPlayerProvider.notifier)
-                                  .togglePlayPause(),
-                        ),
-                        const SizedBox(width: 4),
-                        _MiniControlButton(
-                          icon: Icons.skip_next_rounded,
-                          onTap: playerState.isLoading
-                              ? null
-                              : () => ref
-                                  .read(audioPlayerProvider.notifier)
-                                  .skipToNext(),
-                          size: 20,
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(16),
+          child: Column(
+            children: [
+              // FIX: RepaintBoundary isolates the progress bar's 10Hz repaints.
+              // Flutter creates a separate compositing layer for this subtree.
+              // Repainting the progress bar does NOT dirty the parent layer
+              // containing the cover image and controls.
+              const RepaintBoundary(child: _ProgressBar()),
+              // FIX: Content row is a separate ConsumerWidget that selectively
+              // watches only structural fields (item, isPlaying, isLoading).
+              // It will NOT rebuild on position ticks.
+              const Expanded(child: _ContentRow()),
+            ],
+          ),
         ),
+      ),
+    );
+  }
+}
+
+// ── Progress bar widget — repaints at position tick rate (up to 10Hz) ────────
+// Wrapped in RepaintBoundary by parent → isolated compositing layer.
+
+class _ProgressBar extends ConsumerWidget {
+  const _ProgressBar();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Watch ONLY position and duration — nothing else in AudioPlayerState
+    final position = ref.watch(
+      audioPlayerProvider.select((s) => s.position),
+    );
+    final duration = ref.watch(
+      audioPlayerProvider.select((s) => s.duration),
+    );
+
+    final progress = (duration != null && duration.inMilliseconds > 0)
+        ? (position.inMilliseconds / duration.inMilliseconds).clamp(0.0, 1.0)
+        : 0.0;
+
+    return LinearProgressIndicator(
+      value: progress,
+      backgroundColor: Colors.transparent,
+      color: AppColors.primary,
+      minHeight: 2,
+    );
+  }
+}
+
+// ── Content row widget — rebuilds ONLY on structural state changes ────────────
+// Does NOT rebuild on position ticks. Typical rebuild rate: ~0/sec during
+// playback, ~1/sec on track skip or play/pause toggle.
+
+class _ContentRow extends ConsumerWidget {
+  const _ContentRow();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // FIX: Granular selectors — only the specific scalar values we need
+    final item = ref.watch(
+      audioPlayerProvider.select((s) => s.currentItem),
+    );
+    final isPlaying = ref.watch(
+      audioPlayerProvider.select((s) => s.isPlaying),
+    );
+    final isLoading = ref.watch(
+      audioPlayerProvider.select((s) => s.isLoading),
+    );
+
+    if (item == null) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          // ── Cover ─────────────────────────────────────────────────────────
+          CoverImage(
+            url: item.artworkUrl,
+            size: 42,
+            borderRadius: 10,
+          ),
+          const SizedBox(width: 12),
+
+          // ── Title + subtitle ──────────────────────────────────────────────
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  item.title,
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontSize: 13),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (item.subtitle != null)
+                  Text(
+                    item.subtitle!,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(fontSize: 11),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+              ],
+            ),
+          ),
+
+          // ── Controls ──────────────────────────────────────────────────────
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _MiniControlButton(
+                icon: Icons.skip_previous_rounded,
+                onTap: isLoading
+                    ? null
+                    : () => ref
+                        .read(audioPlayerProvider.notifier)
+                        .skipToPrevious(),
+                size: 20,
+              ),
+              const SizedBox(width: 4),
+              _PlayPauseButton(
+                isPlaying: isPlaying,
+                isLoading: isLoading,
+                onTap: isLoading
+                    ? null
+                    : () => ref
+                        .read(audioPlayerProvider.notifier)
+                        .togglePlayPause(),
+              ),
+              const SizedBox(width: 4),
+              _MiniControlButton(
+                icon: Icons.skip_next_rounded,
+                onTap: isLoading
+                    ? null
+                    : () => ref
+                        .read(audioPlayerProvider.notifier)
+                        .skipToNext(),
+                size: 20,
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -173,7 +226,6 @@ class MiniPlayer extends ConsumerWidget {
 class _PlayPauseButton extends StatelessWidget {
   final bool isPlaying;
   final bool isLoading;
-  // null when loading — disables tap
   final VoidCallback? onTap;
 
   const _PlayPauseButton({
@@ -215,7 +267,6 @@ class _PlayPauseButton extends StatelessWidget {
 
 class _MiniControlButton extends StatelessWidget {
   final IconData icon;
-  // null when loading — renders as visually dimmed, non-interactive
   final VoidCallback? onTap;
   final double size;
 
@@ -235,7 +286,6 @@ class _MiniControlButton extends StatelessWidget {
         child: Icon(
           icon,
           size: size,
-          // Dim the icon while disabled
           color: onTap == null
               ? AppColors.textTertiary.withOpacity(0.4)
               : AppColors.textSecondary,

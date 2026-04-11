@@ -1,25 +1,39 @@
 // lib/features/downloads/data/services/download_manager.dart
 //
-// THREAD FIX — Encryption / decryption moved to background isolate
-// ================================================================
+// BLAST BUFFER QUEUE FIX — DOWNLOAD PROGRESS THROTTLING
+// ======================================================
 //
-// PREVIOUS PROBLEM:
-//   encryptFile() and decryptToTemp() read entire MP3 files into memory and
-//   ran AES-256-CBC on the MAIN ISOLATE.  A 20 MB file takes ~300-800 ms to
-//   encrypt on the main thread, causing BLASTBufferQueue overflow and dropped
-//   frames while the progress ring was supposed to be animating.
+// ROOT CAUSE:
+//   Dio's onReceiveProgress callback fires on every TCP packet received.
+//   On a fast connection (e.g. WiFi, 50+ Mbps), a 30MB file downloads in
+//   ~5 seconds. TCP packets are typically 64KB, so:
+//     30MB / 64KB = ~480 packets → 480 callbacks in 5 seconds = ~96/sec
+//
+//   Each callback → _ProgressMessage sent via SendPort → ReceivePort.listen()
+//   → _updateState() → state = {...state} (creates new Map) → Riverpod
+//   notifies all watchers → _ActiveDownloadCard.build() runs → Flutter
+//   schedules a new frame → SurfaceView queues a buffer.
+//
+//   At 96 progress updates/second but SurfaceFlinger consuming at 60fps,
+//   the buffer queue fills up in ~120ms and stays overflowed for the entire
+//   download duration. This is the PRIMARY cause of the sustained BLAST error.
 //
 // FIX:
-//   _runDownload() now runs in a separate Dart Isolate via Isolate.run().
-//   The isolate receives all the data it needs (URLs, paths, encryption key)
-//   and reports progress back via SendPort messages.
-//   The main isolate only updates UI state in response to those messages.
+//   In the isolate worker (_downloadIsolateEntry), throttle SendPort messages
+//   to at most 10 per second (100ms minimum interval between sends).
+//   The download still proceeds at full speed; we just update the UI less often.
+//   10 Hz progress updates are more than smooth enough for the progress ring.
 //
-//   For decryption (playback), decryptToTemp() is called via compute() so
-//   the main thread is free to render the player screen while decryption runs.
+//   Additionally, "structural" messages (status changes: downloading →
+//   encrypting → completed/failed) are always sent immediately regardless of
+//   throttle, so the UI reflects actual state changes without lag.
 //
-// NOTE: The EncryptionService itself is unchanged — we just call it from
-// a different thread context.
+// SECONDARY FIX — _updateState coalescing:
+//   Even with 10Hz isolate messages, multiple messages can arrive in the same
+//   event loop tick if the main isolate was busy. We batch state updates
+//   using a microtask coalescer in _scheduleStateUpdate(), similar to the
+//   approach in audio_handler.dart, so at most one Riverpod state update
+//   fires per event loop tick.
 
 import 'dart:io';
 import 'dart:isolate';
@@ -74,7 +88,7 @@ class _DownloadPayload {
   final int partCount;
   final String baseEncPath;
   final String downloadsDir;
-  final String encryptionKey; // comma-separated bytes, safe to send
+  final String encryptionKey;
 
   const _DownloadPayload({
     required this.sendPort,
@@ -87,12 +101,11 @@ class _DownloadPayload {
   });
 }
 
-// ── Isolate worker function (top-level, sendable) ─────────────────────────
+// ── Isolate worker function ────────────────────────────────────────────────
 
 Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
   final send = payload.sendPort;
 
-  // Re-create a minimal Dio inside the isolate (no platform channels needed).
   final dio = Dio(
     BaseOptions(
       connectTimeout: const Duration(seconds: 30),
@@ -101,10 +114,33 @@ Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
     ),
   );
 
-  // Re-create the encryption service inside the isolate.
-  // The key bytes are passed as a string to avoid SendPort restrictions.
   final encService = EncryptionService();
   await encService.initWithKeyBytes(payload.encryptionKey);
+
+  // FIX: Throttle progress messages to 10Hz (100ms minimum interval).
+  // Structural status changes (encrypting, completed, failed) bypass throttle.
+  DateTime _lastProgressSend = DateTime.fromMillisecondsSinceEpoch(0);
+  const Duration _progressThrottle = Duration(milliseconds: 100);
+
+  void sendProgress({
+    required String status,
+    required double progress,
+    required int downloadedParts,
+    bool forceImmediate = false,
+  }) {
+    final now = DateTime.now();
+    // Always send structural changes (status != 'downloading') immediately
+    if (forceImmediate || now.difference(_lastProgressSend) >= _progressThrottle) {
+      _lastProgressSend = now;
+      send.send(_ProgressMessage(
+        mediaId: payload.mediaId,
+        status: status,
+        progress: progress,
+        downloadedParts: downloadedParts,
+      ));
+    }
+    // Otherwise drop this progress tick — UI will catch up on next tick
+  }
 
   final List<String> downloadUrls = [];
   if (payload.partCount <= 1) {
@@ -142,12 +178,12 @@ Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
             final partProgress = received / total;
             final overall =
                 (i + partProgress) / downloadUrls.length * 0.85;
-            send.send(_ProgressMessage(
-              mediaId: payload.mediaId,
+            // FIX: use throttled sender for byte-level progress ticks
+            sendProgress(
               status: 'downloading',
               progress: overall.clamp(0.01, 0.85),
               downloadedParts: i + 1,
-            ));
+            );
           }
         },
         options: Options(
@@ -163,12 +199,13 @@ Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
         throw Exception('Part $i download is empty');
       }
 
-      send.send(_ProgressMessage(
-        mediaId: payload.mediaId,
+      // FIX: forceImmediate=true for status change to 'encrypting'
+      sendProgress(
         status: 'encrypting',
         progress: 0.85 + (i + 0.5) / downloadUrls.length * 0.15,
         downloadedParts: i + 1,
-      ));
+        forceImmediate: true, // structural change — send immediately
+      );
 
       await encService.encryptFile(tmpPath, partEncPath);
       try { File(tmpPath).deleteSync(); } catch (_) {}
@@ -176,14 +213,16 @@ Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
       final partFile = File(partEncPath);
       if (partFile.existsSync()) totalSize += partFile.lengthSync();
 
-      send.send(_ProgressMessage(
-        mediaId: payload.mediaId,
+      // FIX: forceImmediate=true after each part completes encryption
+      sendProgress(
         status: 'downloading',
         progress: ((i + 1) / downloadUrls.length * 0.85).clamp(0.01, 0.85),
         downloadedParts: i + 1,
-      ));
+        forceImmediate: true, // part boundary — send immediately
+      );
     }
 
+    // Completed is always sent immediately (not a progress message)
     send.send(_CompletedMessage(
       mediaId: payload.mediaId,
       fileSizeBytes: totalSize,
@@ -232,8 +271,12 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
   final EncryptionService _encryptionService;
   final _uuid = const Uuid();
 
-  // Active isolate receive ports keyed by mediaId — for cancellation (future).
   final Map<String, ReceivePort> _activePorts = {};
+
+  // FIX: Coalesce rapid state updates — batch multiple progress messages
+  // arriving in the same event loop tick into a single Riverpod notification.
+  bool _pendingStateUpdate = false;
+  Map<String, DownloadModel>? _pendingState;
 
   DownloadManager(this._encryptionService) : super({}) {
     _loadSavedDownloads();
@@ -337,8 +380,6 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
   Future<void> _runDownloadInIsolate(
       DownloadModel model, String downloadsDir) async {
-    // Get the encryption key so we can send it to the isolate.
-    // EncryptionService.getKeyBytesString() returns the comma-separated key.
     final keyString = await _encryptionService.getKeyBytesString();
     if (keyString == null) {
       _markFailed(model, 'Encryption key unavailable');
@@ -358,7 +399,6 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
       encryptionKey: keyString,
     );
 
-    // Spawn the isolate — download + encrypt runs completely off the main thread.
     await Isolate.spawn(_downloadIsolateEntry, payload);
 
     receivePort.listen((message) {
@@ -368,7 +408,8 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
         current.status = message.status;
         current.progress = message.progress;
         current.downloadedParts = message.downloadedParts;
-        _updateState(current);
+        // FIX: Use coalesced state update for progress messages
+        _scheduleStateUpdate(current);
       } else if (message is _CompletedMessage) {
         final current = state[message.mediaId];
         if (current == null) return;
@@ -376,6 +417,7 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
         current.status = 'completed';
         current.progress = 1.0;
         current.errorMessage = null;
+        // Completed is structural — update immediately (not coalesced)
         _updateState(current);
         _cleanupPort(message.mediaId);
       } else if (message is _FailedMessage) {
@@ -383,6 +425,39 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
         if (current == null) return;
         _markFailed(current, message.errorMessage);
         _cleanupPort(message.mediaId);
+      }
+    });
+  }
+
+  // FIX: Coalesced state update for progress messages.
+  // Multiple progress messages arriving in the same event loop tick are
+  // merged into a single state = {...} call, reducing Riverpod notifications
+  // from potentially 96/sec to at most 10/sec (matching isolate throttle).
+  void _scheduleStateUpdate(DownloadModel model) {
+    // Always update the pending state so we have the latest values
+    final newState = Map<String, DownloadModel>.from(
+        _pendingState ?? Map<String, DownloadModel>.from(state));
+    newState[model.mediaId] = model;
+    _pendingState = newState;
+
+    if (_pendingStateUpdate) return; // already scheduled
+    _pendingStateUpdate = true;
+
+    Future.microtask(() {
+      _pendingStateUpdate = false;
+      final toApply = _pendingState;
+      _pendingState = null;
+      if (toApply != null && mounted) {
+        state = toApply;
+        // Persist the latest progress to Hive (only once per batch)
+        for (final model in toApply.values) {
+          if (model.isInProgress) {
+            try {
+              final box = Hive.box(AppConstants.downloadsBox);
+              box.put('dl_${model.mediaId}', model);
+            } catch (_) {}
+          }
+        }
       }
     });
   }
@@ -423,7 +498,6 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
         if (sourcePath == null) return null;
 
-        // FIX: Decrypt in background isolate so the player screen opens instantly
         final decrypted = await compute(
           _decryptInBackground,
           _DecryptPayload(
@@ -435,7 +509,6 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
         if (decrypted == null) return null;
         results.add(decrypted);
       } else {
-        // Multi-part: decrypt all parts in parallel background isolates
         final futures = <Future<String?>>[];
         for (int i = 0; i < totalParts; i++) {
           final partEncPath = _partEncPath(download.encryptedFilePath, i);
