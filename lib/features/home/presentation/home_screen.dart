@@ -52,17 +52,11 @@ class HomeScreen extends ConsumerWidget {
         titlePadding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
         title: Row(
           children: [
-            Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [AppColors.primary, AppColors.primaryDark],
-                ),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Icon(Icons.waves_rounded,
-                  color: Colors.white, size: 18),
+            Image.asset(
+              'assets/icons/logo.png',
+              width: 36,
+              height: 36,
+              fit: BoxFit.contain,
             ),
             const SizedBox(width: 10),
             Text(
@@ -75,13 +69,7 @@ class HomeScreen extends ConsumerWidget {
           ],
         ),
       ),
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.settings_rounded, size: 22),
-          color: AppColors.textSecondary,
-          onPressed: () {},
-        ),
-      ],
+      actions: const [],
     );
   }
 }

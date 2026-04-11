@@ -30,6 +30,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 import '../theme/app_theme.dart';
 
@@ -300,11 +301,10 @@ class _SplashScreenState extends State<SplashScreen>
                     );
                   },
                   child: Image.asset(
-                    'assets/images/logo.png',
+                    'assets/icons/logo.png',
                     width: 160,
                     height: 160,
                     fit: BoxFit.contain,
-                    // Graceful fallback if asset path differs
                     errorBuilder: (_, __, ___) => _FallbackLogo(glow: _glowCtrl),
                   ),
                 ),
