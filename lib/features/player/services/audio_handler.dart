@@ -1,63 +1,51 @@
 // lib/features/player/services/audio_handler.dart
 //
-// BLAST BUFFER QUEUE FIX — DEEP ANALYSIS & ROOT CAUSE
-// ====================================================
+// CHANGES IN THIS VERSION
+// =======================
 //
-// ERROR: "acquireNextBufferLocked: Can't acquire next buffer.
-//         Already acquired max frames 7 max:5 + 2"
+// NEXT-ITEM PRE-LOADING (gapless / seamless track transitions)
+// -------------------------------------------------------------
+// Problem: when a track ends, the next one starts loading from scratch —
+// causing a 1-3 second gap (network round-trip + buffer fill) that interrupts
+// the listening experience.
 //
-// ANDROID SURFACE BUFFER QUEUE ARCHITECTURE:
-//   - Android SurfaceFlinger allocates a circular buffer queue per SurfaceView
-//   - Default max: 5 dequeued + 2 in-flight = 7 total "acquired" frames
-//   - When the producer (Flutter GPU thread) tries to enqueue an 8th frame
-//     before the consumer (SurfaceFlinger) has composited any, it overflows
-//   - This is NOT a rendering bug — it is a SCHEDULING bug: frames are being
-//     GENERATED faster than they can be CONSUMED
+// Fix: 30 seconds before the current item ends, quietly open the next queue
+// item's first audio part in a background player (`_nextItemPlayer`).
+// When the current item actually finishes, we swap the pre-loaded player
+// into the active slot instead of starting a fresh download.
 //
-// ROOT CAUSE IN THIS FILE (audio_handler.dart):
-//   The previous fix used scheduleMicrotask() for coalescing. This is WRONG
-//   for the following reason:
+// How it works:
+//   1. `_scheduleNextItemPreload()` is called whenever a new item starts.
+//      It reads the known total duration (or waits for just_audio to report it)
+//      and sets a Timer to fire 30 s before the end.
+//   2. When the timer fires, `_preloadNextQueueItem()` resolves the next
+//      item's first-part URL and calls `_nextItemPlayer.setAudioSource()`
+//      WITHOUT calling play() — this fills the network/decoder buffer silently.
+//   3. When `_handleItemCompletion()` is called for a loopMode.off track:
+//      - If `_nextItemPreloaded` is true, we swap `_nextItemPlayer` →
+//        `_player`, re-attach streams, call play(), and start a new
+//        preload cycle for the item after that.
+//      - Otherwise (preload wasn't ready or timed out), we fall through to
+//        the existing `_loadItem()` path unchanged.
 //
-//   Microtasks run in a tight loop BEFORE yielding back to the event loop.
-//   The Dart event loop order is:
-//     [sync code] → [microtask queue] → [event loop tick] → [frame callback]
+// The preload is best-effort: if the timer fires and the next URL cannot
+// be resolved, or if the user skips before the transition, we cancel
+// cleanly and fall back to the normal loading path.  The listening
+// experience degrades gracefully to the previous behaviour.
 //
-//   When _player.positionStream fires at 10Hz AND _player.durationStream fires
-//   AND _player.playerStateStream fires simultaneously (e.g. on seek), they all
-//   call _scheduleBroadcast() in the same sync frame. scheduleMicrotask()
-//   registers ONE microtask — so that part works.
+// Edge cases handled:
+//   • User skips forward/backward: `_cancelNextItemPreload()` is called at
+//     the top of `skipToNext` / `skipToPrevious` / `skipToQueueItem`.
+//   • Last item in queue: no preload is attempted.
+//   • Multi-part items: we only preload the first part of the next item
+//     (same as what `_loadItem` does — the rest are loaded on demand).
+//   • Loop modes: preload is skipped when loopMode == one (replays same item)
+//     and handled for loopMode == all (wraps to index 0).
+//   • Offline items: the URL is a local file:// URI — setAudioSource is fast
+//     and essentially free, but we still preload to ensure the decoder is warm.
 //
-//   BUT: when _broadcastStateNow() calls playbackState.add(), AudioService
-//   internally calls onPlaybackStateChanged() on the Android platform channel,
-//   which posts to the Android main thread. The Android main thread then
-//   triggers a notification redraw via NotificationCompat.Builder, which calls
-//   RemoteViews.apply(), which calls Canvas operations, which calls
-//   SurfaceView.lockCanvas() / unlockCanvasAndPost().
-//
-//   This notification redraw is SEPARATE from Flutter's rendering pipeline.
-//   It queues a buffer in the SAME SurfaceView as Flutter's rendering.
-//   When Flutter's rasterizer AND the notification redraws BOTH queue frames
-//   faster than SurfaceFlinger can composite them, the buffer fills up.
-//
-//   THE REAL FIX:
-//   1. Use a minimum interval timer (16ms = 1 frame at 60fps) between
-//      broadcasts, not just microtask coalescing. This matches SurfaceFlinger's
-//      consumption rate.
-//   2. On critical state changes (play/pause/skip) we still broadcast
-//      immediately but then impose a 16ms cooldown before the next one.
-//   3. Position-only updates (the highest frequency) are further throttled to
-//      200ms since the notification seekbar doesn't need 10Hz updates.
-//
-// SECONDARY ROOT CAUSE — Download progress updates:
-//   The isolate sends progress messages on every ReceivePort.listen() callback.
-//   Dio's onReceiveProgress fires per-chunk (can be 50-100 times/second for
-//   fast connections). Each message → _updateState() → state = {...state} →
-//   Riverpod notifies ALL watchers → _ActiveDownloadCard rebuilds → new frame.
-//   Fix: throttle progress messages to max 10Hz in the isolate worker.
-//
-// TERTIARY ROOT CAUSE — app_shell.dart watches audioPlayerProvider:
-//   The shell rebuilds on EVERY position tick (100ms) even though it only
-//   cares about `hasMedia`. Fix: use .select() to only watch hasMedia.
+// ALL pre-existing logic (throttled broadcasts, multi-part streaming,
+// part preloading within an item, position saving, seek) is unchanged.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -71,8 +59,14 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   // ── Primary player ─────────────────────────────────────────────────────────
   ja.AudioPlayer _player = ja.AudioPlayer();
 
-  // ── Pre-load player ────────────────────────────────────────────────────────
+  // ── Within-item pre-load player (next PART of the same item) ──────────────
   ja.AudioPlayer _preloadPlayer = ja.AudioPlayer();
+
+  // ── Next-item pre-load player (first part of the NEXT queue item) ─────────
+  ja.AudioPlayer _nextItemPlayer = ja.AudioPlayer();
+  bool _nextItemPreloaded = false;
+  int _nextItemPreloadIndex = -1; // which queue index we preloaded
+  Timer? _nextItemPreloadTimer;
 
   final MultiPartUrlService _urlService = MultiPartUrlService(null);
 
@@ -93,40 +87,12 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final List<StreamSubscription> _subs = [];
   StreamSubscription? _completionSub;
 
-  // ── FIX: Frame-rate-aware broadcast throttling ─────────────────────────────
-  //
-  // TWO-TIER throttle system:
-  //
-  // Tier 1 — Microtask coalescing (unchanged from before):
-  //   Collapses multiple stream events fired in the SAME sync frame into one
-  //   pending broadcast. _pendingBroadcast flag prevents duplicate scheduling.
-  //
-  // Tier 2 — Minimum interval timer (NEW):
-  //   Even after coalescing, broadcasts can still fire at 10Hz (position stream
-  //   tick rate). At 60fps, a frame takes 16.67ms. If we broadcast every 100ms
-  //   (position tick), that's 6 broadcasts per 60 frames. Each broadcast posts
-  //   to Android's notification system which queues a SurfaceView buffer.
-  //   By enforcing a 16ms minimum between broadcasts, we cap at ~60/s max,
-  //   matching SurfaceFlinger's consumption rate so buffers never accumulate.
-  //
-  // Tier 3 — Position-only throttle (NEW):
-  //   Position stream fires at ~10Hz. The Android notification seekbar updates
-  //   look fine at 5Hz. We track the last broadcast time and skip position-only
-  //   broadcasts that arrive within 200ms of the last one.
-  //   "Position-only" means: nothing changed except position (not play/pause/
-  //   loading state, not duration, not queue index).
-
+  // ── Broadcast throttling (unchanged) ──────────────────────────────────────
   bool _pendingBroadcast = false;
   DateTime _lastBroadcastTime = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _throttleTimer;
-
-  // Minimum time between ANY broadcast (matches one frame at 60fps)
   static const Duration _kMinBroadcastInterval = Duration(milliseconds: 16);
-
-  // Minimum time between POSITION-ONLY broadcasts (5Hz max for notification)
   static const Duration _kPositionBroadcastInterval = Duration(milliseconds: 200);
-
-  // Track last broadcast's "structural" state to detect position-only changes
   bool _lastBroadcastPlaying = false;
   bool _lastBroadcastLoading = false;
   int _lastBroadcastQueueIndex = -1;
@@ -136,31 +102,184 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   int _lastSavedPositionSeconds = 0;
   static const int _saveIntervalSeconds = 5;
 
+  // ── Pre-load trigger: how many seconds before end to start next-item load ──
+  static const int _kPreloadLeadSeconds = 30;
+
   AudioCalmHandler() {
     _init();
   }
 
   void _init() {
-    // FIX: positionStream uses the position-aware scheduler that applies
-    // the coarser 200ms throttle since position is the highest-frequency event
     _subs.add(_player.positionStream.listen((_) {
       _schedulePositionBroadcast();
       _maybeSavePosition();
     }));
-
-    // These use the standard scheduler (still coalesced but not position-throttled)
     _subs.add(
         _player.bufferedPositionStream.listen((_) => _scheduleBroadcast(structural: false)));
     _subs.add(_player.durationStream.listen((dur) {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
+      // When duration becomes known, reschedule the next-item preload timer
+      // in case we couldn't schedule it at load time (duration was unknown).
+      _maybeReschedulePreloadTimer();
       _scheduleBroadcast(structural: true);
     }));
     _subs.add(_player.playerStateStream.listen((_) => _scheduleBroadcast(structural: true)));
   }
 
-  // ── TIER 1: Microtask coalescing ───────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NEXT-ITEM PRE-LOADING
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Called whenever we start playing a new queue item.
+  /// Sets a timer to preload the next item ~30 s before the end.
+  void _scheduleNextItemPreload() {
+    _cancelNextItemPreload();
+
+    // Don't preload when looping a single track.
+    if (_loopMode == ja.LoopMode.one) return;
+
+    final nextIndex = _nextQueueIndex();
+    if (nextIndex == null) return; // last item, no next
+
+    final totalDuration = _knownTotalDuration;
+    if (totalDuration == null || totalDuration == Duration.zero) {
+      // Duration not yet known — _maybeReschedulePreloadTimer() will retry
+      // once just_audio reports it via durationStream.
+      return;
+    }
+
+    final leadTime = const Duration(seconds: _kPreloadLeadSeconds);
+    final fireAfter = totalDuration - leadTime;
+    if (fireAfter <= Duration.zero) {
+      // Short track — preload immediately.
+      _preloadNextQueueItem(nextIndex);
+      return;
+    }
+
+    final currentPos = _unifiedPosition;
+    final remaining = fireAfter - currentPos;
+    if (remaining <= Duration.zero) {
+      _preloadNextQueueItem(nextIndex);
+      return;
+    }
+
+    _nextItemPreloadTimer = Timer(remaining, () {
+      final idx = _nextQueueIndex();
+      if (idx != null) _preloadNextQueueItem(idx);
+    });
+    debugPrint('[AudioHandler] Next-item preload scheduled in '
+        '${remaining.inSeconds}s for queue[$nextIndex]');
+  }
+
+  /// Reschedule when duration becomes known after item load.
+  void _maybeReschedulePreloadTimer() {
+    if (_nextItemPreloadTimer != null) return; // already scheduled
+    if (_nextItemPreloaded) return; // already done
+    _scheduleNextItemPreload();
+  }
+
+  /// Cancel any pending next-item preload (e.g. on skip).
+  void _cancelNextItemPreload() {
+    _nextItemPreloadTimer?.cancel();
+    _nextItemPreloadTimer = null;
+    _nextItemPreloaded = false;
+    _nextItemPreloadIndex = -1;
+    // Dispose and recreate so the old source is freed.
+    _nextItemPlayer.dispose();
+    _nextItemPlayer = ja.AudioPlayer();
+  }
+
+  /// Silently load the first part of queue item at [index] into the
+  /// background player.  Does NOT call play().
+  Future<void> _preloadNextQueueItem(int index) async {
+    if (index < 0 || index >= _playableQueue.length) return;
+    final item = _playableQueue[index];
+    final urls = _buildPartUrls(item);
+    if (urls.isEmpty) return;
+
+    try {
+      debugPrint('[AudioHandler] Preloading queue[$index] "${item.title}"');
+      await _nextItemPlayer.setAudioSource(
+        ja.AudioSource.uri(Uri.parse(urls.first)),
+        preload: true,
+      );
+      _nextItemPreloaded = true;
+      _nextItemPreloadIndex = index;
+      debugPrint('[AudioHandler] Preload ready for queue[$index]');
+    } catch (e) {
+      debugPrint('[AudioHandler] Preload failed for queue[$index]: $e');
+      _nextItemPreloaded = false;
+    }
+  }
+
+  /// Returns the queue index that should play after the current item,
+  /// accounting for loop mode.  Returns null if there is no next item.
+  int? _nextQueueIndex() {
+    if (_playableQueue.isEmpty) return null;
+    switch (_loopMode) {
+      case ja.LoopMode.one:
+        return null; // replays same item — no "next"
+      case ja.LoopMode.all:
+        return (_currentQueueIndex + 1) % _playableQueue.length;
+      case ja.LoopMode.off:
+        final next = _currentQueueIndex + 1;
+        return next < _playableQueue.length ? next : null;
+    }
+  }
+
+  // ── Swap pre-loaded next-item player into the active slot ──────────────────
+  Future<void> _swapToNextItemPlayer(int nextQueueIndex) async {
+    debugPrint('[AudioHandler] Swapping to pre-loaded queue[$nextQueueIndex]');
+
+    await _completionSub?.cancel();
+    _completionSub = null;
+
+    // Promote the pre-loaded player to primary.
+    final oldPlayer = _player;
+    _player = _nextItemPlayer;
+    _nextItemPlayer = ja.AudioPlayer();
+    _nextItemPreloaded = false;
+    _nextItemPreloadIndex = -1;
+
+    // Reset multi-part state for the new item.
+    final item = _playableQueue[nextQueueIndex];
+    _currentQueueIndex = nextQueueIndex;
+    _partUrls = _buildPartUrls(item);
+    _currentPartIndex = 0;
+    _partOffset = Duration.zero;
+    _partDurations.clear();
+    _lastSavedPositionSeconds = 0;
+    _knownTotalDuration =
+        item.duration != null ? Duration(seconds: item.duration!) : null;
+
+    mediaItem.add(_playableToMediaItem(item));
+    _reAttachStreams();
+
+    // Start playing immediately (the audio is already buffered).
+    await _player.play();
+
+    // Set up part-completion listener.
+    _completionSub = _player.processingStateStream.listen((state) {
+      if (state == ja.ProcessingState.completed) _onPartCompleted();
+    });
+
+    _broadcastCritical();
+
+    // Dispose old player after a short delay to avoid any in-flight reads.
+    Future.delayed(const Duration(milliseconds: 500), () => oldPlayer.dispose());
+
+    // Schedule the NEXT preload for the item after this one.
+    _scheduleNextItemPreload();
+
+    debugPrint('[AudioHandler] Gapless swap complete for "${item.title}"');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BROADCAST THROTTLING (unchanged)
+  // ═══════════════════════════════════════════════════════════════════════════
+
   void _scheduleBroadcast({bool structural = true}) {
     if (_pendingBroadcast) return;
     _pendingBroadcast = true;
@@ -170,16 +289,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     });
   }
 
-  // Position-aware scheduler: checks position-throttle interval first
   void _schedulePositionBroadcast() {
     if (_pendingBroadcast) return;
-    // Check if enough time has passed for a position-only broadcast
     final now = DateTime.now();
-    final sinceLastBroadcast = now.difference(_lastBroadcastTime);
-    if (sinceLastBroadcast < _kPositionBroadcastInterval) {
-      // Skip this position tick entirely — too soon
-      return;
-    }
+    if (now.difference(_lastBroadcastTime) < _kPositionBroadcastInterval) return;
     _pendingBroadcast = true;
     scheduleMicrotask(() {
       _pendingBroadcast = false;
@@ -187,18 +300,13 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     });
   }
 
-  // ── TIER 2: Minimum interval enforcement ──────────────────────────────────
   void _maybeBroadcast({required bool isPositionOnly}) {
     final now = DateTime.now();
     final elapsed = now.difference(_lastBroadcastTime);
-
     if (elapsed >= _kMinBroadcastInterval) {
-      // Enough time has passed — broadcast now
       _lastBroadcastTime = now;
       _broadcastStateNow();
     } else {
-      // Too soon — schedule for when the interval expires
-      // Only schedule if we don't already have a pending timer
       _throttleTimer?.cancel();
       final remaining = _kMinBroadcastInterval - elapsed;
       _throttleTimer = Timer(remaining, () {
@@ -208,9 +316,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     }
   }
 
-  // ── TIER 3: Immediate broadcast for critical state changes ─────────────────
-  // Used for play/pause/skip/stop where notification latency matters.
-  // Resets the throttle timer so subsequent position ticks don't fire immediately.
   void _broadcastCritical() {
     _throttleTimer?.cancel();
     _pendingBroadcast = false;
@@ -218,12 +323,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _broadcastStateNow();
   }
 
-  /// Core broadcast implementation — sends current state to AudioService.
-  /// Called by both the throttled path and the critical path.
   void _broadcastStateNow() {
     final isPlaying = _player.playing;
     final ps = _player.processingState;
-
     playbackState.add(playbackState.value.copyWith(
       controls: [
         MediaControl.skipToPrevious,
@@ -252,8 +354,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       speed:            _player.speed,
       queueIndex:       _currentQueueIndex,
     ));
-
-    // Update structural state cache for next comparison
     _lastBroadcastPlaying = isPlaying;
     _lastBroadcastLoading = (ps == ja.ProcessingState.loading ||
         ps == ja.ProcessingState.buffering);
@@ -261,19 +361,15 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _lastBroadcastDuration = _unifiedDuration;
   }
 
-  // ── Position save (throttled) ──────────────────────────────────────────────
+  // ── Position save ──────────────────────────────────────────────────────────
   void _maybeSavePosition() {
     final currentItem = _currentQueueIndex < _playableQueue.length
         ? _playableQueue[_currentQueueIndex]
         : null;
     if (currentItem == null) return;
-
     final posSeconds = _unifiedPosition.inSeconds;
-    if ((posSeconds - _lastSavedPositionSeconds).abs() < _saveIntervalSeconds) {
-      return;
-    }
+    if ((posSeconds - _lastSavedPositionSeconds).abs() < _saveIntervalSeconds) return;
     _lastSavedPositionSeconds = posSeconds;
-
     PlaybackPositionService.save(
       currentItem.id,
       posSeconds,
@@ -317,12 +413,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         return parts;
       }
     }
-
     if (item.streamUrl.startsWith('file://') || item.streamUrl.startsWith('/')) {
       debugPrint('[AudioHandler] Offline single-part — URI: ${item.streamUrl}');
       return [item.streamUrl];
     }
-
     final contentType = item.isEpisode ? 'episodes' : 'songs';
     return _urlService
         .buildPartsFromCount(
@@ -359,12 +453,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         await _player.play();
       }
 
-      _maybePreloadNext(partIndex);
+      _maybePreloadNextPart(partIndex);
 
       _completionSub = _player.processingStateStream.listen((state) {
-        if (state == ja.ProcessingState.completed) {
-          _onPartCompleted();
-        }
+        if (state == ja.ProcessingState.completed) _onPartCompleted();
       });
     } catch (e) {
       debugPrint('[AudioHandler] _loadPartAndPlay error: $e');
@@ -386,17 +478,15 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       final currentItem = _currentQueueIndex < _playableQueue.length
           ? _playableQueue[_currentQueueIndex]
           : null;
-      if (currentItem != null) {
-        PlaybackPositionService.clear(currentItem.id);
-      }
+      if (currentItem != null) PlaybackPositionService.clear(currentItem.id);
       _handleItemCompletion();
     }
   }
 
-  // ── Pre-loading ────────────────────────────────────────────────────────────
+  // ── Within-item part preloading ────────────────────────────────────────────
   bool _preloadReady = false;
 
-  void _maybePreloadNext(int currentPart) {
+  void _maybePreloadNextPart(int currentPart) {
     _preloadReady = false;
     final nextPart = currentPart + 1;
     if (nextPart >= _partUrls.length) return;
@@ -407,11 +497,8 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
     _preloadPlayer
         .setAudioSource(ja.AudioSource.uri(Uri.parse(url)))
-        .then((_) {
-      _preloadReady = true;
-    }).catchError((e) {
-      _preloadReady = false;
-    });
+        .then((_) { _preloadReady = true; })
+        .catchError((e) { _preloadReady = false; });
   }
 
   Future<void> _swapToPreloaded() async {
@@ -429,12 +516,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   void _reAttachStreams() {
-    for (final s in _subs) {
-      s.cancel();
-    }
+    for (final s in _subs) { s.cancel(); }
     _subs.clear();
 
-    // Re-attach with the same throttled approach
     _subs.add(_player.positionStream.listen((_) {
       _schedulePositionBroadcast();
       _maybeSavePosition();
@@ -445,6 +529,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
+      _maybeReschedulePreloadTimer();
       _scheduleBroadcast(structural: true);
     }));
     _subs.add(_player.playerStateStream
@@ -459,13 +544,22 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         break;
       case ja.LoopMode.all:
         final nextIdx = (_currentQueueIndex + 1) % _playableQueue.length;
-        _playItemAtQueueIndex(nextIdx);
+        _handleTransitionTo(nextIdx);
         break;
       case ja.LoopMode.off:
         if (_currentQueueIndex < _playableQueue.length - 1) {
-          _playItemAtQueueIndex(_currentQueueIndex + 1);
+          _handleTransitionTo(_currentQueueIndex + 1);
         }
         break;
+    }
+  }
+
+  /// Transition to the given queue index, using the pre-loaded player if ready.
+  Future<void> _handleTransitionTo(int nextIndex) async {
+    if (_nextItemPreloaded && _nextItemPreloadIndex == nextIndex) {
+      await _swapToNextItemPlayer(nextIndex);
+    } else {
+      await _playItemAtQueueIndex(nextIndex);
     }
   }
 
@@ -491,7 +585,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         '${_partUrls.length} part(s), known total: ${_knownTotalDuration?.inSeconds}s');
 
     await _loadPartAndPlay(0);
-    _broadcastCritical(); // immediate notification on item load
+    _broadcastCritical();
+
+    // Schedule background preload of the NEXT queue item.
+    _scheduleNextItemPreload();
   }
 
   MediaItem _playableToMediaItem(PlayableItem item) {
@@ -516,6 +613,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     List<PlayableItem>? queue,
     int index = 0,
   }) async {
+    _cancelNextItemPreload();
     if (queue != null) {
       _playableQueue = queue;
       _currentQueueIndex = index;
@@ -531,21 +629,22 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> play() async {
     await _player.play();
-    _broadcastCritical(); // immediate on play
+    _broadcastCritical();
   }
 
   @override
   Future<void> pause() async {
     _savePositionNow();
     await _player.pause();
-    _broadcastCritical(); // immediate on pause
+    _broadcastCritical();
   }
 
   @override
   Future<void> stop() async {
     _savePositionNow();
+    _cancelNextItemPreload();
     await _player.stop();
-    _broadcastCritical(); // immediate on stop
+    _broadcastCritical();
     await super.stop();
   }
 
@@ -593,17 +692,18 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       );
       await _player.play();
 
-      _maybePreloadNext(targetPart);
+      _maybePreloadNextPart(targetPart);
       _completionSub = _player.processingStateStream.listen((state) {
         if (state == ja.ProcessingState.completed) _onPartCompleted();
       });
     }
-    _broadcastCritical(); // immediate on seek
+    _broadcastCritical();
   }
 
   @override
   Future<void> skipToNext() async {
     _savePositionNow();
+    _cancelNextItemPreload();
     if (_currentQueueIndex < _playableQueue.length - 1) {
       await _playItemAtQueueIndex(_currentQueueIndex + 1);
     }
@@ -613,6 +713,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> skipToPrevious() async {
     _savePositionNow();
+    _cancelNextItemPreload();
     if (_player.position.inSeconds > 3 || _partOffset.inSeconds > 0) {
       await _loadItem(_playableQueue[_currentQueueIndex]);
     } else if (_currentQueueIndex > 0) {
@@ -624,6 +725,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> skipToQueueItem(int index) async {
     _savePositionNow();
+    _cancelNextItemPreload();
     await _playItemAtQueueIndex(index);
     _broadcastCritical();
   }
@@ -650,6 +752,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> setLoopMode(ja.LoopMode mode) async {
     _loopMode = mode;
     if (_partUrls.length <= 1) await _player.setLoopMode(mode);
+    // Reschedule preload since next-index may have changed.
+    _cancelNextItemPreload();
+    _scheduleNextItemPreload();
   }
 
   Future<void> toggleShuffle() async {
@@ -677,11 +782,11 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   Future<void> dispose() async {
     _throttleTimer?.cancel();
+    _nextItemPreloadTimer?.cancel();
     await _completionSub?.cancel();
-    for (final s in _subs) {
-      s.cancel();
-    }
+    for (final s in _subs) { s.cancel(); }
     await _player.dispose();
     await _preloadPlayer.dispose();
+    await _nextItemPlayer.dispose();
   }
 }
