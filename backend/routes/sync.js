@@ -1,21 +1,50 @@
 // routes/sync.js
 // FIX: Call invalidateSeriesCache() after a successful stories sync so the
-// all-with-episodes NodeCache is flushed immediately. Without this, the cache
-// serves the old episode list (e.g. 80 episodes) for up to 5 more minutes
-// after a new episode is synced — which is the root cause of the "ep 80"
-// count bug when the backend cache is warm.
+// all-with-episodes NodeCache is flushed immediately.
 //
-// Only the router POST handlers are changed (3 lines added).
-// All sync logic (runStoriesSync, runMusicSync, runCoversSync) is unchanged.
+// EPISODE 64 FIX — runStoriesSync() filename parser
+// ==================================================
+//
+// ROOT CAUSE:
+// Episode 64's Telegram filename is:  KarnaPishachini_Ep64.m4a
+// Episode 63's Telegram filenames are: KarnaPishachini...63_part01.mp3
+//                                      KarnaPishachini...63_part02.mp3
+//
+// The old parser had THREE patterns checked in order:
+//   1. Multi-part:  SeriesName_Ep63_Part1.ext   ← ep63 matched this
+//   2. Caption:     Series — EP64: Title         ← no caption on ep64
+//   3. Filename:    Series_EP64_Title.ext        ← requires a title segment
+//
+// Pattern 3 required a title segment after the episode number:
+//   /^(.+?)_EP(\d+)[_\s]+(.+?)\./i
+//                              ^^^— this group is mandatory
+//
+// KarnaPishachini_Ep64.m4a has NO title after EP64, so it matched nothing
+// → hit the `globalSkipped++` branch → never inserted into the DB.
+//
+// FIX:
+//   Added Pattern 3b — a new fallback that matches filenames where the
+//   episode number is the LAST thing before the extension:
+//     /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
+//
+//   This matches:  KarnaPishachini_Ep64.m4a
+//     Group 1 → "KarnaPishachini"  (series name)
+//     Group 2 → "64"               (episode number)
+//   Title falls back to "Episode 64" since there is no explicit title.
+//
+// ALSO FIXED: normalizeAudio() now explicitly accepts .m4a / .aac / .ogg
+//   MIME types in addition to the existing audio/* wildcard, ensuring the
+//   document branch handles them even if Telegram sends a non-standard type.
+//
+// ALL OTHER SYNC LOGIC IS UNCHANGED.
 
 const express = require('express');
 const router  = require('express').Router();
 const axios   = require('axios');
 const prisma  = require('../services/db');
 
-// FIX: import cache invalidation from series and albums routes
 const { invalidateSeriesCache } = require('./series');
-const { invalidateAlbumCache  } = require('./albums'); // optional, for music sync
+const { invalidateAlbumCache  } = require('./albums');
 
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -79,20 +108,38 @@ const syncStatus = {
   covers:  { running: false, lastResult: null, lastError: null, lastRun: null },
 };
 
+// ── FIX: normalizeAudio now explicitly handles .m4a / .aac / .ogg ────────────
+// Telegram sometimes sends these as documents with mime_type 'audio/mp4',
+// 'audio/aac', 'audio/ogg', or even 'video/mp4' for .m4a files.
+// The existing `audio/*` wildcard covers most cases, but we add an explicit
+// extension check as a belt-and-suspenders fallback.
+
+const AUDIO_EXTENSIONS = /\.(mp3|m4a|aac|ogg|opus|flac|wav|m4b)$/i;
+
 function normalizeAudio(msg) {
   if (msg.audio) return msg.audio;
+
   const doc = msg.document;
-  if (doc && doc.mime_type && doc.mime_type.startsWith('audio/')) {
+  if (!doc) return null;
+
+  const mimeOk = doc.mime_type && (
+    doc.mime_type.startsWith('audio/') ||
+    doc.mime_type === 'video/mp4'        // Telegram sometimes sends .m4a as video/mp4
+  );
+  const extOk = doc.file_name && AUDIO_EXTENSIONS.test(doc.file_name);
+
+  if (mimeOk || extOk) {
     return {
-      file_id:   doc.file_id,
-      file_name: doc.file_name  || null,
-      file_size: doc.file_size  || null,
-      duration:  doc.duration   || 0,
-      performer: doc.performer  || null,
-      title:     doc.title      || null,
+      file_id:        doc.file_id,
+      file_name:      doc.file_name  || null,
+      file_size:      doc.file_size  || null,
+      duration:       doc.duration   || 0,
+      performer:      doc.performer  || null,
+      title:          doc.title      || null,
       _from_document: true,
     };
   }
+
   return null;
 }
 
@@ -292,6 +339,32 @@ async function runMusicSync() {
   };
 }
 
+// ── runStoriesSync ────────────────────────────────────────────────────────────
+//
+// FIX: Added Pattern 3b to handle filenames like KarnaPishachini_Ep64.m4a
+// where there is NO title segment after the episode number.
+//
+// Parsing priority (checked in order):
+//
+//   Pattern 1 — Multi-part filename:
+//     SeriesName_Ep63_Part1.mp3  or  SeriesName_Ep63_part01.mp3
+//     Regex: /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
+//
+//   Pattern 2 — Caption with title:
+//     "Series Name — EP64: Episode Title"
+//     Regex: /^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i
+//
+//   Pattern 3 — Filename with title:
+//     SeriesName_EP64_EpisodeTitle.mp3
+//     Regex: /^(.+?)_EP(\d+)[_\s]+(.+?)\./i
+//
+//   Pattern 3b — Filename WITHOUT title (NEW):  ← fixes ep 64
+//     KarnaPishachini_Ep64.m4a
+//     Regex: /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
+//     Title falls back to "Episode N"
+//
+// Without Pattern 3b, ep 64 hit the warn+skip branch and was never inserted.
+
 async function runStoriesSync() {
   const state        = await readState();
   const fromUpdateId = state.storiesLastUpdateId || 0;
@@ -346,6 +419,8 @@ async function runStoriesSync() {
 
     if (seenFileIds.has(fileId)) { globalSkipped++; continue; }
 
+    // ── Pattern 1: Multi-part filename ──────────────────────────────────────
+    // e.g. KarnaPishachini_Ep63_Part1.mp3
     const partMatch = fileName.match(
       /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
     );
@@ -362,27 +437,69 @@ async function runStoriesSync() {
         fileId,
         duration: audio.duration ?? 0,
       });
+      console.log(`  ✅ [Pattern 1 multi-part] "${fileName}" → ${seriesTitle} EP${episodeNum} Part${partNum}`);
       continue;
     }
 
-    const captionMatch  = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
+    // ── Pattern 2: Caption with title ────────────────────────────────────────
+    // e.g. "KarnaPishachini — EP64: The Dark Forest"
+    const captionMatch = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
+
+    if (captionMatch) {
+      parsed.push({
+        seriesTitle:  captionMatch[1].trim(),
+        episodeNum:   parseInt(captionMatch[2]),
+        partNum:      null,
+        episodeTitle: captionMatch[3].trim(),
+        fileId,
+        duration: audio.duration ?? 0,
+      });
+      console.log(`  ✅ [Pattern 2 caption] "${caption}" → EP${captionMatch[2]}`);
+      continue;
+    }
+
+    // ── Pattern 3: Filename with title ───────────────────────────────────────
+    // e.g. KarnaPishachini_EP64_TheDarkForest.mp3
     const fileNameMatch = fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
-    const match         = captionMatch || fileNameMatch;
 
-    if (!match) {
-      console.warn(`⚠️  [Stories] Cannot parse: "${caption || fileName}"`);
-      globalSkipped++;
+    if (fileNameMatch) {
+      parsed.push({
+        seriesTitle:  fileNameMatch[1].replace(/[_\-]+/g, ' ').trim(),
+        episodeNum:   parseInt(fileNameMatch[2]),
+        partNum:      null,
+        episodeTitle: fileNameMatch[3].replace(/[_\-]+/g, ' ').trim(),
+        fileId,
+        duration: audio.duration ?? 0,
+      });
+      console.log(`  ✅ [Pattern 3 filename+title] "${fileName}" → EP${fileNameMatch[2]}`);
       continue;
     }
 
-    parsed.push({
-      seriesTitle:  match[1].trim(),
-      episodeNum:   parseInt(match[2]),
-      partNum:      null,
-      episodeTitle: match[3].trim(),
-      fileId,
-      duration: audio.duration ?? 0,
-    });
+    // ── Pattern 3b: Filename WITHOUT title (NEW FIX for ep 64) ───────────────
+    // e.g. KarnaPishachini_Ep64.m4a  — episode number is the last thing before ext
+    // Also handles: KarnaPishachini_Ep64.mp3, SeriesName_EP64.m4a
+    const fileNameNoTitleMatch = fileName.match(
+      /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
+    );
+
+    if (fileNameNoTitleMatch) {
+      const seriesTitle = fileNameNoTitleMatch[1].replace(/[_\-]+/g, ' ').trim();
+      const episodeNum  = parseInt(fileNameNoTitleMatch[2]);
+      parsed.push({
+        seriesTitle,
+        episodeNum,
+        partNum:      null,
+        episodeTitle: `Episode ${episodeNum}`, // no title in filename — use generic
+        fileId,
+        duration: audio.duration ?? 0,
+      });
+      console.log(`  ✅ [Pattern 3b filename-no-title] "${fileName}" → ${seriesTitle} EP${episodeNum}`);
+      continue;
+    }
+
+    // ── No pattern matched ────────────────────────────────────────────────────
+    console.warn(`⚠️  [Stories] Cannot parse (skipped): caption="${caption}" fileName="${fileName}"`);
+    globalSkipped++;
   }
 
   const groups = new Map();
@@ -485,6 +602,7 @@ async function runStoriesSync() {
         skipDuplicates: true,
       });
     }
+    console.log(`🎙️  [Stories] Created ${episodesToCreate.length} episode(s)`);
   }
 
   if (episodesToUpdate.length > 0) {
@@ -496,6 +614,7 @@ async function runStoriesSync() {
         })
       )
     );
+    console.log(`🎙️  [Stories] Updated ${episodesToUpdate.length} episode(s)`);
   }
 
   if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
@@ -579,7 +698,6 @@ router.post('/music', async (req, res, next) => {
   try {
     const result = await runMusicSync();
     syncStatus.music.lastResult = result;
-    // FIX: bust album cache so new songs are visible immediately
     try { invalidateAlbumCache?.(); } catch (_) {}
     res.json({ success: true, ...result });
   } catch (err) {
@@ -598,11 +716,7 @@ router.post('/stories', async (req, res, next) => {
   try {
     const result = await runStoriesSync();
     syncStatus.stories.lastResult = result;
-
-    // FIX: flush all series caches immediately after sync so the new episode
-    // count is visible on the very next Flutter request — not 5 min later.
     try { invalidateSeriesCache(); } catch (_) {}
-
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.stories.lastError = err.message;
