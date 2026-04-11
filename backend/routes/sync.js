@@ -785,7 +785,8 @@ router.post('/reset', async (req, res, next) => {
 
 const { execFile } = require('child_process');
 const { promisify } = require('util');
-const fs  = require('fs');
+const fs           = require('fs');
+const ffprobePath  = require('ffprobe-static').path;  // pre-compiled binary, no apt-get needed
 const execFileAsync = promisify(execFile);
 
 // Download a Telegram file to a temp path, return the path
@@ -821,7 +822,7 @@ async function downloadToTemp(fileId) {
 
 // Run ffprobe on a local file, return exact duration in seconds (integer)
 async function getExactDuration(filePath) {
-  const { stdout } = await execFileAsync('ffprobe', [
+  const { stdout } = await execFileAsync(ffprobePath, [
     '-v',             'error',
     '-show_entries',  'format=duration',
     '-of',            'default=noprint_wrappers=1:nokey=1',
