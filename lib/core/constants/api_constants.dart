@@ -9,6 +9,7 @@ class ApiConstants {
   static const String albums  = '/api/albums';
   static const String search  = '/api/search';
   static const String health  = '/health';
+  static const String allAlbumsWithSongs = '/api/albums/all-with-songs';
 
   static String seriesById(String id)     => '/api/series/$id';
   static String seriesEpisodes(String id) => '/api/series/$id/episodes';
@@ -20,6 +21,7 @@ class ApiConstants {
   static String songStream(String id)     => '/api/songs/$id/stream';
   static String songParts(String id)      => '/api/songs/$id/parts';
   static String songDownload(String id)   => '/api/songs/$id/download';
+  
 
   // PERF FIX: 10s connect (was 30s), 15s receive for JSON (was 120s)
   // Streaming uses a separate longer timeout set in audio_handler.dart
