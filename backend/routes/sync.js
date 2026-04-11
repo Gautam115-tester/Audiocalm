@@ -2,35 +2,26 @@
 // FIX: Call invalidateSeriesCache() after a successful stories sync so the
 // all-with-episodes NodeCache is flushed immediately.
 //
-// EPISODE 64 FIX — runStoriesSync() filename parser
-// ==================================================
+// EPISODE 64 FIX + SPACED-FILENAME FIX — runStoriesSync() filename parser
+// ========================================================================
 //
-// ROOT CAUSE:
+// ROOT CAUSE (ep 64):
 // Episode 64's Telegram filename is:  KarnaPishachini_Ep64.m4a
-// Episode 63's Telegram filenames are: KarnaPishachini...63_part01.mp3
-//                                      KarnaPishachini...63_part02.mp3
+//   → no title segment after EP number → old Pattern 3 required one → skipped.
+//   FIX: Pattern 3b matches filenames where episode number is last before ext.
 //
-// The old parser had THREE patterns checked in order:
-//   1. Multi-part:  SeriesName_Ep63_Part1.ext   ← ep63 matched this
-//   2. Caption:     Series — EP64: Title         ← no caption on ep64
-//   3. Filename:    Series_EP64_Title.ext        ← requires a title segment
+// NEW FORMAT SUPPORTED (Aayra-style):
+// Telegram filenames like:  "Aayra shaadi ya khauf Ep 16_part01.aac"
+//                            "Aayra shaadi ya khauf Ep 16_part02.aac"
+//                            "Aayra shaadi ya khauf Ep 18.aac"
+// Features:
+//   • Series name contains SPACES (not just underscores)
+//   • "Ep" has a SPACE before the episode number: "Ep 16"
+//   • Multi-part suffix: "_part01", "_part02"
+//   • Extension: .aac (already handled by normalizeAudio)
 //
-// Pattern 3 required a title segment after the episode number:
-//   /^(.+?)_EP(\d+)[_\s]+(.+?)\./i
-//                              ^^^— this group is mandatory
-//
-// KarnaPishachini_Ep64.m4a has NO title after EP64, so it matched nothing
-// → hit the `globalSkipped++` branch → never inserted into the DB.
-//
-// FIX:
-//   Added Pattern 3b — a new fallback that matches filenames where the
-//   episode number is the LAST thing before the extension:
-//     /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
-//
-//   This matches:  KarnaPishachini_Ep64.m4a
-//     Group 1 → "KarnaPishachini"  (series name)
-//     Group 2 → "64"               (episode number)
-//   Title falls back to "Episode 64" since there is no explicit title.
+// ALL PATTERNS now use a greedy series-name group that accepts spaces,
+// and the Ep/EP separator allows an optional space: [Ee][Pp]\s*(\d+)
 //
 // ALSO FIXED: normalizeAudio() now explicitly accepts .m4a / .aac / .ogg
 //   MIME types in addition to the existing audio/* wildcard, ensuring the
@@ -341,29 +332,26 @@ async function runMusicSync() {
 
 // ── runStoriesSync ────────────────────────────────────────────────────────────
 //
-// FIX: Added Pattern 3b to handle filenames like KarnaPishachini_Ep64.m4a
-// where there is NO title segment after the episode number.
-//
 // Parsing priority (checked in order):
 //
-//   Pattern 1 — Multi-part filename:
-//     SeriesName_Ep63_Part1.mp3  or  SeriesName_Ep63_part01.mp3
-//     Regex: /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
+//   Pattern 1 — Multi-part filename (underscore OR space separator, optional space after Ep):
+//     SeriesName_Ep63_Part1.mp3
+//     Aayra shaadi ya khauf Ep 16_part01.aac
+//     Regex: /^(.+?)\s*[Ee][Pp]\s*(\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
 //
 //   Pattern 2 — Caption with title:
 //     "Series Name — EP64: Episode Title"
 //     Regex: /^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i
 //
-//   Pattern 3 — Filename with title:
+//   Pattern 3 — Filename with title (optional space after Ep):
 //     SeriesName_EP64_EpisodeTitle.mp3
-//     Regex: /^(.+?)_EP(\d+)[_\s]+(.+?)\./i
+//     Regex: /^(.+?)\s*[Ee][Pp]\s*(\d+)[\s_]+(.+?)\./i
 //
-//   Pattern 3b — Filename WITHOUT title (NEW):  ← fixes ep 64
+//   Pattern 3b — Filename WITHOUT title (optional space after Ep):
 //     KarnaPishachini_Ep64.m4a
-//     Regex: /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
+//     Aayra shaadi ya khauf Ep 18.aac
+//     Regex: /^(.+?)\s*[Ee][Pp]\s*(\d+)\.[a-z0-9]{2,5}$/i
 //     Title falls back to "Episode N"
-//
-// Without Pattern 3b, ep 64 hit the warn+skip branch and was never inserted.
 
 async function runStoriesSync() {
   const state        = await readState();
@@ -420,10 +408,11 @@ async function runStoriesSync() {
     if (seenFileIds.has(fileId)) { globalSkipped++; continue; }
 
     // ── Pattern 1: Multi-part filename ──────────────────────────────────────
-    // e.g. KarnaPishachini_Ep63_Part1.mp3
-    const partMatch = fileName.match(
-      /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
-    );
+    // Old: KarnaPishachini_Ep63_Part1.mp3  (underscore/dash separator before Ep)
+    // New: Aayra shaadi ya khauf Ep 16_part01.aac  (space before/after Ep)
+    const partMatch =
+      fileName.match(/^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i) ||
+      fileName.match(/^(.+?)\s*[Ee][Pp]\s*(\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i);
 
     if (partMatch) {
       const seriesTitle = partMatch[1].replace(/[_\-]+/g, ' ').trim();
@@ -459,8 +448,11 @@ async function runStoriesSync() {
     }
 
     // ── Pattern 3: Filename with title ───────────────────────────────────────
-    // e.g. KarnaPishachini_EP64_TheDarkForest.mp3
-    const fileNameMatch = fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
+    // Old: KarnaPishachini_EP64_TheDarkForest.mp3  (underscore before EP)
+    // New: Series Name EP 64 Some Title.mp3  (space, optional space after Ep)
+    const fileNameMatch =
+      fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i) ||
+      fileName.match(/^(.+?)\s*[Ee][Pp]\s*(\d+)[\s_]+(.+?)\./i);
 
     if (fileNameMatch) {
       parsed.push({
@@ -475,12 +467,12 @@ async function runStoriesSync() {
       continue;
     }
 
-    // ── Pattern 3b: Filename WITHOUT title (NEW FIX for ep 64) ───────────────
-    // e.g. KarnaPishachini_Ep64.m4a  — episode number is the last thing before ext
-    // Also handles: KarnaPishachini_Ep64.mp3, SeriesName_EP64.m4a
-    const fileNameNoTitleMatch = fileName.match(
-      /^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i
-    );
+    // ── Pattern 3b: Filename WITHOUT title ───────────────────────────────────
+    // Old: KarnaPishachini_Ep64.m4a  (underscore/dash before Ep, no space after)
+    // New: Aayra shaadi ya khauf Ep 18.aac  (space before/after Ep, spaced series)
+    const fileNameNoTitleMatch =
+      fileName.match(/^(.+?)[\s_\-]*[Ee][Pp](\d+)\.[a-z0-9]{2,4}$/i) ||
+      fileName.match(/^(.+?)\s*[Ee][Pp]\s*(\d+)\.[a-z0-9]{2,5}$/i);
 
     if (fileNameNoTitleMatch) {
       const seriesTitle = fileNameNoTitleMatch[1].replace(/[_\-]+/g, ' ').trim();
