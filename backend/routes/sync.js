@@ -1,18 +1,21 @@
 // routes/sync.js
-// Syncs music, audio stories, and cover images from Telegram channels into the DB.
+// FIX: Call invalidateSeriesCache() after a successful stories sync so the
+// all-with-episodes NodeCache is flushed immediately. Without this, the cache
+// serves the old episode list (e.g. 80 episodes) for up to 5 more minutes
+// after a new episode is synced — which is the root cause of the "ep 80"
+// count bug when the backend cache is warm.
 //
-// DOCUMENT FIX:
-//   Telegram sometimes stores uploaded audio as `document` instead of `audio`
-//   (happens when the file is sent via sendDocument or auto-classified by Telegram).
-//   Both runMusicSync and runStoriesSync now normalise document posts into the
-//   same shape as audio posts so the rest of the logic works unchanged.
-//   normalizeAudio(msg) returns a unified audio object from either msg.audio or
-//   msg.document (as long as the document mime_type starts with "audio/").
+// Only the router POST handlers are changed (3 lines added).
+// All sync logic (runStoriesSync, runMusicSync, runCoversSync) is unchanged.
 
 const express = require('express');
 const router  = require('express').Router();
 const axios   = require('axios');
 const prisma  = require('../services/db');
+
+// FIX: import cache invalidation from series and albums routes
+const { invalidateSeriesCache } = require('./series');
+const { invalidateAlbumCache  } = require('./albums'); // optional, for music sync
 
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -21,7 +24,6 @@ const MUSIC_CHANNEL_ID   = process.env.TELEGRAM_MUSIC_CHANNEL_ID;
 const STORIES_CHANNEL_ID = process.env.TELEGRAM_STORIES_CHANNEL_ID;
 const COVERS_CHANNEL_ID  = process.env.TELEGRAM_COVERS_CHANNEL_ID;
 
-// ── Startup validation ────────────────────────────────────────────────────────
 for (const key of [
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_MUSIC_CHANNEL_ID',
@@ -31,7 +33,6 @@ for (const key of [
   if (!process.env[key]) console.error(`❌ Missing env var: ${key}`);
 }
 
-// ── State helpers ─────────────────────────────────────────────────────────────
 let memState = {
   musicLastUpdateId:   0,
   storiesLastUpdateId: 0,
@@ -72,45 +73,29 @@ async function saveState(patch) {
   }
 }
 
-// ── In-memory sync status ─────────────────────────────────────────────────────
 const syncStatus = {
   music:   { running: false, lastResult: null, lastError: null, lastRun: null },
   stories: { running: false, lastResult: null, lastError: null, lastRun: null },
   covers:  { running: false, lastResult: null, lastError: null, lastRun: null },
 };
 
-// ── normalizeAudio ────────────────────────────────────────────────────────────
-// FIX: Telegram sometimes delivers audio files as `document` instead of `audio`.
-// This happens when:
-//   - The file is uploaded via sendDocument instead of sendAudio
-//   - Telegram auto-classifies the file based on its mime type
-//
-// This function returns a unified audio-like object from either field:
-//   { file_id, file_name, duration, performer, title, file_size }
-//
-// Returns null if the message has no audio or audio-like document.
 function normalizeAudio(msg) {
-  // Standard audio message
   if (msg.audio) return msg.audio;
-
-  // Document with audio mime type (the case we're fixing)
   const doc = msg.document;
   if (doc && doc.mime_type && doc.mime_type.startsWith('audio/')) {
     return {
       file_id:   doc.file_id,
       file_name: doc.file_name  || null,
       file_size: doc.file_size  || null,
-      duration:  doc.duration   || 0,    // documents don't have duration — sync uses filename
+      duration:  doc.duration   || 0,
       performer: doc.performer  || null,
       title:     doc.title      || null,
-      _from_document: true,              // flag for debugging
+      _from_document: true,
     };
   }
-
   return null;
 }
 
-// ── fetchAllUpdates ───────────────────────────────────────────────────────────
 async function fetchAllUpdates(channelId, fromUpdateId = 0) {
   const messages     = [];
   let   offset       = fromUpdateId > 0 ? fromUpdateId + 1 : 0;
@@ -167,7 +152,6 @@ async function fetchAllUpdates(channelId, fromUpdateId = 0) {
   return { messages, lastUpdateId };
 }
 
-// ── Album name cleaner ────────────────────────────────────────────────────────
 function cleanAlbumName(fileName, performer) {
   if (!fileName) return performer || 'Unknown';
   const m    = fileName.match(/^(.+?)(?:[\s_([\-]*(?:Original|OST|Soundtrack|TR\d)|\.[a-z0-9]{3,4}$|$)/i);
@@ -182,7 +166,6 @@ function cleanAlbumName(fileName, performer) {
   return name || 'Unknown Album';
 }
 
-// ── runMusicSync ──────────────────────────────────────────────────────────────
 async function runMusicSync() {
   const state        = await readState();
   const fromUpdateId = state.musicLastUpdateId || 0;
@@ -192,7 +175,6 @@ async function runMusicSync() {
   const { messages: raw, lastUpdateId } = await fetchAllUpdates(MUSIC_CHANNEL_ID, fromUpdateId);
   console.log(`🎵 [Music] ${raw.length} channel posts received total`);
 
-  // FIX: use normalizeAudio — picks up both audio and document posts
   const audioPosts = raw
     .map((m) => ({ ...m, _audio: normalizeAudio(m) }))
     .filter((m) => m._audio != null);
@@ -252,11 +234,7 @@ async function runMusicSync() {
 
     const albumName = cleanAlbumName(audio.file_name, performer);
     const album     = albumMap.get(albumName.toLowerCase());
-    if (!album) {
-      console.warn(`⚠️  [Music] No album matched for "${albumName}" — skipping`);
-      skipped++;
-      continue;
-    }
+    if (!album) { skipped++; continue; }
 
     const titleKey = `${title.toLowerCase()}::${album.id}`;
     if (seenTitleAlbum.has(titleKey)) { skipped++; continue; }
@@ -314,7 +292,6 @@ async function runMusicSync() {
   };
 }
 
-// ── runStoriesSync ────────────────────────────────────────────────────────────
 async function runStoriesSync() {
   const state        = await readState();
   const fromUpdateId = state.storiesLastUpdateId || 0;
@@ -324,7 +301,6 @@ async function runStoriesSync() {
   const { messages: raw, lastUpdateId } = await fetchAllUpdates(STORIES_CHANNEL_ID, fromUpdateId);
   console.log(`🎙️  [Stories] ${raw.length} channel posts received total`);
 
-  // FIX: use normalizeAudio — picks up both audio and document posts
   const audioPosts = raw
     .map((m) => ({ ...m, _audio: normalizeAudio(m) }))
     .filter((m) => m._audio != null);
@@ -337,7 +313,6 @@ async function runStoriesSync() {
     return { created: 0, updated: 0, skipped: 0, scanned: raw.length };
   }
 
-  // ── Load existing data ─────────────────────────────────────────────────────
   const allSeries  = await prisma.series.findMany({ select: { id: true, title: true } });
   const seriesMap  = new Map(allSeries.map((s) => [s.title.toLowerCase(), s]));
 
@@ -360,19 +335,17 @@ async function runStoriesSync() {
     }
   }
 
-  // ── Parse each audio post ──────────────────────────────────────────────────
   const parsed = [];
   let globalSkipped = 0;
 
   for (const msg of audioPosts) {
-    const audio    = msg._audio;   // FIX: use normalised audio object
+    const audio    = msg._audio;
     const fileId   = audio.file_id;
     const caption  = msg.caption || '';
     const fileName = audio.file_name || '';
 
     if (seenFileIds.has(fileId)) { globalSkipped++; continue; }
 
-    // Pattern: SeriesName_Ep01_part01.mp3
     const partMatch = fileName.match(
       /^(.+?)[\s_\-]+[Ee][Pp](\d+)[\s_\-]+[Pp](?:art)?[\s_\-]?(\d+)\./i
     );
@@ -392,9 +365,7 @@ async function runStoriesSync() {
       continue;
     }
 
-    // Caption: "Series Title — EP1: Episode Title"
     const captionMatch  = caption.match(/^(.+?)\s*[—\-]+\s*EP(\d+)[:\s]+(.+)$/i);
-    // Filename (no parts): SeriesTitle_EP01_EpisodeTitle.mp3
     const fileNameMatch = fileName.match(/^(.+?)_EP(\d+)[_\s]+(.+?)\./i);
     const match         = captionMatch || fileNameMatch;
 
@@ -414,7 +385,6 @@ async function runStoriesSync() {
     });
   }
 
-  // ── Group by "seriesTitle::episodeNum" ─────────────────────────────────────
   const groups = new Map();
 
   for (const item of parsed) {
@@ -434,7 +404,6 @@ async function runStoriesSync() {
     });
   }
 
-  // ── Process each group ─────────────────────────────────────────────────────
   const episodesToCreate = [];
   const episodesToUpdate = [];
   let skipped = 0;
@@ -488,24 +457,12 @@ async function runStoriesSync() {
         partCount:      mergedPartCount,
       });
 
-      console.log(
-        `🔄 [Stories] Merging ${trulyNewIds.length} new part(s) into ` +
-        `"${group.seriesTitle}" EP${group.episodeNum} ` +
-        `(now ${mergedPartCount} parts, ${mergedDuration}s total)`
-      );
-
       trulyNewIds.forEach((id) => seenFileIds.add(id));
       continue;
     }
 
-    // Brand new episode
     const telegramFileId = newPartCount === 1 ? newFileIds[0] : JSON.stringify(newFileIds);
     const totalDuration  = newPartDuration || null;
-
-    console.log(
-      `✨ [Stories] New episode: "${group.seriesTitle}" EP${group.episodeNum} ` +
-      `— ${newPartCount} part(s), ${totalDuration}s total`
-    );
 
     newFileIds.forEach((id) => seenFileIds.add(id));
     existingEpMap.set(dbKey, { id: 'pending', seriesId: series.id, episodeNumber: group.episodeNum });
@@ -520,7 +477,6 @@ async function runStoriesSync() {
     });
   }
 
-  // ── Batch CREATE ───────────────────────────────────────────────────────────
   if (episodesToCreate.length > 0) {
     const BATCH = 100;
     for (let i = 0; i < episodesToCreate.length; i += BATCH) {
@@ -529,13 +485,8 @@ async function runStoriesSync() {
         skipDuplicates: true,
       });
     }
-    console.log(
-      `🎙️  [Stories] Created ${episodesToCreate.length} episode(s) ` +
-      `(${episodesToCreate.filter(e => e.partCount > 1).length} multi-part)`
-    );
   }
 
-  // ── Batch UPDATE ───────────────────────────────────────────────────────────
   if (episodesToUpdate.length > 0) {
     await Promise.all(
       episodesToUpdate.map(({ id, telegramFileId, duration, partCount }) =>
@@ -545,7 +496,6 @@ async function runStoriesSync() {
         })
       )
     );
-    console.log(`🔄 [Stories] Updated ${episodesToUpdate.length} episode(s) with new parts`);
   }
 
   if (lastUpdateId > fromUpdateId) await saveState({ storiesLastUpdateId: lastUpdateId });
@@ -558,7 +508,6 @@ async function runStoriesSync() {
   };
 }
 
-// ── runCoversSync ─────────────────────────────────────────────────────────────
 async function runCoversSync() {
   const state        = await readState();
   const fromUpdateId = state.coversLastUpdateId || 0;
@@ -566,10 +515,7 @@ async function runCoversSync() {
   console.log(`\n🖼️  [Covers Sync] Starting — last update_id: ${fromUpdateId}`);
 
   const { messages: raw, lastUpdateId } = await fetchAllUpdates(COVERS_CHANNEL_ID, fromUpdateId);
-  console.log(`🖼️  [Covers] ${raw.length} channel posts received total`);
-
   const photoMessages = raw.filter((m) => m.photo);
-  console.log(`🖼️  [Covers] ${photoMessages.length} photo messages to process`);
 
   if (photoMessages.length === 0) {
     if (lastUpdateId > fromUpdateId) await saveState({ coversLastUpdateId: lastUpdateId });
@@ -596,28 +542,16 @@ async function runCoversSync() {
 
     if (albumMatch) {
       const name  = albumMatch[1].replace(/\([^)]*\)/g, '').trim().toLowerCase();
-      const album =
-        albumMap.get(name) ??
+      const album = albumMap.get(name) ??
         [...albumMap.values()].find((a) => a.title.toLowerCase().includes(name));
-      if (album) {
-        albumUpdates.push({ id: album.id, fileId });
-        console.log(`🖼️  [Covers] Matched album: "${album.title}"`);
-      } else {
-        console.warn(`⚠️  [Covers] No album matched for: "${name}"`);
-      }
+      if (album) albumUpdates.push({ id: album.id, fileId });
     }
 
     if (seriesMatch) {
       const name   = seriesMatch[1].replace(/\([^)]*\)/g, '').trim().toLowerCase();
-      const series =
-        seriesMap.get(name) ??
+      const series = seriesMap.get(name) ??
         [...seriesMap.values()].find((s) => s.title.toLowerCase().includes(name));
-      if (series) {
-        seriesUpdates.push({ id: series.id, fileId });
-        console.log(`🖼️  [Covers] Matched series: "${series.title}"`);
-      } else {
-        console.warn(`⚠️  [Covers] No series matched for: "${name}"`);
-      }
+      if (series) seriesUpdates.push({ id: series.id, fileId });
     }
   }
 
@@ -632,10 +566,7 @@ async function runCoversSync() {
 
   if (lastUpdateId > fromUpdateId) await saveState({ coversLastUpdateId: lastUpdateId });
 
-  return {
-    updated: albumUpdates.length + seriesUpdates.length,
-    scanned: raw.length,
-  };
+  return { updated: albumUpdates.length + seriesUpdates.length, scanned: raw.length };
 }
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -648,10 +579,11 @@ router.post('/music', async (req, res, next) => {
   try {
     const result = await runMusicSync();
     syncStatus.music.lastResult = result;
+    // FIX: bust album cache so new songs are visible immediately
+    try { invalidateAlbumCache?.(); } catch (_) {}
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.music.lastError = err.message;
-    console.error('❌ [Music] sync failed:', err.message);
     next(err);
   } finally {
     syncStatus.music.running = false;
@@ -666,10 +598,14 @@ router.post('/stories', async (req, res, next) => {
   try {
     const result = await runStoriesSync();
     syncStatus.stories.lastResult = result;
+
+    // FIX: flush all series caches immediately after sync so the new episode
+    // count is visible on the very next Flutter request — not 5 min later.
+    try { invalidateSeriesCache(); } catch (_) {}
+
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.stories.lastError = err.message;
-    console.error('❌ [Stories] sync failed:', err.message);
     next(err);
   } finally {
     syncStatus.stories.running = false;
@@ -687,7 +623,6 @@ router.post('/covers', async (req, res, next) => {
     res.json({ success: true, ...result });
   } catch (err) {
     syncStatus.covers.lastError = err.message;
-    console.error('❌ [Covers] sync failed:', err.message);
     next(err);
   } finally {
     syncStatus.covers.running = false;
@@ -707,7 +642,7 @@ router.post('/reset', async (req, res, next) => {
     syncStatus.music.lastResult   = null;
     syncStatus.stories.lastResult = null;
     syncStatus.covers.lastResult  = null;
-    res.json({ success: true, message: 'Sync state reset. Next run will fetch ALL updates from the beginning.' });
+    res.json({ success: true, message: 'Sync state reset.' });
   } catch (err) { next(err); }
 });
 

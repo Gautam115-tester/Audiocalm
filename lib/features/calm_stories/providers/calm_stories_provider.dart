@@ -1,17 +1,43 @@
 // lib/features/calm_stories/providers/calm_stories_provider.dart
 //
-// FIXES IN THIS VERSION
-// =====================
-// 1. episodeCount is now derived from the LIVE episodes array length — not from
-//    the stale 'episodeCount' field stored in the DB. This fixes the "80 shown
-//    when 81 exist" bug: the backend's episodeCount field can lag behind new
-//    syncs, but the embedded episodes list is always current.
+// FIX: Episode count shows 80 instead of 81
+// ==========================================
 //
-// 2. totalDurationSeconds is computed per series (sum of all episode durations)
-//    and injected into SeriesModel so the UI can show "81 episodes · 14h 23m".
+// ROOT CAUSE (two layers):
 //
-// All public provider names and return types are IDENTICAL to the original.
-// No screen changes required beyond reading the new fields.
+// 1. BACKEND CACHE: series.js caches the all-with-episodes response for 5 min.
+//    If episode 81 was synced AFTER the cache was populated, the cached response
+//    still has `episodes: [ep1...ep80]` and `episodeCount: 80`. The Flutter
+//    provider parses the embedded `episodes` array length correctly (liveCount),
+//    BUT the cache serves stale data — so even the embedded array only has 80.
+//
+// 2. FLUTTER KEEPALIVE: `ref.keepAlive()` on `_allSeriesRawProvider` means
+//    once loaded, it NEVER re-fetches, even across navigation. If the app was
+//    open when ep81 was synced, the user sees stale data until a full restart.
+//
+// FIXES APPLIED:
+//
+// A. Remove `ref.keepAlive()` from `_allSeriesRawProvider` — let Riverpod
+//    dispose it when no longer watched, so navigating back to StoriesScreen
+//    always fetches fresh data.
+//
+// B. Add a cache-buster query param `?t=<minute-epoch>` to the API call.
+//    This bypasses the 5-min server-side NodeCache since the URL changes
+//    every minute. The browser/Dio HTTP cache is not involved (JSON endpoint).
+//    Round to the nearest minute so identical navigations within the same
+//    minute still share the same in-flight request.
+//
+// C. Keep `_parseSeriesAndEpisodes` isolate logic unchanged — it already
+//    correctly derives liveCount from the embedded episodes array length.
+//
+// D. `seriesListProvider` and `episodesProvider` keep `ref.keepAlive()` so
+//    already-loaded detail data stays available while navigating, but they
+//    depend on `_allSeriesRawProvider` which is now auto-disposed → they
+//    re-fetch when the raw provider is re-created.
+//
+// RESULT: After this fix, every time the user opens Stories screen or
+// SeriesDetail, it fetches fresh data from the backend. The 1-minute cache
+// buster means even the server cache is bypassed within a minute of a sync.
 
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -40,25 +66,23 @@ _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
   final episodesBySeriesId = <String, List<EpisodeModel>>{};
 
   for (final raw in payload.rawList) {
-    // Parse episodes first so we can derive the live count and total duration.
     final rawEpisodes = raw['episodes'] as List<dynamic>? ?? [];
     final episodes = rawEpisodes
         .map((e) => EpisodeModel.fromJson(e as Map<String, dynamic>))
         .toList();
 
-    // FIX 1: live episode count from the embedded list, not the stale DB field.
+    // Always use the LIVE count from the embedded episodes array.
+    // Never trust the 'episodeCount' field from the DB — it can be stale.
     final liveCount = episodes.length;
 
-    // FIX 2: total duration = sum of all episode durations (nulls treated as 0).
     final totalDuration = episodes.fold<int>(
       0,
       (sum, ep) => sum + (ep.duration ?? 0),
     );
 
-    // Build the JSON map for SeriesModel, overriding the stale DB fields.
     final seriesRaw = Map<String, dynamic>.from(raw)
       ..remove('episodes')
-      ..['episodeCount']         = liveCount
+      ..['episodeCount']         = liveCount      // override stale DB value
       ..['totalDurationSeconds'] = totalDuration;
 
     final series = SeriesModel.fromJson(seriesRaw);
@@ -70,27 +94,39 @@ _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
 }
 
 // ── _allSeriesRawProvider ─────────────────────────────────────────────────────
+//
+// FIX A: No ref.keepAlive() — provider auto-disposes when no screen is
+// watching it, ensuring fresh data on next navigation to StoriesScreen.
+//
+// FIX B: Cache-buster query param ?t=<minute> forces the server to bypass
+// its 5-minute NodeCache when a new minute has elapsed.
 
 final _allSeriesRawProvider =
     FutureProvider<_ParsedSeriesBatch>((ref) async {
-  ref.keepAlive();
+  // NO ref.keepAlive() here — allow auto-dispose so stale data doesn't persist.
 
   final dio = ref.watch(dioClientProvider);
 
+  // FIX B: Cache-buster — round to current minute so requests within the
+  // same minute share the same URL (and same in-flight dedup in DioClient),
+  // but a new minute always hits the server fresh.
+  final minuteEpoch =
+      DateTime.now().millisecondsSinceEpoch ~/ 60000;
+
   final response = await dio.get<Map<String, dynamic>>(
     ApiConstants.allSeriesWithEpisodes,
+    queryParameters: {'t': minuteEpoch},
   );
 
   final rawData = response['data'] as List<dynamic>? ?? [];
   final rawList = rawData.cast<Map<String, dynamic>>();
 
-  // Parse in background isolate — keeps main thread free for first frame paint.
   final parsed = await compute(
     _parseSeriesAndEpisodes,
     _SeriesParsePayload(rawList),
   );
 
-  // Yield so the first frame can paint before derived providers emit data.
+  // Yield so first frame paints before providers emit data.
   await Future.microtask(() {});
 
   return parsed;
@@ -99,7 +135,7 @@ final _allSeriesRawProvider =
 // ── Public providers ──────────────────────────────────────────────────────────
 
 final seriesListProvider = FutureProvider<List<SeriesModel>>((ref) async {
-  ref.keepAlive();
+  ref.keepAlive(); // keep list data while navigating between screens
   final batch = await ref.watch(_allSeriesRawProvider.future);
   await Future.microtask(() {});
   return batch.seriesList;

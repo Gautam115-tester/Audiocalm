@@ -268,3 +268,9 @@ router.delete('/:id', async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.invalidateAlbumCache = () => {
+  listCache.flushAll();
+  allWithSongCache.flushAll();
+  detailCache.flushAll();
+  songsCache.flushAll();
+};

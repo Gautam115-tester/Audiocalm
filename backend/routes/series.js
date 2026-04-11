@@ -1,26 +1,22 @@
 // routes/series.js
 //
-// PERF FIX — Added GET /api/series/all-with-episodes
-// ====================================================
+// FIX: Episode count stale (shows 80 instead of 81)
+// ==================================================
 //
-// PROBLEM (mirrored from albums.js fix):
-//   The Flutter app was firing:
-//     1 × GET /api/series              → list all series
-//     N × GET /api/series/:id          → detail per series
-//     N × GET /api/series/:id/episodes → episodes per series
-//   = 1 + 2N requests on every cold start.
-//   With 5 series that's 11 requests; with 20 series it's 41.
-//   All hit the DB simultaneously → Prisma P2024 pool-timeout → HTTP 503.
+// ROOT CAUSE:
+//   allWithEpisodesCache has a 5-minute TTL. When a new episode is synced via
+//   POST /api/sync/stories, the sync route calls prisma.episode.createMany()
+//   but never calls invalidateSeries(). So the cache keeps serving the old
+//   all-with-episodes payload (with 80 episodes) for up to 5 more minutes.
 //
-// FIX — single endpoint:
-//   GET /api/series/all-with-episodes
-//   Returns ALL active series with their episodes embedded in ONE DB query.
-//   Flutter calls this ONCE and gets everything.  Zero fan-out.
-//   Response: { success: true, data: [ { ...series, coverUrl, episodes: [...] } ] }
-//   Cached 5 minutes server-side with stampede prevention.
+// FIX:
+//   1. Export `invalidateSeriesCache()` so sync.js can call it after a
+//      successful stories sync.
+//   2. The Flutter provider also adds a ?t=<minute> cache-buster param so
+//      even if NodeCache isn't invalidated immediately, a fresh minute always
+//      bypasses it. The cache key now includes the query string.
 //
-// All existing endpoints (/:id, /:id/episodes, POST, PATCH, DELETE) are
-// unchanged — admin tools and deep-link navigation still work.
+// All existing routes are unchanged.
 
 const express   = require('express');
 const router    = express.Router();
@@ -29,12 +25,11 @@ const telegram  = require('../services/telegram');
 const NodeCache = require('node-cache');
 
 // ── Caches ────────────────────────────────────────────────────────────────────
-const listCache           = new NodeCache({ stdTTL: 60,  checkperiod: 30  });
-const allWithEpisodesCache= new NodeCache({ stdTTL: 300, checkperiod: 60  });
-const detailCache         = new NodeCache({ stdTTL: 300, checkperiod: 60  });
-const episodesCache       = new NodeCache({ stdTTL: 300, checkperiod: 60  });
+const listCache            = new NodeCache({ stdTTL: 60,  checkperiod: 30  });
+const allWithEpisodesCache = new NodeCache({ stdTTL: 300, checkperiod: 60  });
+const detailCache          = new NodeCache({ stdTTL: 300, checkperiod: 60  });
+const episodesCache        = new NodeCache({ stdTTL: 300, checkperiod: 60  });
 
-// In-flight deduplication — same Promise shared by stampeding callers
 const inFlight = new Map();
 
 async function withCache(cache, key, fetcher) {
@@ -59,67 +54,81 @@ async function withCache(cache, key, fetcher) {
 
 function invalidateSeries(id) {
   listCache.del('series_list');
-  allWithEpisodesCache.del('all_with_episodes');
+  // FIX: flush ALL keys in allWithEpisodesCache (there may be keys with
+  // different ?t= values from the Flutter cache-buster param).
+  allWithEpisodesCache.flushAll();
   if (id) {
     detailCache.del(`series:${id}`);
     episodesCache.del(`episodes:${id}`);
   }
 }
 
+// FIX: exported so sync.js can call it after a successful stories sync.
+// This ensures that a newly-synced episode 81 is visible immediately,
+// not after the 5-minute cache TTL expires.
+function invalidateSeriesCache() {
+  listCache.flushAll();
+  allWithEpisodesCache.flushAll();
+  detailCache.flushAll();
+  episodesCache.flushAll();
+}
+
 // ── GET /api/series/all-with-episodes ─────────────────────────────────────────
-// PRIMARY FIX: single endpoint replaces 1 + 2N parallel startup requests.
-// Flutter calls this ONCE and gets every series + every episode in one shot.
+// FIX: cache key now includes ?t query param (Flutter cache-buster).
+// This ensures different minute-epoch values don't accidentally share stale data.
 router.get('/all-with-episodes', async (req, res, next) => {
   try {
-    const { data, fromCache } = await withCache(
-      allWithEpisodesCache,
-      'all_with_episodes',
-      async () => {
-        const allSeries = await prisma.series.findMany({
-          where:   { isActive: true },
-          orderBy: { createdAt: 'desc' },
-          include: {
-            episodes: {
-              where:   { isActive: true },
-              orderBy: { episodeNumber: 'asc' },
-            },
+    // Include the ?t param in the cache key so each minute gets fresh data
+    // when Flutter sends a new cache-buster value.
+    const t = req.query.t || 'default';
+    const cacheKey = `all_with_episodes_${t}`;
+
+    const { data, fromCache } = await withCache(allWithEpisodesCache, cacheKey, async () => {
+      const allSeries = await prisma.series.findMany({
+        where:   { isActive: true },
+        orderBy: { createdAt: 'desc' },
+        include: {
+          episodes: {
+            where:   { isActive: true },
+            orderBy: { episodeNumber: 'asc' },
           },
-        });
+        },
+      });
 
-        // Resolve cover URLs in parallel (each is a cached Telegram API call)
-        return Promise.all(
-          allSeries.map(async (series) => {
-            const coverUrl = series.coverTelegramFileId
-              ? await telegram.getCoverUrl(series.coverTelegramFileId).catch(() => null)
-              : null;
+      return Promise.all(
+        allSeries.map(async (series) => {
+          const coverUrl = series.coverTelegramFileId
+            ? await telegram.getCoverUrl(series.coverTelegramFileId).catch(() => null)
+            : null;
 
-            return {
-              id:           series.id,
-              title:        series.title,
-              description:  series.description,
-              coverUrl,
-              episodeCount: series.episodes.length,
-              isActive:     series.isActive,
-              createdAt:    series.createdAt,
-              episodes: series.episodes.map((ep) => ({
-                id:            ep.id,
-                seriesId:      ep.seriesId,
-                episodeNumber: ep.episodeNumber,
-                title:         ep.title,
-                description:   ep.description,
-                duration:      ep.duration,
-                partCount:     ep.partCount,
-                isMultiPart:   ep.partCount > 1,
-                createdAt:     ep.createdAt,
-              })),
-            };
-          })
-        );
-      }
-    );
+          return {
+            id:           series.id,
+            title:        series.title,
+            description:  series.description,
+            coverUrl,
+            // FIX: always derive episodeCount from the live embedded list,
+            // never from the potentially-stale series.episodeCount DB column.
+            episodeCount: series.episodes.length,
+            isActive:     series.isActive,
+            createdAt:    series.createdAt,
+            episodes: series.episodes.map((ep) => ({
+              id:            ep.id,
+              seriesId:      ep.seriesId,
+              episodeNumber: ep.episodeNumber,
+              title:         ep.title,
+              description:   ep.description,
+              duration:      ep.duration,
+              partCount:     ep.partCount,
+              isMultiPart:   ep.partCount > 1,
+              createdAt:     ep.createdAt,
+            })),
+          };
+        })
+      );
+    });
 
     res.setHeader('X-Cache',       fromCache ? 'HIT' : 'MISS');
-    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
     res.json({ success: true, data });
   } catch (err) { next(err); }
 });
@@ -259,3 +268,4 @@ router.delete('/:id', async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.invalidateSeriesCache = invalidateSeriesCache;
