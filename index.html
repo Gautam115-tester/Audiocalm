@@ -117,6 +117,7 @@
     button.primary { background: var(--text); color: var(--bg); border-color: transparent; }
     button.primary:hover { opacity: 0.85; }
     button.danger  { background: var(--red-bg); color: var(--red-text); border-color: transparent; }
+    button.amber   { background: var(--amber-bg); color: var(--amber-text); border-color: transparent; }
 
     .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
 
@@ -195,11 +196,31 @@
       background: var(--green-bg); color: var(--green-text); display: none;
     }
 
+    /* fix-durations specific */
+    .dur-stat-row {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 14px;
+    }
+    .dur-stat {
+      background: var(--bg2); border-radius: var(--radius); padding: 12px;
+      text-align: center; border: 0.5px solid var(--border);
+    }
+    .dur-stat-num   { font-size: 22px; font-weight: 600; }
+    .dur-stat-num.green  { color: var(--green-text); }
+    .dur-stat-num.amber  { color: var(--amber-text); }
+    .dur-stat-num.plain  { color: var(--text); }
+    .dur-stat-label { font-size: 11px; color: var(--text3); margin-top: 3px; }
+
+    .note-box {
+      font-size: 12px; color: var(--amber-text); background: var(--amber-bg);
+      border-radius: var(--radius); padding: 10px 12px; margin-top: 12px; line-height: 1.6;
+    }
+
     @media (max-width: 540px) {
       .stat-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
       .btn-row   { flex-direction: column; }
       button     { width: 100%; }
       .compat-grid { grid-template-columns: 1fr; }
+      .dur-stat-row { grid-template-columns: repeat(3, 1fr); }
     }
   </style>
 </head>
@@ -313,6 +334,46 @@
     <div class="last-sync" id="last-sync"></div>
   </div>
 
+  <!-- ── Fix Durations ─────────────────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">Fix Missing Durations</span>
+      <button class="danger" style="font-size:12px;padding:5px 12px;" onclick="clearDurLog()">Clear log</button>
+    </div>
+    <div class="section-desc">
+      Downloads each audio part from Telegram → runs ffprobe → writes <strong>exact</strong> duration to DB.
+      Only episodes with duration = null or 0 are processed. Safe to run multiple times.
+    </div>
+
+    <div class="btn-row">
+      <button class="amber" onclick="runFixDurations()" id="btn-fix-dur">⏱ Fix durations</button>
+    </div>
+
+    <div class="dur-stat-row" id="dur-stats" style="display:none;">
+      <div class="dur-stat">
+        <div class="dur-stat-num green" id="dur-fixed">—</div>
+        <div class="dur-stat-label">Fixed</div>
+      </div>
+      <div class="dur-stat">
+        <div class="dur-stat-num amber" id="dur-skipped">—</div>
+        <div class="dur-stat-label">Skipped</div>
+      </div>
+      <div class="dur-stat">
+        <div class="dur-stat-num plain" id="dur-total">—</div>
+        <div class="dur-stat-label">Total found</div>
+      </div>
+    </div>
+
+    <div class="log-box" id="dur-log" style="display:none;">
+      <div class="log-line muted">Waiting…</div>
+    </div>
+
+    <div class="note-box">
+      ⚠ This downloads every affected audio file to the server /tmp to probe it.
+      May take several minutes if many episodes are missing duration.
+    </div>
+  </div>
+
   <!-- Compatibility check -->
   <div class="section">
     <div class="section-title">Flutter ↔ Backend compatibility</div>
@@ -408,7 +469,7 @@
   }
   function saveStats() { localStorage.setItem('sync_stats', JSON.stringify(stats)); }
 
-  /* ── Log ─────────────────────────────────────────────────────────────────── */
+  /* ── Log (sync) ──────────────────────────────────────────────────────────── */
   function addLog(type, msg) {
     const box  = document.getElementById('log');
     const line = document.createElement('div');
@@ -426,6 +487,27 @@
     document.getElementById('log').innerHTML = '<div class="log-line muted">Log cleared.</div>';
   }
 
+  /* ── Log (fix-durations) ─────────────────────────────────────────────────── */
+  function addDurLog(type, msg) {
+    const box  = document.getElementById('dur-log');
+    box.style.display = 'block';
+    const line = document.createElement('div');
+    line.className = 'log-line ' + type;
+    const t = new Date().toLocaleTimeString();
+    line.textContent = '[' + t + '] ' + msg;
+    if (box.children.length === 1 && box.children[0].classList.contains('muted')) {
+      box.innerHTML = '';
+    }
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+  }
+  function clearDurLog() {
+    const box = document.getElementById('dur-log');
+    box.innerHTML = '<div class="log-line muted">Log cleared.</div>';
+    box.style.display = 'none';
+    document.getElementById('dur-stats').style.display = 'none';
+  }
+
   /* ── Progress ────────────────────────────────────────────────────────────── */
   function setProgress(pct) {
     const wrap = document.getElementById('progress-wrap');
@@ -439,6 +521,62 @@
     ['btn-all','btn-music','btn-stories','btn-covers'].forEach((id) => {
       document.getElementById(id).disabled = dis;
     });
+  }
+
+  /* ── post helper ─────────────────────────────────────────────────────────── */
+  async function post(url) {
+    const apiKey = localStorage.getItem('sync_api_key') || '';
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['x-api-key'] = apiKey;
+    const res = await fetch(url, { method: 'POST', headers });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(res.status + ': ' + text.slice(0, 200));
+    }
+    return await res.json();
+  }
+
+  /* ── Fix Durations ───────────────────────────────────────────────────────── */
+  async function runFixDurations() {
+    const base = getBase();
+    if (!base) { addDurLog('err', 'Set backend URL first and click Save'); return; }
+    const apiKey = localStorage.getItem('sync_api_key') || '';
+    if (!apiKey) { addDurLog('err', 'Set API key first'); return; }
+
+    const btn = document.getElementById('btn-fix-dur');
+    btn.disabled = true;
+    btn.textContent = '⏳ Running…';
+
+    document.getElementById('dur-stats').style.display = 'none';
+    addDurLog('info', 'POST /api/sync/fix-durations …');
+    addDurLog('info', 'Downloading & probing audio files — this may take minutes…');
+
+    try {
+      const r = await post(base + '/api/sync/fix-durations');
+
+      if (r.message) {
+        // "All episodes already have duration" case
+        addDurLog('ok', '✓ ' + r.message);
+      } else {
+        addDurLog('ok',   '✓ Fixed:   ' + r.fixed);
+        if (r.skipped > 0)
+          addDurLog('warn', '⚠ Skipped: ' + r.skipped + ' (re-run to retry)');
+        else
+          addDurLog('info', '  Skipped: ' + r.skipped);
+        addDurLog('info', '  Total:   ' + r.total);
+
+        // show stat boxes
+        document.getElementById('dur-fixed').textContent   = r.fixed;
+        document.getElementById('dur-skipped').textContent = r.skipped;
+        document.getElementById('dur-total').textContent   = r.total;
+        document.getElementById('dur-stats').style.display = 'grid';
+      }
+    } catch (e) {
+      addDurLog('err', 'Error: ' + e.message);
+    }
+
+    btn.disabled = false;
+    btn.textContent = '⏱ Fix durations';
   }
 
   /* ── Sync ────────────────────────────────────────────────────────────────── */
@@ -539,22 +677,6 @@
     setTimeout(() => setProgress(null), 1000);
     running = false;
     setBtns(false);
-  }
-
-  async function post(url) {
-    const apiKey = localStorage.getItem('sync_api_key') || '';
-    const headers = { 'Content-Type': 'application/json' };
-    if (apiKey) headers['x-api-key'] = apiKey;
-
-    const res = await fetch(url, {
-      method:  'POST',
-      headers: headers,
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(res.status + ': ' + text.slice(0, 200));
-    }
-    return await res.json();
   }
 
   /* ── History ─────────────────────────────────────────────────────────────── */
