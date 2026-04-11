@@ -764,4 +764,149 @@ router.post('/reset', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── POST /api/sync/fix-durations ──────────────────────────────────────────────
+//
+// PURPOSE: Backfill EXACT duration for episodes synced from .aac/.m4a document-
+// type Telegram messages. Telegram does not provide duration metadata for
+// documents (only for audio-type messages), so duration ends up as null/0.
+//
+// HOW IT WORKS (only the duration column is ever written):
+//   1. Finds all episodes where duration IS NULL or duration = 0
+//   2. For each part's file_id:
+//      a. Calls Telegram getFile to get the temporary download URL
+//      b. Downloads the file to /tmp
+//      c. Runs ffprobe to read the EXACT duration from the file header
+//      d. Deletes the temp file immediately
+//   3. Sums exact durations across all parts, writes to duration column only
+//
+// SAFE TO RUN MULTIPLE TIMES — skips episodes that already have duration > 0.
+// Does NOT touch: title, telegramFileId, partCount, seriesId, episodeNumber.
+// Temp files are always cleaned up even if ffprobe fails.
+
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const fs  = require('fs');
+const execFileAsync = promisify(execFile);
+
+// Download a Telegram file to a temp path, return the path
+async function downloadToTemp(fileId) {
+  // Step 1: resolve file path from Telegram
+  const infoRes = await axios.get(`${TELEGRAM_API}/getFile`, {
+    params:  { file_id: fileId },
+    timeout: 15_000,
+  });
+  if (!infoRes.data.ok) throw new Error(`getFile failed: ${infoRes.data.description}`);
+  const filePath = infoRes.data.result?.file_path;
+  if (!filePath) throw new Error('getFile returned empty file_path');
+
+  const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  const ext         = filePath.split('.').pop() || 'audio';
+  const tempPath    = `/tmp/audiocalm_dur_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+
+  // Step 2: stream the file to disk
+  const writer = fs.createWriteStream(tempPath);
+  const dlRes  = await axios.get(downloadUrl, {
+    responseType: 'stream',
+    timeout:      120_000,
+  });
+  await new Promise((resolve, reject) => {
+    dlRes.data.pipe(writer);
+    writer.on('finish', resolve);
+    writer.on('error',  reject);
+    dlRes.data.on('error', reject);
+  });
+
+  return tempPath;
+}
+
+// Run ffprobe on a local file, return exact duration in seconds (integer)
+async function getExactDuration(filePath) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v',             'error',
+    '-show_entries',  'format=duration',
+    '-of',            'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ], { timeout: 30_000 });
+
+  const secs = parseFloat(stdout.trim());
+  if (isNaN(secs) || secs <= 0) throw new Error(`ffprobe returned invalid duration: "${stdout.trim()}"`);
+  return Math.round(secs);
+}
+
+router.post('/fix-durations', async (req, res, next) => {
+  try {
+    const broken = await prisma.episode.findMany({
+      where: {
+        OR: [{ duration: null }, { duration: 0 }],
+        telegramFileId: { not: null },
+      },
+      select: { id: true, telegramFileId: true, partCount: true, title: true, episodeNumber: true },
+    });
+
+    if (broken.length === 0) {
+      return res.json({ success: true, fixed: 0, message: 'All episodes already have duration.' });
+    }
+
+    console.log(`\n⏱️  [fix-durations] Found ${broken.length} episode(s) with missing duration — using ffprobe for exact values`);
+
+    let fixed   = 0;
+    let skipped = 0;
+
+    for (const ep of broken) {
+      // Parse file IDs
+      let fileIds = [];
+      const raw   = ep.telegramFileId;
+      if (raw.startsWith('[')) {
+        try { fileIds = JSON.parse(raw); } catch { fileIds = [raw]; }
+      } else {
+        fileIds = [raw];
+      }
+
+      let totalDuration = 0;
+      let allPartsOk    = true;
+
+      for (const fileId of fileIds) {
+        let tempPath = null;
+        try {
+          console.log(`  ⬇️  Downloading EP${ep.episodeNumber} part (fileId ${fileId.slice(0, 15)}…)`);
+          tempPath = await downloadToTemp(fileId);
+          const secs = await getExactDuration(tempPath);
+          totalDuration += secs;
+          console.log(`  🎵 Part duration: ${Math.floor(secs/60)}m${secs%60}s`);
+        } catch (err) {
+          console.warn(`  ⚠️  EP${ep.episodeNumber} part failed: ${err.message}`);
+          allPartsOk = false;
+        } finally {
+          // Always clean up the temp file
+          if (tempPath) {
+            try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+          }
+        }
+        // Brief pause between files to avoid Telegram rate limits
+        await new Promise((r) => setTimeout(r, 300));
+      }
+
+      if (totalDuration > 0) {
+        await prisma.episode.update({
+          where: { id: ep.id },
+          data:  { duration: totalDuration },
+        });
+        const mins = Math.floor(totalDuration / 60);
+        const secs = totalDuration % 60;
+        console.log(`  ✅ EP${ep.episodeNumber} "${ep.title}" → ${mins}m${secs}s (${fileIds.length} part(s)${!allPartsOk ? ', some parts failed' : ''})`);
+        fixed++;
+      } else {
+        console.warn(`  ❌ EP${ep.episodeNumber} "${ep.title}" — all parts failed, skipping`);
+        skipped++;
+      }
+    }
+
+    // Flush series cache so Flutter sees updated durations immediately
+    try { invalidateSeriesCache(); } catch (_) {}
+
+    console.log(`\n⏱️  [fix-durations] Done: ${fixed} fixed, ${skipped} skipped`);
+    res.json({ success: true, fixed, skipped, total: broken.length });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
