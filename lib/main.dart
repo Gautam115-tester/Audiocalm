@@ -1,42 +1,30 @@
 // lib/main.dart
 //
-// STARTUP SPEED FIXES
-// ===================
+// STARTUP SPEED FIXES (unchanged from previous version)
+// =====================================================
+// FIX 1 — Parallel Hive box opens via Future.wait()
+// FIX 2 — AudioService.init() overlapped with Hive init
+// FIX 3 — setPreferredOrientations deferred to post-first-frame
+// FIX 4 — Providers load faster because Hive is ready sooner
 //
-// Previous startup: ~5s before the app was interactive + ~10s for data.
-// After these changes: target <1.5s to first frame, <3s for data.
+// NEW — SPLASH SCREEN INTEGRATION
+// =================================
+// SplashNotifier is created here and passed to AudioCalmApp.
+// As each real init step completes, we call splashNotifier.advance(index).
+// The splash widget receives these events via a broadcast stream and
+// animates progress accordingly.
 //
-// FIX 1 — Parallel Hive box opens (saves ~300-500ms)
-//   The old code opened 7 boxes SEQUENTIALLY, each followed by a
-//   `Future.microtask(() {})` yield — that's 7 sequential async hops
-//   before the app even starts. Hive boxes are independent; there is no
-//   reason to open them one at a time.
-//   New approach: open all boxes with Future.wait() simultaneously.
-//   One microtask yield AFTER all boxes are open (to let the engine
-//   schedule the first frame) instead of 7 yields during opens.
-//
-// FIX 2 — Overlap audio service init with Hive (saves ~400-800ms)
-//   AudioService.init() registers a background isolate and does platform
-//   channel calls. This can take 400-800ms on cold start. Previously it
-//   ran AFTER Hive finished. Now both run in parallel via Future.wait().
-//   The ProviderScope receives the handler as soon as both are ready —
-//   net saving is the longer of (Hive time, audio init time) minus the
-//   max of both, which is always positive.
-//
-// FIX 3 — Removed SystemChrome.setPreferredOrientations from the hot path
-//   This call forces a window resize event, which flushes the render pipeline.
-//   It was running synchronously before Hive init, adding latency to the
-//   very first frame. Moved to a unawaited post-frame callback so it
-//   applies after the first frame is already on screen.
-//
-// FIX 4 — Provider data loads faster because Hive is ready sooner
-//   albumsListProvider and seriesListProvider both read from Hive (favorites,
-//   downloads, playback state) during their first build. The sooner Hive is
-//   open, the sooner these providers can complete. Combining FIX 1+2 means
-//   Hive is ready ~1s earlier than before, pulling the data screens forward
-//   by the same amount.
-//
-// The audio service config is unchanged.
+// Stage index map (must match _kStages in splash_screen.dart):
+//   0  → Hive.initFlutter() done
+//   1  → Adapter registered
+//   2  → All Hive boxes opened
+//   3  → Download registry loaded
+//   4  → AudioService.init() started
+//   5  → AudioService.init() complete
+//   6  → PlaybackPositionService ready
+//   7  → DownloadManager primed
+//   8  → App fully mounted, router ready
+//   9  → Ready (auto-advance after first frame)
 
 import 'dart:async';
 
@@ -49,14 +37,22 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'core/router/app_router.dart';
 import 'core/theme/app_theme.dart';
 import 'core/constants/app_constants.dart';
+import 'core/widgets/splash_screen.dart';          // ← NEW
 import 'features/player/services/audio_handler.dart';
 import 'features/player/providers/audio_player_provider.dart';
 import 'features/downloads/data/models/download_model.dart';
+import 'features/player/services/playback_position_service.dart';
+
+// ── Global splash notifier ─────────────────────────────────────────────────────
+// Created before runApp so init functions can call advance() before
+// the widget tree exists. The stream is broadcast so late subscribers
+// (the widget) still receive events.
+final SplashNotifier _splashNotifier = SplashNotifier();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Set status / nav bar style immediately — pure sync, zero cost.
+  // Instant sync — zero cost.
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor:                    Colors.transparent,
@@ -66,8 +62,7 @@ Future<void> main() async {
     ),
   );
 
-  // FIX 3: setPreferredOrientations triggers a window resize flush.
-  // Defer it until after the first frame so it never blocks startup.
+  // FIX 3: Defer orientation lock until after first frame.
   unawaited(WidgetsBinding.instance.endOfFrame.then((_) {
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
@@ -79,35 +74,46 @@ Future<void> main() async {
   // Both are I/O-bound; neither depends on the other during startup.
   final results = await Future.wait([
     _initHive(),
-    _initAudioServiceBackground(),
+    _initAudioService(),
   ]);
 
   final audioHandler = results[1] as AudioCalmHandler;
+
+  // Stage 6: PlaybackPositionService (pure Hive, fast)
+  await PlaybackPositionService.init();
+  _splashNotifier.advance(6);
+
+  // Stage 7: DownloadManager will self-prime when first read.
+  // We just signal the stage for UX continuity.
+  _splashNotifier.advance(7);
+
+  // Stage 8: App is mounting.
+  _splashNotifier.advance(8);
 
   runApp(
     ProviderScope(
       overrides: [
         audioHandlerProvider.overrideWithValue(audioHandler),
       ],
-      child: const AudioCalmApp(),
+      child: AudioCalmApp(splashNotifier: _splashNotifier),
     ),
   );
 }
 
-/// Opens all Hive boxes in parallel.
-/// Returns void — typed as Future<Object?> to satisfy Future.wait's
-/// homogeneous list requirement (we ignore the return value).
-Future<Object?> _initHive() async {
-  await Hive.initFlutter();
+// ─── Hive init ────────────────────────────────────────────────────────────────
 
-  // Register adapter once, synchronously — this is instant.
+Future<Object?> _initHive() async {
+  // Stage 0
+  await Hive.initFlutter();
+  _splashNotifier.advance(0);
+
+  // Stage 1
   if (!Hive.isAdapterRegistered(0)) {
     Hive.registerAdapter(DownloadModelAdapter());
   }
+  _splashNotifier.advance(1);
 
-  // FIX 1: Open all boxes simultaneously instead of sequentially.
-  // Hive uses separate file handles per box — opening them in parallel
-  // is safe and saves (N-1) × round-trip latency vs the old sequential loop.
+  // Stage 2: Open all boxes simultaneously.
   const boxes = [
     AppConstants.downloadsBox,
     AppConstants.favoritesBox,
@@ -117,17 +123,28 @@ Future<Object?> _initHive() async {
     AppConstants.completedEpisodesBox,
     'playback_positions_box',
   ];
-
   await Future.wait(boxes.map(Hive.openBox));
+  _splashNotifier.advance(2);
 
-  // Single yield AFTER all boxes are open — lets the engine schedule
-  // the first frame without the 7 sequential yields we had before.
+  // Single microtask yield after all boxes open.
   await Future.microtask(() {});
+
+  // Stage 3: Download registry is now accessible (DownloadManager reads on
+  // first access; we just signal the stage here for visual completeness).
+  _splashNotifier.advance(3);
+
   return null;
 }
 
-Future<AudioCalmHandler> _initAudioServiceBackground() async {
-  return AudioService.init(
+// ─── Audio service init ───────────────────────────────────────────────────────
+
+Future<AudioCalmHandler> _initAudioService() async {
+  // Stage 4: signal that we've started audio init.
+  // (advance(4) is fired even though _initHive might still be running —
+  // the notifier is broadcast; the splash will process both when it mounts.)
+  _splashNotifier.advance(4);
+
+  final handler = await AudioService.init(
     builder: () => AudioCalmHandler(),
     config: const AudioServiceConfig(
       androidNotificationChannelId:
@@ -141,10 +158,41 @@ Future<AudioCalmHandler> _initAudioServiceBackground() async {
       artDownscaleWidth:               200,
     ),
   );
+
+  // Stage 5: AudioService fully ready.
+  _splashNotifier.advance(5);
+  return handler;
 }
 
-class AudioCalmApp extends StatelessWidget {
-  const AudioCalmApp({super.key});
+// ─── Root app widget ──────────────────────────────────────────────────────────
+
+class AudioCalmApp extends StatefulWidget {
+  final SplashNotifier splashNotifier;
+
+  const AudioCalmApp({super.key, required this.splashNotifier});
+
+  @override
+  State<AudioCalmApp> createState() => _AudioCalmAppState();
+}
+
+class _AudioCalmAppState extends State<AudioCalmApp> {
+  bool _splashDone = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // After the first frame the app is truly interactive.
+    // Fire stage 9 (Ready) and dismiss the splash after a brief hold
+    // so the user can see the 100% state.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.splashNotifier.advance(9);           // → 100% "Ready"
+
+      Future.delayed(const Duration(milliseconds: 900), () {
+        if (mounted) setState(() => _splashDone = true);
+      });
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -156,9 +204,36 @@ class AudioCalmApp extends StatelessWidget {
       showPerformanceOverlay:     false,
       builder: (context, child) {
         return RepaintBoundary(
-          child: child ?? const SizedBox.shrink(),
+          child: Stack(
+            children: [
+              // Main app content
+              child ?? const SizedBox.shrink(),
+
+              // Splash overlay — fades out when _splashDone = true
+              AnimatedOpacity(
+                opacity: _splashDone ? 0.0 : 1.0,
+                duration: const Duration(milliseconds: 600),
+                curve: Curves.easeOut,
+                onEnd: () {
+                  // No rebuild needed — opacity 0 + IgnorePointer is sufficient.
+                },
+                child: IgnorePointer(
+                  ignoring: _splashDone,
+                  child: _splashDone
+                      ? const SizedBox.shrink()   // remove from tree after fade
+                      : SplashScreen(notifier: widget.splashNotifier),
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
+  }
+
+  @override
+  void dispose() {
+    widget.splashNotifier.dispose();
+    super.dispose();
   }
 }
