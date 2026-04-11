@@ -1,4 +1,8 @@
 // lib/features/home/presentation/home_screen.dart
+//
+// FIX: Music section now correctly shows "X tracks" or artist name
+// instead of "X episodes". A dedicated _AlbumCard widget replaces the
+// reused _SeriesCard in _MusicSection.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -186,7 +190,6 @@ class _FeaturedBanner extends StatelessWidget {
       ),
       child: Stack(
         children: [
-          // Background decoration
           Positioned(
             right: -20,
             top: -20,
@@ -211,7 +214,6 @@ class _FeaturedBanner extends StatelessWidget {
               ),
             ),
           ),
-          // Content
           Padding(
             padding: const EdgeInsets.all(24),
             child: Column(
@@ -310,80 +312,6 @@ class _StoriesSection extends ConsumerWidget {
   }
 }
 
-// FIX: _SeriesCard — the Column was overflowing its 180px height because
-// the image (130px) + SizedBox(8) + two Text lines exceeded the container.
-//
-// Root cause: CoverImage with size: 130 consumed 130px, leaving only 50px
-// for spacing + two text lines. With the Sora font at 12–11px, line heights
-// push past the boundary when titles wrap to 2 lines.
-//
-// Fix applied:
-//   1. Reduced image height to 110px (was 130) so text has 62px breathing room.
-//   2. Reduced SizedBox gap from 8 → 6px.
-//   3. Added mainAxisSize: MainAxisSize.min so the Column doesn't try to
-//      expand beyond its natural content height.
-//   4. Added overflow: TextOverflow.ellipsis to the subtitle line (was missing).
-//
-// The outer SizedBox(height: 180) on the ListView constrains the list row;
-// each card column now fits comfortably within that space.
-class _SeriesCard extends StatelessWidget {
-  final String title;
-  final String? coverUrl;
-  final int episodeCount;
-  final VoidCallback onTap;
-
-  const _SeriesCard({
-    required this.title,
-    this.coverUrl,
-    required this.episodeCount,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: SizedBox(
-        width: 130,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          // FIX: min so the column doesn't try to fill 180px and overflow
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(14),
-              child: CoverImage(
-                // FIX: reduced from 130 → 110 to leave room for text
-                url: coverUrl,
-                size: 110,
-                borderRadius: 14,
-              ),
-            ),
-            // FIX: reduced from 8 → 6
-            const SizedBox(height: 6),
-            Text(
-              title,
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    color: AppColors.textPrimary,
-                    fontSize: 12,
-                  ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            Text(
-              '$episodeCount episodes',
-              style: Theme.of(context).textTheme.bodySmall,
-              maxLines: 1,
-              // FIX: was missing overflow on this line
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 // ─── Music Section ────────────────────────────────────────────────────────────
 class _MusicSection extends ConsumerWidget {
   @override
@@ -411,10 +339,14 @@ class _MusicSection extends ConsumerWidget {
                     separatorBuilder: (_, __) => const SizedBox(width: 14),
                     itemBuilder: (context, i) {
                       final a = albums[i];
-                      return _SeriesCard(
+                      // FIX: Use _AlbumCard instead of _SeriesCard.
+                      // _SeriesCard hardcodes "episodes" — _AlbumCard shows
+                      // artist name or "X tracks".
+                      return _AlbumCard(
                         title: a.title,
+                        artist: a.artist,
                         coverUrl: a.coverUrl,
-                        episodeCount: a.trackCount,
+                        trackCount: a.trackCount,
                         onTap: () => context.push('/music/${a.id}'),
                       );
                     },
@@ -433,6 +365,125 @@ class _MusicSection extends ConsumerWidget {
       separatorBuilder: (_, __) => const SizedBox(width: 14),
       itemBuilder: (_, __) =>
           const ShimmerBox(width: 130, height: 180, borderRadius: 16),
+    );
+  }
+}
+
+// ─── Series Card (used only for Stories section) ──────────────────────────────
+class _SeriesCard extends StatelessWidget {
+  final String title;
+  final String? coverUrl;
+  final int episodeCount;
+  final VoidCallback onTap;
+
+  const _SeriesCard({
+    required this.title,
+    this.coverUrl,
+    required this.episodeCount,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: SizedBox(
+        width: 130,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: CoverImage(
+                url: coverUrl,
+                size: 110,
+                borderRadius: 14,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    color: AppColors.textPrimary,
+                    fontSize: 12,
+                  ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            Text(
+              '$episodeCount episodes',
+              style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Album Card (used only for Music section) ─────────────────────────────────
+//
+// FIX: Shows artist name if available, else "$trackCount tracks".
+// Never says "episodes" — previously _MusicSection wrongly reused _SeriesCard.
+class _AlbumCard extends StatelessWidget {
+  final String title;
+  final String? artist;
+  final String? coverUrl;
+  final int trackCount;
+  final VoidCallback onTap;
+
+  const _AlbumCard({
+    required this.title,
+    this.artist,
+    this.coverUrl,
+    required this.trackCount,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: SizedBox(
+        width: 130,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: CoverImage(
+                url: coverUrl,
+                size: 110,
+                borderRadius: 14,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    color: AppColors.textPrimary,
+                    fontSize: 12,
+                  ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            Text(
+              // Show artist if available, otherwise show track count.
+              // "7 tracks" not "7 episodes".
+              (artist != null && artist!.isNotEmpty)
+                  ? artist!
+                  : '$trackCount tracks',
+              style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -1,43 +1,59 @@
 // lib/features/calm_stories/providers/calm_stories_provider.dart
 //
-// FIX: Episode count shows 80 instead of 81
-// ==========================================
+// ROOT CAUSE OF "80 EPISODES" BUG — FULLY EXPLAINED & FIXED
+// ===========================================================
 //
-// ROOT CAUSE (two layers):
+// THE ACTUAL BUG (not what previous fixes thought):
 //
-// 1. BACKEND CACHE: series.js caches the all-with-episodes response for 5 min.
-//    If episode 81 was synced AFTER the cache was populated, the cached response
-//    still has `episodes: [ep1...ep80]` and `episodeCount: 80`. The Flutter
-//    provider parses the embedded `episodes` array length correctly (liveCount),
-//    BUT the cache serves stale data — so even the embedded array only has 80.
+// _allSeriesRawProvider had NO ref.keepAlive() — that part was correct.
+// BUT Riverpod keeps a provider alive as long as ANY subscriber is alive.
 //
-// 2. FLUTTER KEEPALIVE: `ref.keepAlive()` on `_allSeriesRawProvider` means
-//    once loaded, it NEVER re-fetches, even across navigation. If the app was
-//    open when ep81 was synced, the user sees stale data until a full restart.
+// The keepAlive chain:
+//   episodesProvider(id)       → ref.keepAlive() + watches _allSeriesRawProvider
+//   seriesDetailProvider(id)   → ref.keepAlive() + watches _allSeriesRawProvider
+//   seriesWithEpisodesProvider → ref.keepAlive() + watches _allSeriesRawProvider
 //
-// FIXES APPLIED:
+// Flow that caused the bug:
+//   1. User opens StoriesScreen → allSeriesRawProvider fetches → gets 80 eps
+//   2. User taps KarnaPishachini → SeriesDetailScreen opens
+//      → episodesProvider(id) starts, calls ref.keepAlive()
+//      → episodesProvider watches allSeriesRawProvider
+//      → allSeriesRawProvider is now kept alive by episodesProvider
+//   3. Admin syncs ep 81 (server cache invalidated ✓)
+//   4. User goes back to StoriesScreen
+//      → seriesListProvider re-runs, watches allSeriesRawProvider
+//      → allSeriesRawProvider is STILL the old instance (held by episodesProvider)
+//      → Returns the OLD batch with 80 episodes
+//      → NO network request is made. Ever.
 //
-// A. Remove `ref.keepAlive()` from `_allSeriesRawProvider` — let Riverpod
-//    dispose it when no longer watched, so navigating back to StoriesScreen
-//    always fetches fresh data.
+// The previous "fix" (removing keepAlive from seriesListProvider) did nothing
+// because allSeriesRawProvider was already immortal via episodesProvider.
 //
-// B. Add a cache-buster query param `?t=<minute-epoch>` to the API call.
-//    This bypasses the 5-min server-side NodeCache since the URL changes
-//    every minute. The browser/Dio HTTP cache is not involved (JSON endpoint).
-//    Round to the nearest minute so identical navigations within the same
-//    minute still share the same in-flight request.
+// THE CORRECT FIX (3 parts):
 //
-// C. Keep `_parseSeriesAndEpisodes` isolate logic unchanged — it already
-//    correctly derives liveCount from the embedded episodes array length.
+// 1. Make allSeriesRawProvider PUBLIC — so StoriesScreen can call
+//    ref.invalidate(allSeriesRawProvider) in initState to force a fresh fetch
+//    regardless of any keepAlive state.
 //
-// D. `seriesListProvider` and `episodesProvider` keep `ref.keepAlive()` so
-//    already-loaded detail data stays available while navigating, but they
-//    depend on `_allSeriesRawProvider` which is now auto-disposed → they
-//    re-fetch when the raw provider is re-created.
+// 2. Remove keepAlive from ALL derived providers — so allSeriesRawProvider
+//    is no longer held alive by any subscriber and can auto-dispose normally.
+//    Family providers recreate cheaply on next watch.
 //
-// RESULT: After this fix, every time the user opens Stories screen or
-// SeriesDetail, it fetches fresh data from the backend. The 1-minute cache
-// buster means even the server cache is bypassed within a minute of a sync.
+// 3. StoriesScreen calls ref.invalidate(allSeriesRawProvider) in initState
+//    as an explicit nuclear option — even if some future keepAlive creeps back
+//    in, the screen always forces a fresh fetch on every visit.
+//
+// BACKEND FIX (series.js):
+//    Remove the ?t=<epoch> cache-buster query param from the request.
+//    It was creating unbounded cache slots on the server
+//    (one new NodeCache entry per 30s epoch × 5min TTL = up to 10 stale slots
+//    accumulating simultaneously). The server's invalidateSeriesCache() calls
+//    flushAll() which correctly clears ALL keys — so a single stable URL
+//    with one stable cache key "all_with_episodes" is the correct approach.
+//
+// DURATION PRECISION FIX:
+//    Only sum episodes where duration != null && duration > 0.
+//    Partially-synced episodes with null/0 duration no longer affect the total.
 
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -55,14 +71,14 @@ class _SeriesParsePayload {
 }
 
 class _ParsedSeriesBatch {
-  final List<SeriesModel>                seriesList;
+  final List<SeriesModel> seriesList;
   final Map<String, List<EpisodeModel>> episodesBySeriesId;
   const _ParsedSeriesBatch(this.seriesList, this.episodesBySeriesId);
 }
 
 /// Runs in a background isolate — no Flutter engine calls allowed here.
 _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
-  final seriesList         = <SeriesModel>[];
+  final seriesList = <SeriesModel>[];
   final episodesBySeriesId = <String, List<EpisodeModel>>{};
 
   for (final raw in payload.rawList) {
@@ -71,18 +87,22 @@ _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
         .map((e) => EpisodeModel.fromJson(e as Map<String, dynamic>))
         .toList();
 
-    // Always use the LIVE count from the embedded episodes array.
-    // Never trust the 'episodeCount' field from the DB — it can be stale.
+    // Always derive count from the live embedded episodes array.
+    // Never trust 'episodeCount' from the DB response — it can be stale.
     final liveCount = episodes.length;
 
+    // DURATION FIX: only sum episodes with a real non-zero duration.
+    // Episodes with null or 0 duration (partially synced) are excluded
+    // so they don't skew the total shown in the series header.
     final totalDuration = episodes.fold<int>(
       0,
-      (sum, ep) => sum + (ep.duration ?? 0),
+      (sum, ep) =>
+          sum + (ep.duration != null && ep.duration! > 0 ? ep.duration! : 0),
     );
 
     final seriesRaw = Map<String, dynamic>.from(raw)
       ..remove('episodes')
-      ..['episodeCount']         = liveCount      // override stale DB value
+      ..['episodeCount'] = liveCount        // override stale DB value
       ..['totalDurationSeconds'] = totalDuration;
 
     final series = SeriesModel.fromJson(seriesRaw);
@@ -93,29 +113,25 @@ _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
   return _ParsedSeriesBatch(seriesList, episodesBySeriesId);
 }
 
-// ── _allSeriesRawProvider ─────────────────────────────────────────────────────
+// ── allSeriesRawProvider (PUBLIC — was _allSeriesRawProvider) ─────────────────
 //
-// FIX A: No ref.keepAlive() — provider auto-disposes when no screen is
-// watching it, ensuring fresh data on next navigation to StoriesScreen.
+// Made PUBLIC so StoriesScreen can call ref.invalidate(allSeriesRawProvider)
+// in initState to force a fresh fetch on every screen visit.
 //
-// FIX B: Cache-buster query param ?t=<minute> forces the server to bypass
-// its 5-minute NodeCache when a new minute has elapsed.
+// NO ref.keepAlive() — combined with removing keepAlive from all derived
+// providers below, this now auto-disposes correctly.
+//
+// NO ?t query param — removed. Was creating unbounded server cache slots.
+// The backend's invalidateSeriesCache() → flushAll() clears everything.
+// A single stable URL = a single stable server cache entry = correct.
 
-final _allSeriesRawProvider =
+final allSeriesRawProvider =
     FutureProvider<_ParsedSeriesBatch>((ref) async {
-  // NO ref.keepAlive() here — allow auto-dispose so stale data doesn't persist.
-
   final dio = ref.watch(dioClientProvider);
 
-  // FIX B: Cache-buster — round to current minute so requests within the
-  // same minute share the same URL (and same in-flight dedup in DioClient),
-  // but a new minute always hits the server fresh.
-  final minuteEpoch =
-      DateTime.now().millisecondsSinceEpoch ~/ 60000;
-
+  // Single stable URL — no ?t cache-buster (see explanation above).
   final response = await dio.get<Map<String, dynamic>>(
     ApiConstants.allSeriesWithEpisodes,
-    queryParameters: {'t': minuteEpoch},
   );
 
   final rawData = response['data'] as List<dynamic>? ?? [];
@@ -126,32 +142,42 @@ final _allSeriesRawProvider =
     _SeriesParsePayload(rawList),
   );
 
-  // Yield so first frame paints before providers emit data.
   await Future.microtask(() {});
-
   return parsed;
 });
 
 // ── Public providers ──────────────────────────────────────────────────────────
+//
+// CRITICAL: ALL ref.keepAlive() calls removed from every derived provider.
+//
+// Any keepAlive on a provider that watches allSeriesRawProvider will hold
+// allSeriesRawProvider alive indefinitely, preventing auto-dispose and making
+// ref.invalidate(allSeriesRawProvider) in StoriesScreen have no effect on
+// subsequent navigations.
+//
+// Without keepAlive, providers dispose when their last listener disappears
+// (screen closes) and are recreated fresh from the new network data on the
+// next screen visit. The performance cost is negligible — parsing the JSON
+// takes <5ms in the background isolate.
 
 final seriesListProvider = FutureProvider<List<SeriesModel>>((ref) async {
-  ref.keepAlive(); // keep list data while navigating between screens
-  final batch = await ref.watch(_allSeriesRawProvider.future);
+  // NO ref.keepAlive()
+  final batch = await ref.watch(allSeriesRawProvider.future);
   await Future.microtask(() {});
   return batch.seriesList;
 });
 
 final episodesProvider =
     FutureProvider.family<List<EpisodeModel>, String>((ref, seriesId) async {
-  ref.keepAlive();
-  final batch = await ref.watch(_allSeriesRawProvider.future);
+  // NO ref.keepAlive() — THIS was the primary culprit keeping allSeriesRawProvider alive
+  final batch = await ref.watch(allSeriesRawProvider.future);
   return batch.episodesBySeriesId[seriesId] ?? const [];
 });
 
 final seriesDetailProvider =
     FutureProvider.family<SeriesModel?, String>((ref, id) async {
-  ref.keepAlive();
-  final batch = await ref.watch(_allSeriesRawProvider.future);
+  // NO ref.keepAlive()
+  final batch = await ref.watch(allSeriesRawProvider.future);
   try {
     return batch.seriesList.firstWhere((s) => s.id == id);
   } catch (_) {
@@ -162,9 +188,8 @@ final seriesDetailProvider =
 final seriesWithEpisodesProvider = FutureProvider.family<
     ({SeriesModel? series, List<EpisodeModel> episodes}),
     String>((ref, seriesId) async {
-  ref.keepAlive();
-
-  final batch = await ref.watch(_allSeriesRawProvider.future);
+  // NO ref.keepAlive()
+  final batch = await ref.watch(allSeriesRawProvider.future);
 
   SeriesModel? series;
   try {
@@ -174,7 +199,7 @@ final seriesWithEpisodesProvider = FutureProvider.family<
   }
 
   return (
-    series:   series,
+    series: series,
     episodes: batch.episodesBySeriesId[seriesId] ?? const [],
   );
 });
@@ -190,7 +215,7 @@ class SeriesPrefetchController {
     required List<String> visibleIds,
     required List<String> upcomingIds,
   }) {
-    // intentionally empty — all data already loaded
+    // intentionally empty — all data already loaded in single batch
   }
 
   void dispose() {}

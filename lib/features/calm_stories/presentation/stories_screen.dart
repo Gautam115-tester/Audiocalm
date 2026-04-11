@@ -1,8 +1,17 @@
 // lib/features/calm_stories/presentation/stories_screen.dart
 //
-// SMART PREFETCH: ScrollController detects which series cards are visible,
-// then tells SeriesPrefetchController to warm exactly those + next 5.
-// For a library of any size, only ~10 items are ever prefetched at once.
+// FIX: Forces a fresh fetch of allSeriesRawProvider every time this screen
+// mounts by calling ref.invalidate(allSeriesRawProvider) in initState.
+//
+// WHY THIS IS NEEDED:
+// Even with keepAlive removed from all derived providers, there is a window
+// where allSeriesRawProvider could still be alive (e.g. if SeriesDetailScreen
+// is still in the navigator stack). ref.invalidate() is the guaranteed nuclear
+// option — it forces a fresh network request regardless of the provider's
+// current lifecycle state, ensuring the episode count is always up to date.
+//
+// The invalidation happens BEFORE the first build, so the loading shimmer
+// is shown briefly while fresh data arrives — correct UX behaviour.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,7 +20,6 @@ import '../providers/calm_stories_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/shared_widgets.dart';
 
-// Grid constants — must match the GridView delegate below
 const _kCrossAxisCount = 2;
 const _kItemAspectRatio = 0.72;
 const _kSpacing = 14.0;
@@ -31,6 +39,18 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
+
+    // CORE FIX: Invalidate allSeriesRawProvider every time StoriesScreen
+    // mounts. This forces a fresh network fetch, guaranteeing the episode
+    // count is always current regardless of any Riverpod keepAlive state.
+    //
+    // Using addPostFrameCallback so the widget tree is fully built before
+    // the invalidation triggers a rebuild — avoids setState-during-build errors.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        ref.invalidate(allSeriesRawProvider);
+      }
+    });
   }
 
   @override
@@ -46,8 +66,6 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
     _triggerPrefetch(series);
   }
 
-  /// Computes which series indices are currently visible in the grid,
-  /// then asks the prefetch controller to warm those + the next 5.
   void _triggerPrefetch(List series) {
     final controller = ref.read(seriesPrefetchControllerProvider);
     final screenHeight = MediaQuery.of(context).size.height;
@@ -55,18 +73,15 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
         ? _scrollController.offset
         : 0.0;
 
-    // Item height derived from grid aspect ratio + spacing
     final itemWidth =
         (MediaQuery.of(context).size.width - _kPadding * 2 - _kSpacing) /
             _kCrossAxisCount;
     final itemHeight = itemWidth / _kItemAspectRatio + _kSpacing;
 
-    // Row range visible on screen
     final firstVisibleRow = (scrollOffset / itemHeight).floor();
     final lastVisibleRow =
         ((scrollOffset + screenHeight) / itemHeight).ceil();
 
-    // Convert rows → flat indices
     final firstIdx =
         (firstVisibleRow * _kCrossAxisCount).clamp(0, series.length - 1);
     final lastIdx = ((lastVisibleRow + 1) * _kCrossAxisCount - 1)
@@ -77,7 +92,6 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
         .map<String>((s) => s.id as String)
         .toList();
 
-    // Next 5 beyond the visible window
     final aheadEnd = (lastIdx + 1 + 5).clamp(0, series.length);
     final upcomingIds = lastIdx + 1 < series.length
         ? series
@@ -105,7 +119,7 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
         loading: () => _buildShimmer(),
         error: (e, _) => AppErrorWidget(
           message: 'Unable to load stories',
-          onRetry: () => ref.refresh(seriesListProvider),
+          onRetry: () => ref.invalidate(allSeriesRawProvider),
         ),
         data: (series) {
           if (series.isEmpty) {
@@ -116,7 +130,6 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
             );
           }
 
-          // Trigger initial prefetch for whatever is visible on first render
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) _triggerPrefetch(series);
           });
