@@ -1,23 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  FIXES IN THIS VERSION
-  =====================
-
-  1. enableOnBackInvokedCallback="true" (FIX for W/WindowOnBackDispatcher warning)
-     The logs showed: "OnBackInvokedCallback is not enabled for the application.
-     Set android:enableOnBackInvokedCallback=true in the application manifest."
-     Added to <application> tag. Required for Android 13+ predictive back gesture.
-
-  2. Removed android:largeHeap="true" from <application>
-     largeHeap increases the max heap but also tells Android your app is a
-     memory hog — the OS is less likely to keep it in memory when backgrounded,
-     causing cold-start re-initialisation. For an audio app using just_audio +
-     a few images, the default heap is sufficient. BLASTBufferQueue errors
-     are not caused by heap size and largeHeap doesn't help them.
-
-  3. Added android:enableOnBackInvokedCallback="true" to stop logcat warning spam.
-     Each warning line contributes to UI thread pressure on low-end devices.
--->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.audiocalm.app">
 
@@ -52,12 +33,9 @@
         android:label="Audio Calm"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="true"
         android:hardwareAccelerated="true"
-        android:enableOnBackInvokedCallback="true">
-        <!-- FIX: enableOnBackInvokedCallback stops W/WindowOnBackDispatcher warning spam -->
-        <!-- FIX: Removed android:largeHeap="true" — hurts background keep-alive -->
+        android:largeHeap="true">
 
         <activity
             android:name=".MainActivity"
