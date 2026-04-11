@@ -1,24 +1,21 @@
 // lib/features/calm_stories/presentation/series_detail_screen.dart
 //
-// MULTI-PART DISPLAY FIX:
-// Episodes can be single-file or multi-part (partCount > 1).
-// The DB stores:
-//   duration  = TOTAL seconds across all parts (e.g. 446+347 = 793)
-//   partCount = number of parts
-//   title     = "Episode 1"  (NOT "Episode 1 Part 1/2")
-//
-// This screen shows:
-//   • "Episode 1"  as the title (clean, no part suffix)
-//   • "13:13"      as the duration (combined)
-//   • No visual indication of parts — the player handles seamless playback
-//
-// Download / favorites / progress ring fixes are unchanged from previous version.
+// CHANGES IN THIS VERSION
+// =======================
+// 1. Header shows LIVE episode count (from the embedded list, not the stale
+//    DB field) and total series duration, e.g. "81 episodes · 14h 23m".
+// 2. Episode tiles show a teal "done" badge when the user has completed that
+//    episode. Works for online streaming and offline playback.
+//    The episode number badge also gets a green check circle overlay.
+// 3. Long-pressing the favourite button on a completed episode marks it
+//    incomplete again (in case the user wants to re-listen).
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../data/models/episode_model.dart';
 import '../data/models/series_model.dart';
 import '../providers/calm_stories_provider.dart';
+import '../providers/completed_episodes_provider.dart';
 import '../../player/providers/audio_player_provider.dart';
 import '../../player/domain/media_item_model.dart';
 import '../../downloads/data/services/download_manager.dart';
@@ -34,23 +31,44 @@ class SeriesDetailScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final seriesAsync  = ref.watch(seriesDetailProvider(seriesId));
+    final seriesAsync   = ref.watch(seriesDetailProvider(seriesId));
     final episodesAsync = ref.watch(episodesProvider(seriesId));
 
     return Scaffold(
       backgroundColor: AppColors.background,
       body: CustomScrollView(
         slivers: [
-          seriesAsync.when(
-            loading: () => const SliverToBoxAdapter(
-              child: SizedBox(height: 280, child: ShimmerBox(height: 280)),
+          // Build the header once episodes are loaded so we can use the live count.
+          episodesAsync.when(
+            loading: () => seriesAsync.when(
+              loading: () => const SliverToBoxAdapter(
+                child: SizedBox(height: 280, child: ShimmerBox(height: 280)),
+              ),
+              error: (_, __) => const SliverToBoxAdapter(child: SizedBox.shrink()),
+              data: (series) => series != null
+                  ? _SeriesHeader(
+                      series:           series,
+                      liveEpisodeCount: 0,
+                      liveEpisodes:     const [],
+                    )
+                  : const SliverToBoxAdapter(child: SizedBox.shrink()),
             ),
-            error: (_, __) =>
-                const SliverToBoxAdapter(child: SizedBox.shrink()),
-            data: (series) => series != null
-                ? _SeriesHeader(series: series)
-                : const SliverToBoxAdapter(child: SizedBox.shrink()),
+            error: (_, __) => const SliverToBoxAdapter(child: SizedBox.shrink()),
+            data: (episodes) => seriesAsync.when(
+              loading: () => const SliverToBoxAdapter(
+                child: SizedBox(height: 280, child: ShimmerBox(height: 280)),
+              ),
+              error: (_, __) => const SliverToBoxAdapter(child: SizedBox.shrink()),
+              data: (series) => series != null
+                  ? _SeriesHeader(
+                      series:           series,
+                      liveEpisodeCount: episodes.length,   // FIX 1
+                      liveEpisodes:     episodes,           // FIX 2 (for duration)
+                    )
+                  : const SliverToBoxAdapter(child: SizedBox.shrink()),
+            ),
           ),
+
           episodesAsync.when(
             loading: () => SliverList(
               delegate: SliverChildBuilderDelegate(
@@ -65,8 +83,8 @@ class SeriesDetailScreen extends ConsumerWidget {
               if (episodes.isEmpty) {
                 return const SliverToBoxAdapter(
                   child: EmptyStateWidget(
-                    icon: Icons.headphones_rounded,
-                    title: 'No Episodes Yet',
+                    icon:     Icons.headphones_rounded,
+                    title:    'No Episodes Yet',
                     subtitle: 'Episodes will appear here after syncing',
                   ),
                 );
@@ -79,13 +97,14 @@ class SeriesDetailScreen extends ConsumerWidget {
                     seriesAsync: seriesAsync,
                     index:       i,
                   ),
-                  childCount:            episodes.length,
+                  childCount:             episodes.length,
                   addAutomaticKeepAlives: false,
                   addRepaintBoundaries:   true,
                 ),
               );
             },
           ),
+
           const SliverToBoxAdapter(child: SizedBox(height: 120)),
         ],
       ),
@@ -96,11 +115,35 @@ class SeriesDetailScreen extends ConsumerWidget {
 // ── Series header ─────────────────────────────────────────────────────────────
 
 class _SeriesHeader extends StatelessWidget {
-  final SeriesModel series;
-  const _SeriesHeader({required this.series});
+  final SeriesModel        series;
+  final int                liveEpisodeCount;
+  final List<EpisodeModel> liveEpisodes;
+
+  const _SeriesHeader({
+    required this.series,
+    required this.liveEpisodeCount,
+    required this.liveEpisodes,
+  });
+
+  /// Compute total duration from the live episode list (most accurate).
+  String get _totalDuration {
+    if (liveEpisodes.isEmpty) return series.formattedTotalDuration;
+    final total = liveEpisodes.fold<int>(0, (s, ep) => s + (ep.duration ?? 0));
+    if (total <= 0) return series.formattedTotalDuration;
+    final h = total ~/ 3600;
+    final m = (total % 3600) ~/ 60;
+    if (h > 0 && m > 0) return '${h}h ${m}m';
+    if (h > 0) return '${h}h';
+    if (m > 0) return '${m}m';
+    return '';
+  }
 
   @override
   Widget build(BuildContext context) {
+    // Prefer live count; fall back to the pre-computed value if not loaded yet.
+    final count = liveEpisodeCount > 0 ? liveEpisodeCount : series.episodeCount;
+    final dur   = _totalDuration;
+
     return SliverAppBar(
       expandedHeight: 260,
       pinned:          true,
@@ -113,16 +156,14 @@ class _SeriesHeader extends StatelessWidget {
             Container(
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end:   Alignment.bottomCenter,
+                  begin:  Alignment.topCenter,
+                  end:    Alignment.bottomCenter,
                   colors: [Colors.transparent, AppColors.background],
                 ),
               ),
             ),
             Positioned(
-              bottom: 16,
-              left:   20,
-              right:  20,
+              bottom: 16, left: 20, right: 20,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -139,12 +180,33 @@ class _SeriesHeader extends StatelessWidget {
                       ),
                     ),
                   const SizedBox(height: 8),
-                  Text(
-                    '${series.episodeCount} episode${series.episodeCount == 1 ? '' : 's'}',
-                    style: Theme.of(context)
-                        .textTheme
-                        .labelMedium
-                        ?.copyWith(color: AppColors.primary),
+                  // FIX 1 + 2: live episode count · total duration
+                  Row(
+                    children: [
+                      Text(
+                        '$count episode${count == 1 ? '' : 's'}',
+                        style: Theme.of(context)
+                            .textTheme
+                            .labelMedium
+                            ?.copyWith(color: AppColors.primary),
+                      ),
+                      if (dur.isNotEmpty) ...[
+                        Text(
+                          '  ·  ',
+                          style: Theme.of(context)
+                              .textTheme
+                              .labelMedium
+                              ?.copyWith(color: AppColors.textTertiary),
+                        ),
+                        Text(
+                          dur,
+                          style: Theme.of(context)
+                              .textTheme
+                              .labelMedium
+                              ?.copyWith(color: AppColors.textSecondary),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),
@@ -159,10 +221,10 @@ class _SeriesHeader extends StatelessWidget {
 // ── Episode tile ──────────────────────────────────────────────────────────────
 
 class _EpisodeTile extends ConsumerWidget {
-  final EpisodeModel         episode;
-  final List<EpisodeModel>   allEpisodes;
+  final EpisodeModel             episode;
+  final List<EpisodeModel>       allEpisodes;
   final AsyncValue<SeriesModel?> seriesAsync;
-  final int                  index;
+  final int                      index;
 
   const _EpisodeTile({
     required this.episode,
@@ -177,8 +239,8 @@ class _EpisodeTile extends ConsumerWidget {
       title:      ep.title,
       subtitle:   series?.title,
       artworkUrl: series?.coverUrl,
-      duration:   ep.duration,      // COMBINED duration already in DB
-      partCount:  ep.partCount,     // tells audio_handler how many ?part=N URLs
+      duration:   ep.duration,
+      partCount:  ep.partCount,
       type:       MediaType.episode,
       streamUrl:  '${ApiConstants.baseUrl}${ApiConstants.episodeStream(ep.id)}',
     );
@@ -186,36 +248,51 @@ class _EpisodeTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final isCompleted = ref.watch(
+    final isDownloaded = ref.watch(
       downloadManagerProvider.select((map) => map[episode.id]?.isCompleted == true),
     );
-    final isFav = ref.watch(
-      favoritesProvider.select((set) => set.contains(episode.id)),
+    // FIX 3: completed badge — persisted in Hive, works online + offline
+    final isCompleted = ref.watch(
+      completedEpisodesProvider.select((set) => set.contains(episode.id)),
     );
+    final isFav  = ref.watch(favoritesProvider.select((set) => set.contains(episode.id)));
     final series = seriesAsync.valueOrNull;
 
     return RepaintBoundary(
       child: ListTile(
         contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-        leading: _EpisodeNumberBadge(number: episode.episodeNumber),
+        leading: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            _EpisodeNumberBadge(
+              number:      episode.episodeNumber,
+              isCompleted: isCompleted,
+            ),
+          ],
+        ),
         title: Text(
           episode.title,
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontSize: 14),
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+            fontSize: 14,
+            // Slightly muted when done — gives a "read" feel
+            color: isCompleted ? AppColors.textSecondary : null,
+          ),
         ),
         subtitle: Row(
           children: [
-            // Show combined duration (already summed in DB)
             if (episode.duration != null)
               DurationBadge(duration: episode.formattedDuration),
-
-            // Multi-part indicator — subtle, just shows part count
             if (episode.isMultiPart) ...[
               const SizedBox(width: 6),
               _PartBadge(count: episode.partCount),
             ],
-
+            // FIX 3: completed badge
+            if (isCompleted) ...[
+              const SizedBox(width: 6),
+              _CompletedBadge(),
+            ],
             const SizedBox(width: 6),
-            if (isCompleted) const _EncLockBadge(),
+            if (isDownloaded) const _EncLockBadge(),
           ],
         ),
         trailing: Row(
@@ -228,21 +305,30 @@ class _EpisodeTile extends ConsumerWidget {
               partCount:       episode.partCount,
               seriesTitle:     series?.title,
               coverUrl:        series?.coverUrl,
-              durationSeconds: episode.duration, // FIX: needed for offline seekbar
+              durationSeconds: episode.duration,
             ),
-            IconButton(
-              icon: Icon(
-                isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                size: 20,
+            // Long-press to undo "completed" — handy for re-listening
+            GestureDetector(
+              onLongPress: isCompleted
+                  ? () => ref
+                      .read(completedEpisodesProvider.notifier)
+                      .markIncomplete(episode.id)
+                  : null,
+              child: IconButton(
+                icon: Icon(
+                  isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                  size: 20,
+                ),
+                color: isFav ? AppColors.error : AppColors.textTertiary,
+                onPressed: () =>
+                    ref.read(favoritesProvider.notifier).toggle(episode.id),
               ),
-              color: isFav ? AppColors.error : AppColors.textTertiary,
-              onPressed: () =>
-                  ref.read(favoritesProvider.notifier).toggle(episode.id),
             ),
           ],
         ),
         onTap: () {
-          final queue = allEpisodes.map((ep) => _toPlayable(ep, series)).toList();
+          final queue =
+              allEpisodes.map((ep) => _toPlayable(ep, series)).toList();
           ref
               .read(audioPlayerProvider.notifier)
               .playItem(queue[index], queue: queue, index: index);
@@ -253,35 +339,93 @@ class _EpisodeTile extends ConsumerWidget {
   }
 }
 
-// ── Episode number badge ──────────────────────────────────────────────────────
+// ── Episode number badge (with optional completed overlay) ────────────────────
 
 class _EpisodeNumberBadge extends StatelessWidget {
-  final int number;
-  const _EpisodeNumberBadge({required this.number});
+  final int  number;
+  final bool isCompleted;
+
+  const _EpisodeNumberBadge({
+    required this.number,
+    required this.isCompleted,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width:  44,
-      height: 44,
-      decoration: BoxDecoration(
-        color:        AppColors.surfaceVariant,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Center(
-        child: Text(
-          number.toString().padLeft(2, '0'),
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-            color:      AppColors.primary,
-            fontWeight: FontWeight.w700,
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          width: 44, height: 44,
+          decoration: BoxDecoration(
+            color:        AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Center(
+            child: Text(
+              number.toString().padLeft(2, '0'),
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                color:      isCompleted ? AppColors.success : AppColors.primary,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
           ),
         ),
+        // Small check circle in the bottom-right corner when completed
+        if (isCompleted)
+          Positioned(
+            right:  -4,
+            bottom: -4,
+            child: Container(
+              width: 18, height: 18,
+              decoration: const BoxDecoration(
+                color:  AppColors.success,
+                shape:  BoxShape.circle,
+              ),
+              child: const Icon(Icons.check_rounded, size: 12, color: Colors.white),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ── Completed badge ───────────────────────────────────────────────────────────
+
+class _CompletedBadge extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color:        AppColors.success.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+          color: AppColors.success.withOpacity(0.4),
+          width: 0.8,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.check_rounded, size: 9, color: AppColors.success),
+          const SizedBox(width: 3),
+          Text(
+            'done',
+            style: const TextStyle(
+              color:       AppColors.success,
+              fontSize:    9,
+              fontWeight:  FontWeight.w700,
+              letterSpacing: 0.4,
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-// ── Part count badge (subtle) ─────────────────────────────────────────────────
+// ── Part badge ────────────────────────────────────────────────────────────────
 
 class _PartBadge extends StatelessWidget {
   final int count;
@@ -316,8 +460,6 @@ class _DownloadButton extends ConsumerWidget {
   final int     partCount;
   final String? seriesTitle;
   final String? coverUrl;
-  // FIX: pass combined duration so it's stored in DownloadModel and available
-  // for offline playback — prevents position > duration on the seekbar.
   final int?    durationSeconds;
 
   const _DownloadButton({
@@ -346,18 +488,20 @@ class _DownloadButton extends ConsumerWidget {
       );
     }
 
-    if (status == 'downloading' || status == 'merging' || status == 'encrypting') {
+    if (status == 'downloading' ||
+        status == 'merging'     ||
+        status == 'encrypting') {
       final clamped = progress.clamp(0.0, 1.0);
-      final pct = (clamped * 100).round();
+      final pct     = (clamped * 100).round();
 
       final Color  ringColor;
       final String label;
       if (status == 'merging' || status == 'encrypting') {
         ringColor = AppColors.accentGold;
-        label = status == 'encrypting' ? '🔒' : '⚙';
+        label     = status == 'encrypting' ? '🔒' : '⚙';
       } else {
         ringColor = AppColors.primary;
-        label = '$pct%';
+        label     = '$pct%';
       }
 
       return SizedBox(
@@ -374,12 +518,15 @@ class _DownloadButton extends ConsumerWidget {
                 color:           ringColor,
               ),
             ),
-            Text(label, style: TextStyle(
-              fontSize:   8,
-              fontWeight: FontWeight.w700,
-              color:      ringColor,
-              letterSpacing: -0.3,
-            )),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize:      8,
+                fontWeight:    FontWeight.w700,
+                color:         ringColor,
+                letterSpacing: -0.3,
+              ),
+            ),
           ],
         ),
       );
@@ -400,13 +547,13 @@ class _DownloadButton extends ConsumerWidget {
       color: AppColors.textTertiary,
       onPressed: () {
         ref.read(downloadManagerProvider.notifier).startDownload(
-          mediaId:    episodeId,
-          title:      episodeTitle,
-          mediaType:  'episode',
-          partCount:        partCount,   // pass actual part count for correct download
-          artworkUrl:       coverUrl,
-          subtitle:         seriesTitle,
-          durationSeconds:  durationSeconds, // FIX: store for offline seekbar
+          mediaId:         episodeId,
+          title:           episodeTitle,
+          mediaType:       'episode',
+          partCount:       partCount,
+          artworkUrl:      coverUrl,
+          subtitle:        seriesTitle,
+          durationSeconds: durationSeconds,
         );
 
         ScaffoldMessenger.of(context)
@@ -418,14 +565,14 @@ class _DownloadButton extends ConsumerWidget {
               Expanded(
                 child: Text(
                   'Downloading "$episodeTitle"…',
-                  style: const TextStyle(fontSize: 13),
+                  style:    const TextStyle(fontSize: 13),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
             ]),
-            duration:  const Duration(seconds: 2),
-            behavior:  SnackBarBehavior.floating,
-            shape:     RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            duration:        const Duration(seconds: 2),
+            behavior:        SnackBarBehavior.floating,
+            shape:           RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
             backgroundColor: AppColors.surfaceVariant,
           ));
       },
@@ -445,22 +592,37 @@ class _EncLockBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color:        AppColors.accentGold.withOpacity(0.18),
         borderRadius: BorderRadius.circular(4),
-        border:       Border.all(color: AppColors.accentGold.withOpacity(0.55), width: 0.8),
-        boxShadow: [BoxShadow(color: AppColors.accentGold.withOpacity(0.25), blurRadius: 6)],
+        border: Border.all(
+          color: AppColors.accentGold.withOpacity(0.55),
+          width: 0.8,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color:     AppColors.accentGold.withOpacity(0.25),
+            blurRadius: 6,
+          ),
+        ],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.lock_rounded, size: 9, color: AppColors.accentGold,
-              shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4)]),
+          Icon(
+            Icons.lock_rounded,
+            size:    9,
+            color:   AppColors.accentGold,
+            shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4)],
+          ),
           const SizedBox(width: 3),
-          Text('ENC', style: TextStyle(
-            color:       AppColors.accentGold,
-            fontSize:    9,
-            fontWeight:  FontWeight.w800,
-            letterSpacing: 0.6,
-            shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.5), blurRadius: 4)],
-          )),
+          Text(
+            'ENC',
+            style: TextStyle(
+              color:        AppColors.accentGold,
+              fontSize:     9,
+              fontWeight:   FontWeight.w800,
+              letterSpacing: 0.6,
+              shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.5), blurRadius: 4)],
+            ),
+          ),
         ],
       ),
     );

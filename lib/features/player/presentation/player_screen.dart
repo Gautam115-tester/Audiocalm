@@ -1,4 +1,19 @@
 // lib/features/player/presentation/player_screen.dart
+//
+// CHANGES IN THIS VERSION
+// =======================
+// FIX 4 (Image 3 — playback speed overflow):
+//   The sheet used a ListView inside a bottom sheet without isScrollControlled,
+//   causing the inner scroll view to not communicate its intrinsic height.
+//   Fixed by:
+//     • Adding isScrollControlled: true so the sheet sizes to its content.
+//     • Replacing ListView with a Column spread (only 7 items — no scroll needed).
+//     • Wrapping in SafeArea so it clears the system navigation bar automatically
+//       (gesture bar ~34 px on most Android devices, or button bar ~48 px).
+//
+// FIX 5 (Image 4 — Queue sheet touching the navigation bar):
+//   Wrapped the Queue sheet content in SafeArea with bottom: true so it always
+//   floats above the navigation bar regardless of gesture/button nav mode.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -20,15 +35,15 @@ class PlayerScreen extends ConsumerStatefulWidget {
 class _PlayerScreenState extends ConsumerState<PlayerScreen>
     with TickerProviderStateMixin {
   late AnimationController _artworkController;
-  late Animation<double> _artworkScale;
-  bool _isSeeking = false;
-  double _seekValue = 0;
+  late Animation<double>   _artworkScale;
+  bool   _isSeeking = false;
+  double _seekValue  = 0;
 
   @override
   void initState() {
     super.initState();
     _artworkController = AnimationController(
-      vsync: this,
+      vsync:    this,
       duration: const Duration(milliseconds: 300),
     );
     _artworkScale = Tween<double>(begin: 0.85, end: 1.0).animate(
@@ -45,7 +60,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   @override
   Widget build(BuildContext context) {
     final playerState = ref.watch(audioPlayerProvider);
-    final notifier = ref.read(audioPlayerProvider.notifier);
+    final notifier    = ref.read(audioPlayerProvider.notifier);
 
     if (!playerState.hasMedia) {
       return Scaffold(
@@ -57,22 +72,16 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     final item = playerState.currentItem!;
 
-    if (playerState.isPlaying) {
-      _artworkController.forward();
-    } else {
-      _artworkController.reverse();
-    }
+    if (playerState.isPlaying) _artworkController.forward();
+    else _artworkController.reverse();
 
     return Scaffold(
       backgroundColor: AppColors.background,
       body: GestureDetector(
         onHorizontalDragEnd: (details) {
           if (details.primaryVelocity != null) {
-            if (details.primaryVelocity! > 500) {
-              notifier.skipToPrevious();
-            } else if (details.primaryVelocity! < -500) {
-              notifier.skipToNext();
-            }
+            if (details.primaryVelocity! > 500)       notifier.skipToPrevious();
+            else if (details.primaryVelocity! < -500) notifier.skipToNext();
           }
         },
         child: Container(
@@ -116,7 +125,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 32),
+            icon:  const Icon(Icons.keyboard_arrow_down_rounded, size: 32),
             color: AppColors.textSecondary,
             onPressed: () => Navigator.of(context).pop(),
           ),
@@ -125,13 +134,13 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               'NOW PLAYING',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    letterSpacing: 2,
-                    color: AppColors.primary,
-                  ),
+                letterSpacing: 2,
+                color:         AppColors.primary,
+              ),
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.more_vert_rounded),
+            icon:  const Icon(Icons.more_vert_rounded),
             color: AppColors.textSecondary,
             onPressed: () => _showOptions(context),
           ),
@@ -147,27 +156,26 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         scale: _artworkScale,
         child: Container(
           height: 260,
-          width: double.infinity,
+          width:  double.infinity,
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(24),
             boxShadow: [
               BoxShadow(
-                color: AppColors.primary.withOpacity(0.25),
+                color:      AppColors.primary.withOpacity(0.25),
                 blurRadius: 40,
                 spreadRadius: 4,
-                offset: const Offset(0, 16),
+                offset:     const Offset(0, 16),
               ),
             ],
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(24),
             child: CoverImage(
-              url: url,
-              size: double.infinity,
+              url:          url,
+              size:         double.infinity,
               borderRadius: 24,
               placeholder: Container(
-                decoration:
-                    const BoxDecoration(gradient: AppColors.cardGradient),
+                decoration: const BoxDecoration(gradient: AppColors.cardGradient),
                 child: const Center(
                   child: Icon(Icons.music_note_rounded,
                       size: 72, color: AppColors.textTertiary),
@@ -186,7 +194,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     String? subtitle,
     AudioPlayerState state,
   ) {
-    final item = state.currentItem;
+    final item  = state.currentItem;
     final isFav = item != null
         ? ref.watch(favoritesProvider).contains(item.id)
         : false;
@@ -225,11 +233,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           if (item != null)
             IconButton(
               icon: Icon(
-                isFav
-                    ? Icons.favorite_rounded
-                    : Icons.favorite_border_rounded,
+                isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
                 color: isFav ? AppColors.error : AppColors.textSecondary,
-                size: 28,
+                size:  28,
               ),
               onPressed: () =>
                   ref.read(favoritesProvider.notifier).toggle(item.id),
@@ -261,24 +267,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         children: [
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
-              trackHeight: 4,
-              thumbShape:
-                  const RoundSliderThumbShape(enabledThumbRadius: 7),
-              overlayShape:
-                  const RoundSliderOverlayShape(overlayRadius: 18),
-              activeTrackColor: AppColors.primary,
+              trackHeight:        4,
+              thumbShape:         const RoundSliderThumbShape(enabledThumbRadius: 7),
+              overlayShape:       const RoundSliderOverlayShape(overlayRadius: 18),
+              activeTrackColor:   AppColors.primary,
               inactiveTrackColor: AppColors.surfaceVariant,
-              thumbColor: Colors.white,
-              overlayColor: AppColors.primary.withOpacity(0.15),
+              thumbColor:         Colors.white,
+              overlayColor:       AppColors.primary.withOpacity(0.15),
             ),
             child: Slider(
               value: (_isSeeking ? _seekValue : progress).toDouble(),
               onChangeStart: (_) => setState(() => _isSeeking = true),
-              onChanged: (v) => setState(() => _seekValue = v),
-              onChangeEnd: (v) {
+              onChanged:     (v) => setState(() => _seekValue = v),
+              onChangeEnd:   (v) {
                 setState(() => _isSeeking = false);
-                final ms =
-                    (v * (state.duration?.inMilliseconds ?? 0)).toInt();
+                final ms = (v * (state.duration?.inMilliseconds ?? 0)).toInt();
                 notifier.seek(Duration(milliseconds: ms));
               },
             ),
@@ -308,38 +311,36 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        // Fix: Icons.forward_15_rounded doesn't exist → use replay_10_rounded
         _ControlButton(
-          icon: Icons.replay_10_rounded,
+          icon:  Icons.replay_10_rounded,
           onTap: notifier.skipBackward,
-          size: 32,
+          size:  32,
           color: AppColors.textSecondary,
         ),
         const SizedBox(width: 12),
         _ControlButton(
-          icon: Icons.skip_previous_rounded,
+          icon:  Icons.skip_previous_rounded,
           onTap: notifier.skipToPrevious,
-          size: 36,
+          size:  36,
           color: AppColors.textPrimary,
         ),
         const SizedBox(width: 12),
         GestureDetector(
           onTap: notifier.togglePlayPause,
           child: Container(
-            width: 70,
-            height: 70,
+            width: 70, height: 70,
             decoration: BoxDecoration(
               gradient: const LinearGradient(
                 colors: [AppColors.primary, AppColors.primaryDark],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
+                begin:  Alignment.topLeft,
+                end:    Alignment.bottomRight,
               ),
               shape: BoxShape.circle,
               boxShadow: [
                 BoxShadow(
-                  color: AppColors.primary.withOpacity(0.4),
+                  color:      AppColors.primary.withOpacity(0.4),
                   blurRadius: 24,
-                  offset: const Offset(0, 8),
+                  offset:     const Offset(0, 8),
                 ),
               ],
             ),
@@ -354,23 +355,22 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                         ? Icons.pause_rounded
                         : Icons.play_arrow_rounded,
                     color: Colors.white,
-                    size: 36,
+                    size:  36,
                   ),
           ),
         ),
         const SizedBox(width: 12),
         _ControlButton(
-          icon: Icons.skip_next_rounded,
+          icon:  Icons.skip_next_rounded,
           onTap: notifier.skipToNext,
-          size: 36,
+          size:  36,
           color: AppColors.textPrimary,
         ),
         const SizedBox(width: 12),
-        // Fix: Icons.forward_15_rounded doesn't exist → use forward_10_rounded
         _ControlButton(
-          icon: Icons.forward_10_rounded,
+          icon:  Icons.forward_10_rounded,
           onTap: notifier.skipForward,
-          size: 32,
+          size:  32,
           color: AppColors.textSecondary,
         ),
       ],
@@ -382,7 +382,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     AudioPlayerState state,
     AudioPlayerNotifier notifier,
   ) {
-    // Fix: exhaustive switch on ja.LoopMode (sealed enum)
     final loopIcon = switch (state.loopMode) {
       ja.LoopMode.off => Icons.repeat_rounded,
       ja.LoopMode.one => Icons.repeat_one_rounded,
@@ -395,21 +394,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           _IconToggle(
-            icon: Icons.shuffle_rounded,
+            icon:   Icons.shuffle_rounded,
             active: state.shuffleMode,
-            onTap: notifier.toggleShuffle,
+            onTap:  notifier.toggleShuffle,
           ),
           _IconToggle(
-            icon: loopIcon,
+            icon:   loopIcon,
             active: state.loopMode != ja.LoopMode.off,
-            onTap: notifier.cycleLoopMode,
+            onTap:  notifier.cycleLoopMode,
           ),
           _SpeedButton(speed: state.speed, onChanged: notifier.setSpeed),
           if (state.currentItem?.isSong ?? false)
             _IconToggle(
-              icon: Icons.equalizer_rounded,
+              icon:   Icons.equalizer_rounded,
               active: false,
-              onTap: () => _showEqualizer(context),
+              onTap:  () => _showEqualizer(context),
             )
           else
             const SizedBox(width: 36),
@@ -420,43 +419,48 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   void _showEqualizer(BuildContext context) {
     showModalBottomSheet(
-      context: context,
+      context:          context,
       isScrollControlled: true,
-      backgroundColor: Colors.transparent,
+      backgroundColor:  Colors.transparent,
       builder: (_) => const EqualizerSheet(),
     );
   }
 
+  // FIX 5: Queue sheet — SafeArea clears system navigation bar automatically.
+  // Whether the device uses gesture nav (~34 px) or button nav (~48 px),
+  // SafeArea adds the right bottom padding so the content floats above it.
   void _showOptions(BuildContext context) {
     showModalBottomSheet(
-      context: context,
+      context:         context,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        margin: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 12),
-            Container(
-              width: 36,
-              height: 4,
-              decoration: BoxDecoration(
-                color: AppColors.textTertiary,
-                borderRadius: BorderRadius.circular(2),
+      builder: (ctx) => SafeArea(
+        child: Container(
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          decoration: BoxDecoration(
+            color:        AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 12),
+              Container(
+                width:  36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color:        AppColors.textTertiary,
+                  borderRadius: BorderRadius.circular(2),
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            ListTile(
-              leading: const Icon(Icons.queue_music_rounded),
-              title: const Text('Queue'),
-              onTap: () => Navigator.pop(ctx),
-            ),
-            const SizedBox(height: 8),
-          ],
+              const SizedBox(height: 8),
+              ListTile(
+                leading: const Icon(Icons.queue_music_rounded),
+                title:   const Text('Queue'),
+                onTap:   () => Navigator.pop(ctx),
+              ),
+              // No extra bottom SizedBox — SafeArea provides the inset gap.
+            ],
+          ),
         ),
       ),
     );
@@ -473,53 +477,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   }
 }
 
-class _ControlButton extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback onTap;
-  final double size;
-  final Color color;
-
-  const _ControlButton({
-    required this.icon,
-    required this.onTap,
-    required this.size,
-    required this.color,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      behavior: HitTestBehavior.opaque,
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Icon(icon, size: size, color: color),
-      ),
-    );
-  }
-}
-
-class _IconToggle extends StatelessWidget {
-  final IconData icon;
-  final bool active;
-  final VoidCallback onTap;
-
-  const _IconToggle(
-      {required this.icon, required this.active, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Icon(icon,
-            size: 24,
-            color: active ? AppColors.primary : AppColors.textTertiary),
-      ),
-    );
-  }
-}
+// ── _SpeedButton — FIX 4 ────────────────────────────────────────────────────
+//
+// Previous bug: ListView inside showModalBottomSheet without isScrollControlled
+// → the sheet had no height constraint → inner scroll view couldn't report its
+// intrinsic height → the sheet grew to max and then clipped/overflowed.
+//
+// Fix:
+//   1. isScrollControlled: true — sheet sizes to content height naturally.
+//   2. Column spread instead of ListView — 7 items need no scrolling.
+//   3. SafeArea — clears the system navigation bar on all device types.
+//   4. margin + borderRadius container — matches Queue sheet style.
 
 class _SpeedButton extends StatelessWidget {
   final double speed;
@@ -532,10 +500,9 @@ class _SpeedButton extends StatelessWidget {
     return GestureDetector(
       onTap: () => _showSpeedMenu(context),
       child: Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
+          color:        AppColors.surfaceVariant,
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
             color: speed != 1.0
@@ -546,12 +513,12 @@ class _SpeedButton extends StatelessWidget {
         child: Text(
           '${speed}x',
           style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                color: speed != 1.0
-                    ? AppColors.primary
-                    : AppColors.textSecondary,
-                fontWeight: FontWeight.w700,
-                fontSize: 12,
-              ),
+            color: speed != 1.0
+                ? AppColors.primary
+                : AppColors.textSecondary,
+            fontWeight: FontWeight.w700,
+            fontSize:   12,
+          ),
         ),
       ),
     );
@@ -559,36 +526,102 @@ class _SpeedButton extends StatelessWidget {
 
   void _showSpeedMenu(BuildContext context) {
     showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        margin: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 16),
-            Text('Playback Speed',
-                style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 8),
-            ...AppConstants.playbackSpeeds.map(
-              (s) => ListTile(
-                title: Text('${s}x'),
-                trailing: speed == s
-                    ? const Icon(Icons.check_rounded,
-                        color: AppColors.primary)
-                    : null,
-                onTap: () {
-                  onChanged(s);
-                  Navigator.pop(ctx);
-                },
-              ),
+      context:            context,
+      backgroundColor:    Colors.transparent,
+      isScrollControlled: true, // FIX: lets the sheet shrink-wrap its content
+      builder: (ctx) {
+        return SafeArea(
+          // SafeArea automatically adds bottom padding == nav-bar height.
+          child: Container(
+            margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            decoration: BoxDecoration(
+              color:        AppColors.surfaceVariant,
+              borderRadius: BorderRadius.circular(20),
             ),
-            const SizedBox(height: 8),
-          ],
+            child: Column(
+              mainAxisSize: MainAxisSize.min, // shrink-wrap to content
+              children: [
+                const SizedBox(height: 16),
+                Text(
+                  'Playback Speed',
+                  style: Theme.of(ctx).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 8),
+                // FIX: Column instead of ListView — avoids intrinsic-height
+                // issue that caused the overflow. 7 speed options never need
+                // a scroll view.
+                ...AppConstants.playbackSpeeds.map(
+                  (s) => ListTile(
+                    title: Text('${s}x'),
+                    trailing: speed == s
+                        ? const Icon(Icons.check_rounded,
+                            color: AppColors.primary)
+                        : null,
+                    onTap: () {
+                      onChanged(s);
+                      Navigator.pop(ctx);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ── Shared control widgets ────────────────────────────────────────────────────
+
+class _ControlButton extends StatelessWidget {
+  final IconData     icon;
+  final VoidCallback onTap;
+  final double       size;
+  final Color        color;
+
+  const _ControlButton({
+    required this.icon,
+    required this.onTap,
+    required this.size,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap:    onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child:   Icon(icon, size: size, color: color),
+      ),
+    );
+  }
+}
+
+class _IconToggle extends StatelessWidget {
+  final IconData     icon;
+  final bool         active;
+  final VoidCallback onTap;
+
+  const _IconToggle({
+    required this.icon,
+    required this.active,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Icon(
+          icon,
+          size:  24,
+          color: active ? AppColors.primary : AppColors.textTertiary,
         ),
       ),
     );

@@ -1,22 +1,14 @@
 // lib/features/player/providers/audio_player_provider.dart
 //
-// FIX: Mini player now appears instantly when user taps an audio item.
-//
-// ROOT CAUSE of the 5-second delay:
-//   playItem() called _handler.playItem() and AWAITED it before updating state.
-//   _handler.playItem() → _loadItem() → _loadPartAndPlay() → setAudioSource()
-//   which blocks until the network buffer is ready (~5 seconds on slow connections).
-//   During that entire wait, state.currentItem == null, so MiniPlayer returned
-//   SizedBox.shrink() — invisible.
-//
-// FIX APPLIED:
-//   1. Set state.currentItem, queue, isLoading=true SYNCHRONOUSLY before any
-//      await. MiniPlayer sees hasMedia==true immediately and renders.
-//   2. Fire _handler.playItem() without awaiting in the provider — the handler's
-//      own streams (playerStateStream, durationStream, positionStream) drive all
-//      subsequent state updates exactly as before.
-//   3. Added _resetForNewItem() helper to atomically reset position/duration
-//      so stale values from the previous track don't flash on the new item's UI.
+// CHANGES IN THIS VERSION
+// =======================
+// 1. AudioPlayerNotifier now accepts `Ref` so it can call other providers.
+// 2. playerStateStream listener detects ProcessingState.completed and calls
+//    completedEpisodesProvider.notifier.markCompleted(item.id).
+//    This works for BOTH online streaming and offline downloaded playback
+//    because it is driven by the audio engine, not the network layer.
+// 3. All other logic (optimistic state update, mini-player instant render,
+//    history saving, position restore) is unchanged.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -26,6 +18,7 @@ import 'package:just_audio/just_audio.dart' as ja;
 import '../domain/media_item_model.dart';
 import '../services/audio_handler.dart';
 import '../../../../core/constants/app_constants.dart';
+import '../../calm_stories/providers/completed_episodes_provider.dart';
 
 class AudioPlayerState {
   final PlayableItem? currentItem;
@@ -42,14 +35,14 @@ class AudioPlayerState {
 
   const AudioPlayerState({
     this.currentItem,
-    this.isPlaying = false,
-    this.isLoading = false,
-    this.position = Duration.zero,
+    this.isPlaying  = false,
+    this.isLoading  = false,
+    this.position   = Duration.zero,
     this.duration,
-    this.speed = 1.0,
-    this.loopMode = ja.LoopMode.off,
+    this.speed      = 1.0,
+    this.loopMode   = ja.LoopMode.off,
     this.shuffleMode = false,
-    this.queue = const [],
+    this.queue      = const [],
     this.currentIndex = 0,
     this.error,
   });
@@ -71,36 +64,36 @@ class AudioPlayerState {
     bool clearError = false,
   }) =>
       AudioPlayerState(
-        currentItem: currentItem ?? this.currentItem,
-        isPlaying: isPlaying ?? this.isPlaying,
-        isLoading: isLoading ?? this.isLoading,
-        position: position ?? this.position,
-        duration: duration ?? this.duration,
-        speed: speed ?? this.speed,
-        loopMode: loopMode ?? this.loopMode,
-        shuffleMode: shuffleMode ?? this.shuffleMode,
-        queue: queue ?? this.queue,
+        currentItem:  currentItem  ?? this.currentItem,
+        isPlaying:    isPlaying    ?? this.isPlaying,
+        isLoading:    isLoading    ?? this.isLoading,
+        position:     position     ?? this.position,
+        duration:     duration     ?? this.duration,
+        speed:        speed        ?? this.speed,
+        loopMode:     loopMode     ?? this.loopMode,
+        shuffleMode:  shuffleMode  ?? this.shuffleMode,
+        queue:        queue        ?? this.queue,
         currentIndex: currentIndex ?? this.currentIndex,
-        error: clearError ? null : (error ?? this.error),
+        error:        clearError ? null : (error ?? this.error),
       );
 }
 
 class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   final AudioCalmHandler _handler;
+  final Ref _ref; // FIX: needed to call completedEpisodesProvider
   final List<StreamSubscription> _subs = [];
 
-  AudioPlayerNotifier(this._handler) : super(const AudioPlayerState()) {
+  AudioPlayerNotifier(this._handler, this._ref)
+      : super(const AudioPlayerState()) {
     _init();
   }
 
   void _init() {
-    // positionStream emits UNIFIED position (handler accumulates part offsets)
     _subs.add(_handler.positionStream.listen((pos) {
       state = state.copyWith(position: pos);
       _savePosition();
     }));
 
-    // durationStream emits UNIFIED duration (DB total or accumulated)
     _subs.add(_handler.durationStream.listen((dur) {
       if (dur != null && dur > Duration.zero) {
         state = state.copyWith(duration: dur);
@@ -108,6 +101,14 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     }));
 
     _subs.add(_handler.playerStateStream.listen((ps) {
+      // FIX: detect completion and persist it
+      if (ps.processingState == ja.ProcessingState.completed &&
+          state.currentItem != null) {
+        _ref
+            .read(completedEpisodesProvider.notifier)
+            .markCompleted(state.currentItem!.id);
+      }
+
       state = state.copyWith(
         isPlaying: ps.playing,
         isLoading: ps.processingState == ja.ProcessingState.loading ||
@@ -135,31 +136,26 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     } catch (_) {}
   }
 
-  /// FIX: Update state SYNCHRONOUSLY first so MiniPlayer renders immediately,
-  /// then kick off the handler load in the background (no await).
-  Future<void> playItem(PlayableItem item,
-      {List<PlayableItem>? queue, int index = 0}) async {
+  /// Optimistic update: sets currentItem synchronously so MiniPlayer renders
+  /// immediately, then fires the handler load in the background.
+  Future<void> playItem(
+    PlayableItem item, {
+    List<PlayableItem>? queue,
+    int index = 0,
+  }) async {
     final q = queue ?? [item];
 
-    // ── STEP 1: Optimistic state update (synchronous, instant) ──────────────
-    // MiniPlayer checks hasMedia = currentItem != null.
-    // By setting currentItem here — before any network IO — the mini player
-    // appears on the very next frame after the user taps.
     state = state.copyWith(
-      currentItem: item,
-      queue: q,
+      currentItem:  item,
+      queue:        q,
       currentIndex: index,
-      isPlaying: false,      // not playing yet — still buffering
-      isLoading: true,       // show spinner in PlayPause button
-      error: null,
-      position: Duration.zero,
-      // Pre-fill duration from metadata if available so seekbar isn't blank
-      duration: item.duration != null ? Duration(seconds: item.duration!) : null,
+      isPlaying:    false,
+      isLoading:    true,
+      error:        null,
+      position:     Duration.zero,
+      duration:     item.duration != null ? Duration(seconds: item.duration!) : null,
     );
 
-    // ── STEP 2: Start actual playback in background (do NOT await) ───────────
-    // The handler's streams (playerStateStream, durationStream, positionStream)
-    // will push further state updates as buffering progresses.
     _handler.playItem(item, queue: queue, index: index).then((_) {
       _saveToHistory(item);
     }).catchError((e) {
@@ -172,7 +168,7 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   void _saveToHistory(PlayableItem item) {
     try {
       final box = Hive.box(AppConstants.continueListeningBox);
-      final key = 'item_${item.id}';
+      final key  = 'item_${item.id}';
       final json = item.toJson();
       json['lastPlayedAt'] = DateTime.now().toIso8601String();
       box.put(key, json);
@@ -183,20 +179,15 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   Future<void> togglePlayPause() async {
-    if (state.isPlaying) {
-      await _handler.pause();
-    } else {
-      await _handler.play();
-    }
+    if (state.isPlaying) await _handler.pause();
+    else await _handler.play();
   }
 
   Future<void> seek(Duration position) => _handler.seek(position);
-
-  Future<void> skipForward()  => _handler.seekForwardOnce();
-  Future<void> skipBackward() => _handler.seekBackwardOnce();
-
-  Future<void> skipToNext()     => _handler.skipToNext();
-  Future<void> skipToPrevious() => _handler.skipToPrevious();
+  Future<void> skipForward()            => _handler.seekForwardOnce();
+  Future<void> skipBackward()           => _handler.seekBackwardOnce();
+  Future<void> skipToNext()             => _handler.skipToNext();
+  Future<void> skipToPrevious()         => _handler.skipToPrevious();
 
   Future<void> setSpeed(double speed) async {
     await _handler.setSpeed(speed);
@@ -234,5 +225,6 @@ final audioHandlerProvider = Provider<AudioCalmHandler>((ref) {
 final audioPlayerProvider =
     StateNotifierProvider<AudioPlayerNotifier, AudioPlayerState>((ref) {
   final handler = ref.watch(audioHandlerProvider);
-  return AudioPlayerNotifier(handler);
+  // Pass ref so the notifier can access completedEpisodesProvider
+  return AudioPlayerNotifier(handler, ref);
 });
