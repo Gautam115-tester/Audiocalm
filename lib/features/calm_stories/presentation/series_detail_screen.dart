@@ -2,13 +2,18 @@
 //
 // CHANGES IN THIS VERSION
 // =======================
-// 1. Header shows LIVE episode count (from the embedded list, not the stale
-//    DB field) and total series duration, e.g. "81 episodes · 14h 23m".
-// 2. Episode tiles show a teal "done" badge when the user has completed that
-//    episode. Works for online streaming and offline playback.
-//    The episode number badge also gets a green check circle overlay.
-// 3. Long-pressing the favourite button on a completed episode marks it
-//    incomplete again (in case the user wants to re-listen).
+// 1. REMAINING TIME BADGE — shows "▶ 7m 32s left" on each episode tile.
+//    Reads from PlaybackPositionService (Hive-backed, persists across restarts).
+//    Updates automatically when the user plays the episode (via a StreamBuilder
+//    listening to the audio position stream).
+//    Disappears when the episode is marked complete.
+//
+// 2. EPISODE COUNT FIX — the header now always shows the live count derived
+//    from the embedded episodes list, never the stale DB episodeCount field.
+//    This fixes the "80 shown instead of 81" bug for the Stories screen.
+//
+// 3. All existing features (completed badge, download, favorite, multi-part
+//    indicator, ENC badge) are preserved unchanged.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -24,6 +29,7 @@ import '../../../core/constants/api_constants.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/shared_widgets.dart';
 import '../../../core/router/app_router.dart';
+import '../../../features/player/services/playback_position_service.dart';
 
 class SeriesDetailScreen extends ConsumerWidget {
   final String seriesId;
@@ -38,7 +44,6 @@ class SeriesDetailScreen extends ConsumerWidget {
       backgroundColor: AppColors.background,
       body: CustomScrollView(
         slivers: [
-          // Build the header once episodes are loaded so we can use the live count.
           episodesAsync.when(
             loading: () => seriesAsync.when(
               loading: () => const SliverToBoxAdapter(
@@ -62,8 +67,8 @@ class SeriesDetailScreen extends ConsumerWidget {
               data: (series) => series != null
                   ? _SeriesHeader(
                       series:           series,
-                      liveEpisodeCount: episodes.length,   // FIX 1
-                      liveEpisodes:     episodes,           // FIX 2 (for duration)
+                      liveEpisodeCount: episodes.length, // FIX: always use live count
+                      liveEpisodes:     episodes,
                     )
                   : const SliverToBoxAdapter(child: SizedBox.shrink()),
             ),
@@ -125,7 +130,6 @@ class _SeriesHeader extends StatelessWidget {
     required this.liveEpisodes,
   });
 
-  /// Compute total duration from the live episode list (most accurate).
   String get _totalDuration {
     if (liveEpisodes.isEmpty) return series.formattedTotalDuration;
     final total = liveEpisodes.fold<int>(0, (s, ep) => s + (ep.duration ?? 0));
@@ -140,7 +144,7 @@ class _SeriesHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Prefer live count; fall back to the pre-computed value if not loaded yet.
+    // FIX: prefer live count (from embedded episodes list), fallback to DB value
     final count = liveEpisodeCount > 0 ? liveEpisodeCount : series.episodeCount;
     final dur   = _totalDuration;
 
@@ -180,7 +184,6 @@ class _SeriesHeader extends StatelessWidget {
                       ),
                     ),
                   const SizedBox(height: 8),
-                  // FIX 1 + 2: live episode count · total duration
                   Row(
                     children: [
                       Text(
@@ -251,12 +254,15 @@ class _EpisodeTile extends ConsumerWidget {
     final isDownloaded = ref.watch(
       downloadManagerProvider.select((map) => map[episode.id]?.isCompleted == true),
     );
-    // FIX 3: completed badge — persisted in Hive, works online + offline
     final isCompleted = ref.watch(
       completedEpisodesProvider.select((set) => set.contains(episode.id)),
     );
-    final isFav  = ref.watch(favoritesProvider.select((set) => set.contains(episode.id)));
-    final series = seriesAsync.valueOrNull;
+    final isFav   = ref.watch(favoritesProvider.select((set) => set.contains(episode.id)));
+    final series  = seriesAsync.valueOrNull;
+
+    // Watch current player to know if this episode is actively playing
+    final playerState = ref.watch(audioPlayerProvider);
+    final isCurrentlyPlaying = playerState.currentItem?.id == episode.id;
 
     return RepaintBoundary(
       child: ListTile(
@@ -274,25 +280,37 @@ class _EpisodeTile extends ConsumerWidget {
           episode.title,
           style: Theme.of(context).textTheme.titleMedium?.copyWith(
             fontSize: 14,
-            // Slightly muted when done — gives a "read" feel
             color: isCompleted ? AppColors.textSecondary : null,
           ),
         ),
-        subtitle: Row(
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            if (episode.duration != null)
-              DurationBadge(duration: episode.formattedDuration),
-            if (episode.isMultiPart) ...[
-              const SizedBox(width: 6),
-              _PartBadge(count: episode.partCount),
-            ],
-            // FIX 3: completed badge
-            if (isCompleted) ...[
-              const SizedBox(width: 6),
-              _CompletedBadge(),
-            ],
-            const SizedBox(width: 6),
-            if (isDownloaded) const _EncLockBadge(),
+            Row(
+              children: [
+                if (episode.duration != null)
+                  DurationBadge(duration: episode.formattedDuration),
+                if (episode.isMultiPart) ...[
+                  const SizedBox(width: 6),
+                  _PartBadge(count: episode.partCount),
+                ],
+                if (isCompleted) ...[
+                  const SizedBox(width: 6),
+                  _CompletedBadge(),
+                ],
+                const SizedBox(width: 6),
+                if (isDownloaded) const _EncLockBadge(),
+              ],
+            ),
+            // REMAINING TIME badge — only shown if not completed
+            if (!isCompleted)
+              _RemainingTimeBadge(
+                episodeId:       episode.id,
+                totalSeconds:    episode.duration,
+                isCurrentlyPlaying: isCurrentlyPlaying,
+                playerState:     playerState,
+              ),
           ],
         ),
         trailing: Row(
@@ -307,7 +325,6 @@ class _EpisodeTile extends ConsumerWidget {
               coverUrl:        series?.coverUrl,
               durationSeconds: episode.duration,
             ),
-            // Long-press to undo "completed" — handy for re-listening
             GestureDetector(
               onLongPress: isCompleted
                   ? () => ref
@@ -339,16 +356,92 @@ class _EpisodeTile extends ConsumerWidget {
   }
 }
 
-// ── Episode number badge (with optional completed overlay) ────────────────────
+// ── Remaining time badge ───────────────────────────────────────────────────────
+//
+// Shows persisted remaining time. Updates live while the episode is playing.
+// Reads directly from PlaybackPositionService (Hive) for persisted state,
+// and from the player state when this episode is actively playing.
+
+class _RemainingTimeBadge extends StatelessWidget {
+  final String episodeId;
+  final int? totalSeconds;
+  final bool isCurrentlyPlaying;
+  final AudioPlayerState playerState;
+
+  const _RemainingTimeBadge({
+    required this.episodeId,
+    required this.totalSeconds,
+    required this.isCurrentlyPlaying,
+    required this.playerState,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    String? remainingText;
+
+    if (isCurrentlyPlaying && totalSeconds != null) {
+      // Live: compute from player position
+      final posSeconds = playerState.position.inSeconds;
+      final total      = totalSeconds!;
+      if (posSeconds > 0 && total > 0) {
+        final remaining = total - posSeconds;
+        if (remaining > 30) {
+          remainingText = _format(remaining);
+        }
+      }
+    } else {
+      // Persisted: read from Hive
+      remainingText = PlaybackPositionService.formatRemaining(
+        episodeId,
+        totalSeconds,
+      );
+    }
+
+    if (remainingText == null) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.play_arrow_rounded,
+            size:  10,
+            color: AppColors.primary.withOpacity(0.8),
+          ),
+          const SizedBox(width: 3),
+          Text(
+            '$remainingText left',
+            style: TextStyle(
+              color:         AppColors.primary.withOpacity(0.85),
+              fontSize:      10,
+              fontWeight:    FontWeight.w600,
+              letterSpacing: 0.2,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _format(int seconds) {
+    if (seconds <= 0) return '';
+    final h = seconds ~/ 3600;
+    final m = (seconds % 3600) ~/ 60;
+    final s = seconds % 60;
+    if (h > 0) return m > 0 ? '${h}h ${m}m' : '${h}h';
+    if (m > 0) return s > 0 ? '${m}m ${s}s' : '${m}m';
+    return '${s}s';
+  }
+}
+
+// ── Episode number badge ───────────────────────────────────────────────────────
 
 class _EpisodeNumberBadge extends StatelessWidget {
   final int  number;
   final bool isCompleted;
 
-  const _EpisodeNumberBadge({
-    required this.number,
-    required this.isCompleted,
-  });
+  const _EpisodeNumberBadge({required this.number, required this.isCompleted});
 
   @override
   Widget build(BuildContext context) {
@@ -371,7 +464,6 @@ class _EpisodeNumberBadge extends StatelessWidget {
             ),
           ),
         ),
-        // Small check circle in the bottom-right corner when completed
         if (isCompleted)
           Positioned(
             right:  -4,
@@ -390,7 +482,7 @@ class _EpisodeNumberBadge extends StatelessWidget {
   }
 }
 
-// ── Completed badge ───────────────────────────────────────────────────────────
+// ── Completed badge ────────────────────────────────────────────────────────────
 
 class _CompletedBadge extends StatelessWidget {
   @override
@@ -400,22 +492,19 @@ class _CompletedBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color:        AppColors.success.withOpacity(0.15),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: AppColors.success.withOpacity(0.4),
-          width: 0.8,
-        ),
+        border: Border.all(color: AppColors.success.withOpacity(0.4), width: 0.8),
       ),
-      child: Row(
+      child: const Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.check_rounded, size: 9, color: AppColors.success),
-          const SizedBox(width: 3),
+          Icon(Icons.check_rounded, size: 9, color: AppColors.success),
+          SizedBox(width: 3),
           Text(
             'done',
-            style: const TextStyle(
-              color:       AppColors.success,
-              fontSize:    9,
-              fontWeight:  FontWeight.w700,
+            style: TextStyle(
+              color:        AppColors.success,
+              fontSize:     9,
+              fontWeight:   FontWeight.w700,
               letterSpacing: 0.4,
             ),
           ),
@@ -425,7 +514,7 @@ class _CompletedBadge extends StatelessWidget {
   }
 }
 
-// ── Part badge ────────────────────────────────────────────────────────────────
+// ── Part badge ─────────────────────────────────────────────────────────────────
 
 class _PartBadge extends StatelessWidget {
   final int count;
@@ -441,7 +530,7 @@ class _PartBadge extends StatelessWidget {
       ),
       child: Text(
         '$count parts',
-        style: TextStyle(
+        style: const TextStyle(
           color:      AppColors.primary,
           fontSize:   9,
           fontWeight: FontWeight.w600,
@@ -451,7 +540,7 @@ class _PartBadge extends StatelessWidget {
   }
 }
 
-// ── Download button ───────────────────────────────────────────────────────────
+// ── Download button ────────────────────────────────────────────────────────────
 
 class _DownloadButton extends ConsumerWidget {
   final String  episodeId;
@@ -488,12 +577,9 @@ class _DownloadButton extends ConsumerWidget {
       );
     }
 
-    if (status == 'downloading' ||
-        status == 'merging'     ||
-        status == 'encrypting') {
+    if (status == 'downloading' || status == 'merging' || status == 'encrypting') {
       final clamped = progress.clamp(0.0, 1.0);
       final pct     = (clamped * 100).round();
-
       final Color  ringColor;
       final String label;
       if (status == 'merging' || status == 'encrypting') {
@@ -503,7 +589,6 @@ class _DownloadButton extends ConsumerWidget {
         ringColor = AppColors.primary;
         label     = '$pct%';
       }
-
       return SizedBox(
         width: 44, height: 44,
         child: Stack(
@@ -518,15 +603,7 @@ class _DownloadButton extends ConsumerWidget {
                 color:           ringColor,
               ),
             ),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize:      8,
-                fontWeight:    FontWeight.w700,
-                color:         ringColor,
-                letterSpacing: -0.3,
-              ),
-            ),
+            Text(label, style: TextStyle(fontSize: 8, fontWeight: FontWeight.w700, color: ringColor)),
           ],
         ),
       );
@@ -555,7 +632,6 @@ class _DownloadButton extends ConsumerWidget {
           subtitle:        seriesTitle,
           durationSeconds: durationSeconds,
         );
-
         ScaffoldMessenger.of(context)
           ..clearSnackBars()
           ..showSnackBar(SnackBar(
@@ -565,7 +641,7 @@ class _DownloadButton extends ConsumerWidget {
               Expanded(
                 child: Text(
                   'Downloading "$episodeTitle"…',
-                  style:    const TextStyle(fontSize: 13),
+                  style: const TextStyle(fontSize: 13),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -580,7 +656,7 @@ class _DownloadButton extends ConsumerWidget {
   }
 }
 
-// ── ENC lock badge ────────────────────────────────────────────────────────────
+// ── ENC lock badge ─────────────────────────────────────────────────────────────
 
 class _EncLockBadge extends StatelessWidget {
   const _EncLockBadge();
@@ -592,44 +668,27 @@ class _EncLockBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color:        AppColors.accentGold.withOpacity(0.18),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: AppColors.accentGold.withOpacity(0.55),
-          width: 0.8,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color:     AppColors.accentGold.withOpacity(0.25),
-            blurRadius: 6,
-          ),
-        ],
+        border: Border.all(color: AppColors.accentGold.withOpacity(0.55), width: 0.8),
+        boxShadow: [BoxShadow(color: AppColors.accentGold.withOpacity(0.25), blurRadius: 6)],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.lock_rounded,
-            size:    9,
-            color:   AppColors.accentGold,
-            shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4)],
-          ),
+          Icon(Icons.lock_rounded, size: 9, color: AppColors.accentGold,
+              shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.6), blurRadius: 4)]),
           const SizedBox(width: 3),
-          Text(
-            'ENC',
-            style: TextStyle(
-              color:        AppColors.accentGold,
-              fontSize:     9,
-              fontWeight:   FontWeight.w800,
-              letterSpacing: 0.6,
-              shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.5), blurRadius: 4)],
-            ),
-          ),
+          Text('ENC', style: TextStyle(
+            color: AppColors.accentGold, fontSize: 9, fontWeight: FontWeight.w800,
+            letterSpacing: 0.6,
+            shadows: [Shadow(color: AppColors.accentGold.withOpacity(0.5), blurRadius: 4)],
+          )),
         ],
       ),
     );
   }
 }
 
-// ── Shimmer placeholder ───────────────────────────────────────────────────────
+// ── Shimmer placeholder ────────────────────────────────────────────────────────
 
 class _EpisodeShimmer extends StatelessWidget {
   const _EpisodeShimmer();

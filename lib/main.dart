@@ -1,4 +1,5 @@
 // lib/main.dart
+// CHANGE: Added 'playback_positions_box' to Hive init for remaining time tracking.
 
 import 'dart:async';
 
@@ -14,15 +15,16 @@ import 'core/constants/app_constants.dart';
 import 'features/player/services/audio_handler.dart';
 import 'features/player/providers/audio_player_provider.dart';
 import 'features/downloads/data/models/download_model.dart';
+import 'features/player/services/playback_position_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-      systemNavigationBarColor: AppColors.surface,
+      statusBarColor:                   Colors.transparent,
+      statusBarIconBrightness:          Brightness.light,
+      systemNavigationBarColor:         AppColors.surface,
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
@@ -56,14 +58,14 @@ Future<void> _initHive() async {
 
   await Future.microtask(() {});
 
-  // FIX: Added completedEpisodesBox for tracking finished episodes
   final boxes = [
     AppConstants.downloadsBox,
     AppConstants.favoritesBox,
     AppConstants.settingsBox,
     AppConstants.playbackBox,
     AppConstants.continueListeningBox,
-    AppConstants.completedEpisodesBox, // NEW
+    AppConstants.completedEpisodesBox,
+    'playback_positions_box', // NEW: for remaining time persistence
   ];
 
   for (final boxName in boxes) {
@@ -80,11 +82,11 @@ Future<AudioCalmHandler> _initAudioServiceBackground() async {
           AppConstants.audioServiceNotificationChannelId,
       androidNotificationChannelName:
           AppConstants.audioServiceNotificationChannelName,
-      androidNotificationOngoing: true,
-      androidStopForegroundOnPause: true,
-      notificationColor: AppColors.primary,
-      artDownscaleHeight: 200,
-      artDownscaleWidth: 200,
+      androidNotificationOngoing:      true,
+      androidStopForegroundOnPause:    true,
+      notificationColor:               AppColors.primary,
+      artDownscaleHeight:              200,
+      artDownscaleWidth:               200,
     ),
   );
 }
@@ -95,11 +97,11 @@ class AudioCalmApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
-      title: 'Audio Calm',
+      title:                      'Audio Calm',
       debugShowCheckedModeBanner: false,
-      theme: AppTheme.darkTheme(),
-      routerConfig: AppRouter.router,
-      showPerformanceOverlay: false,
+      theme:                      AppTheme.darkTheme(),
+      routerConfig:               AppRouter.router,
+      showPerformanceOverlay:     false,
       builder: (context, child) {
         return RepaintBoundary(
           child: child ?? const SizedBox.shrink(),

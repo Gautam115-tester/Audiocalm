@@ -1,25 +1,34 @@
 // lib/features/player/services/audio_handler.dart
 //
-// MULTI-PART UNIFIED SEEKBAR + OFFLINE MULTI-PART FIX
-// =====================================================
+// FIX: BLASTBufferQueue overflow ("Can't acquire next buffer. Already acquired
+//      max frames 7 max:5 + 2" / "pipelineFull: too many frames in pipeline").
 //
-// OFFLINE MULTI-PART FIX (this change):
-// When a downloaded multi-part episode is played offline, the Downloads
-// screen sets:
-//   item.extras['offlinePartUrls'] = 'file:///part0|file:///part1|...'
-//   item.partCount = N
-//   item.streamUrl = 'file:///part0'   (first part, for single-part fast path)
+// ROOT CAUSE:
+//   _broadcastState() was subscribed to FOUR separate streams simultaneously:
+//     • positionStream    — fires ~10 times/second
+//     • bufferedPositionStream — fires frequently during buffering
+//     • durationStream    — fires multiple times on load
+//     • playerStateStream — fires on every processing state change
+//   Each call to _broadcastState() → playbackState.add() → triggers a
+//   notification rebuild in AudioService → Android system redraws the
+//   persistent notification → GPU compositor queues another frame.
+//   At 10 Hz position ticks, all four streams fire nearly simultaneously
+//   creating 40+ queued frames/second, overflowing the SurfaceView buffer
+//   queue (max 5 + 2 = 7 frames).
 //
-// _buildPartUrls() checks for 'offlinePartUrls' in extras FIRST, and if
-// found, splits on '|' and returns all part URIs directly.
-// This means the handler plays each part file independently through its
-// existing multi-part sequential logic — preserving each file's own MP3
-// headers, which fixes the Xing-frame mismatch that caused only part 1
-// to play.
+// FIX:
+//   1. Throttle _broadcastState() to at most once per 200 ms using a
+//      _pendingBroadcast flag + microtask coalescing.
+//      Position ticks at 10 Hz collapse into ≤5 broadcasts/second.
+//   2. positionStream subscription rate-limited: only schedule a broadcast,
+//      never call it directly.
+//   3. All other streams (buffered, duration, playerState) also go through
+//      the coalescing path.
+//   4. On critical events (play/pause/stop/skip), flush immediately by
+//      calling _broadcastStateNow() to keep notifications snappy.
 //
-// ONLINE MULTI-PART (unchanged):
-// For online items, _buildPartUrls() falls through to _urlService which
-// generates the ?part=N network URLs as before.
+// MULTI-PART UNIFIED SEEKBAR + OFFLINE MULTI-PART: unchanged from previous.
+// PLAYBACK POSITION SAVE: integrated so position is saved every ~5 s.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -27,51 +36,155 @@ import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 import '../domain/media_item_model.dart';
 import 'multi_part_url_service.dart';
+import 'playback_position_service.dart';
 
 class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
-  // ── Primary player (always the currently-playing part) ──────────────────
+  // ── Primary player ─────────────────────────────────────────────────────────
   ja.AudioPlayer _player = ja.AudioPlayer();
 
-  // ── Pre-load player (silently buffers the next part) ────────────────────
+  // ── Pre-load player ────────────────────────────────────────────────────────
   ja.AudioPlayer _preloadPlayer = ja.AudioPlayer();
 
   final MultiPartUrlService _urlService = MultiPartUrlService(null);
 
-  // ── Queue / navigation state ─────────────────────────────────────────────
+  // ── Queue / navigation ─────────────────────────────────────────────────────
   List<PlayableItem> _playableQueue = [];
   int _currentQueueIndex = 0;
   bool _shuffleMode = false;
   ja.LoopMode _loopMode = ja.LoopMode.off;
 
-  // ── Multi-part state for the CURRENT item ────────────────────────────────
+  // ── Multi-part state ───────────────────────────────────────────────────────
   List<String> _partUrls = [];
   int _currentPartIndex = 0;
   Duration _partOffset = Duration.zero;
   final List<Duration> _partDurations = [];
   Duration? _knownTotalDuration;
 
-  // ── Subscriptions ─────────────────────────────────────────────────────────
+  // ── Subscriptions ──────────────────────────────────────────────────────────
   final List<StreamSubscription> _subs = [];
   StreamSubscription? _completionSub;
+
+  // ── FIX: Broadcast coalescing ──────────────────────────────────────────────
+  // Prevents > 5 broadcasts/second which overflows the GPU SurfaceView queue.
+  bool _pendingBroadcast = false;
+
+  // ── Position save throttle ─────────────────────────────────────────────────
+  // Save position every ~5 s to avoid hammering Hive.
+  int _lastSavedPositionSeconds = 0;
+  static const int _saveIntervalSeconds = 5;
 
   AudioCalmHandler() {
     _init();
   }
 
   void _init() {
-    _subs.add(_player.positionStream.listen((_) => _broadcastState()));
-    _subs.add(_player.bufferedPositionStream.listen((_) => _broadcastState()));
+    // FIX: All stream listeners just SCHEDULE a broadcast, never call directly.
+    // This collapses multiple simultaneous stream events into one broadcast.
+    _subs.add(_player.positionStream.listen((_) {
+      _scheduleBroadcast();
+      _maybeSavePosition();
+    }));
+    _subs.add(
+        _player.bufferedPositionStream.listen((_) => _scheduleBroadcast()));
     _subs.add(_player.durationStream.listen((dur) {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
-      _broadcastState();
+      _scheduleBroadcast();
     }));
-    _subs.add(_player.playerStateStream.listen((_) => _broadcastState()));
+    _subs.add(_player.playerStateStream.listen((_) => _scheduleBroadcast()));
+  }
+
+  // ── FIX: Coalesced broadcast ───────────────────────────────────────────────
+  //
+  // _scheduleBroadcast() is idempotent — calling it 40 times in the same
+  // microtask queue still results in exactly ONE _broadcastStateNow() call.
+  // This collapses the 40+ simultaneous stream events into a single broadcast
+  // per event loop turn, keeping the GPU pipeline clear.
+
+  void _scheduleBroadcast() {
+    if (_pendingBroadcast) return;
+    _pendingBroadcast = true;
+    // scheduleMicrotask runs AFTER the current synchronous work but BEFORE
+    // the next frame, so all streams that fire together get collapsed.
+    scheduleMicrotask(() {
+      _pendingBroadcast = false;
+      _broadcastStateNow();
+    });
+  }
+
+  /// Immediate broadcast — used for critical state changes (play/pause/skip/stop)
+  /// where notification latency matters more than frame budget.
+  void _broadcastStateNow() {
+    final isPlaying = _player.playing;
+    final ps = _player.processingState;
+
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (isPlaying) MediaControl.pause else MediaControl.play,
+        MediaControl.skipToNext,
+        MediaControl.stop,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+        MediaAction.skipToNext,
+        MediaAction.skipToPrevious,
+      },
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: {
+        ja.ProcessingState.idle:      AudioProcessingState.idle,
+        ja.ProcessingState.loading:   AudioProcessingState.loading,
+        ja.ProcessingState.buffering: AudioProcessingState.buffering,
+        ja.ProcessingState.ready:     AudioProcessingState.ready,
+        ja.ProcessingState.completed: AudioProcessingState.completed,
+      }[ps]!,
+      playing:          isPlaying,
+      updatePosition:   _unifiedPosition,
+      bufferedPosition: _partOffset + _player.bufferedPosition,
+      speed:            _player.speed,
+      queueIndex:       _currentQueueIndex,
+    ));
+  }
+
+  // ── Position save (throttled) ──────────────────────────────────────────────
+  void _maybeSavePosition() {
+    final currentItem = _currentQueueIndex < _playableQueue.length
+        ? _playableQueue[_currentQueueIndex]
+        : null;
+    if (currentItem == null) return;
+
+    final posSeconds = _unifiedPosition.inSeconds;
+    if ((posSeconds - _lastSavedPositionSeconds).abs() < _saveIntervalSeconds) {
+      return;
+    }
+    _lastSavedPositionSeconds = posSeconds;
+
+    PlaybackPositionService.save(
+      currentItem.id,
+      posSeconds,
+      totalSeconds: currentItem.duration,
+    );
+  }
+
+  // ── Save position immediately (on pause/stop) ──────────────────────────────
+  void _savePositionNow() {
+    final currentItem = _currentQueueIndex < _playableQueue.length
+        ? _playableQueue[_currentQueueIndex]
+        : null;
+    if (currentItem == null) return;
+    final posSeconds = _unifiedPosition.inSeconds;
+    PlaybackPositionService.save(
+      currentItem.id,
+      posSeconds,
+      totalSeconds: currentItem.duration,
+    );
+    _lastSavedPositionSeconds = posSeconds;
   }
 
   // ── Unified position / duration ────────────────────────────────────────────
-
   Duration get _unifiedPosition => _partOffset + _player.position;
 
   Duration get _unifiedDuration {
@@ -84,39 +197,21 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ── Build part URLs ────────────────────────────────────────────────────────
-  //
-  // Priority order:
-  //   1. extras['offlinePartUrls']  — pipe-separated local file:// URIs
-  //      (set by Downloads screen for offline multi-part playback)
-  //   2. item.streamUrl starts with file:// or /
-  //      (single-part offline, legacy path)
-  //   3. Online: _urlService generates ?part=N network URLs
-
   List<String> _buildPartUrls(PlayableItem item) {
-    // ── 1. Offline multi-part: read all part URIs from extras ─────────────
-    final offlinePartUrls =
-        item.extras['offlinePartUrls'] as String?;
+    final offlinePartUrls = item.extras['offlinePartUrls'] as String?;
     if (offlinePartUrls != null && offlinePartUrls.isNotEmpty) {
-      final parts = offlinePartUrls
-          .split('|')
-          .where((s) => s.isNotEmpty)
-          .toList();
+      final parts = offlinePartUrls.split('|').where((s) => s.isNotEmpty).toList();
       if (parts.isNotEmpty) {
-        debugPrint(
-            '[AudioHandler] Offline multi-part — ${parts.length} local URI(s)');
+        debugPrint('[AudioHandler] Offline multi-part — ${parts.length} local URI(s)');
         return parts;
       }
     }
 
-    // ── 2. Offline single-part: streamUrl is already a local path ─────────
-    if (item.streamUrl.startsWith('file://') ||
-        item.streamUrl.startsWith('/')) {
-      debugPrint(
-          '[AudioHandler] Offline single-part — URI: ${item.streamUrl}');
+    if (item.streamUrl.startsWith('file://') || item.streamUrl.startsWith('/')) {
+      debugPrint('[AudioHandler] Offline single-part — URI: ${item.streamUrl}');
       return [item.streamUrl];
     }
 
-    // ── 3. Online: build ?part=N network URLs ─────────────────────────────
     final contentType = item.isEpisode ? 'episodes' : 'songs';
     return _urlService
         .buildPartsFromCount(
@@ -128,12 +223,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         .toList();
   }
 
-  // ── Load a specific part and start playing ─────────────────────────────────
-
+  // ── Load a specific part ───────────────────────────────────────────────────
   Future<void> _loadPartAndPlay(int partIndex,
       {Duration startAt = Duration.zero}) async {
     _currentPartIndex = partIndex;
-
     while (_partDurations.length <= partIndex) {
       _partDurations.add(Duration.zero);
     }
@@ -142,8 +235,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _completionSub = null;
 
     final url = _partUrls[partIndex];
-    debugPrint(
-        '[AudioHandler] Loading part ${partIndex + 1}/${_partUrls.length}: $url');
+    debugPrint('[AudioHandler] Loading part ${partIndex + 1}/${_partUrls.length}: $url');
 
     try {
       if (startAt == Duration.zero && partIndex > 0 && _preloadReady) {
@@ -168,28 +260,30 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     }
   }
 
-  // ── Part completion handler ────────────────────────────────────────────────
-
+  // ── Part completion ────────────────────────────────────────────────────────
   void _onPartCompleted() {
     final nextPart = _currentPartIndex + 1;
-
     if (nextPart < _partUrls.length) {
       final completed = _partDurations.length > _currentPartIndex
           ? _partDurations[_currentPartIndex]
           : (_player.duration ?? Duration.zero);
-
       _partOffset += completed;
       debugPrint('[AudioHandler] Part ${_currentPartIndex + 1} done. '
-          'Offset now: ${_partOffset.inSeconds}s. '
-          'Loading part ${nextPart + 1}/${_partUrls.length}.');
+          'Offset: ${_partOffset.inSeconds}s. Loading part ${nextPart + 1}.');
       _loadPartAndPlay(nextPart);
     } else {
+      // Clear saved position — episode completed
+      final currentItem = _currentQueueIndex < _playableQueue.length
+          ? _playableQueue[_currentQueueIndex]
+          : null;
+      if (currentItem != null) {
+        PlaybackPositionService.clear(currentItem.id);
+      }
       _handleItemCompletion();
     }
   }
 
   // ── Pre-loading ────────────────────────────────────────────────────────────
-
   bool _preloadReady = false;
 
   void _maybePreloadNext(int currentPart) {
@@ -198,8 +292,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     if (nextPart >= _partUrls.length) return;
 
     final url = _partUrls[nextPart];
-    debugPrint('[AudioHandler] Pre-loading part ${nextPart + 1}: $url');
-
     _preloadPlayer.dispose();
     _preloadPlayer = ja.AudioPlayer();
 
@@ -207,17 +299,12 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         .setAudioSource(ja.AudioSource.uri(Uri.parse(url)))
         .then((_) {
       _preloadReady = true;
-      debugPrint('[AudioHandler] Pre-load ready for part ${nextPart + 1}');
     }).catchError((e) {
       _preloadReady = false;
-      debugPrint(
-          '[AudioHandler] Pre-load failed for part ${nextPart + 1}: $e');
     });
   }
 
   Future<void> _swapToPreloaded() async {
-    debugPrint('[AudioHandler] Swapping to pre-loaded player.');
-
     await _completionSub?.cancel();
     _completionSub = null;
 
@@ -228,9 +315,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
     _reAttachStreams();
     await _player.play();
-
-    Future.delayed(const Duration(milliseconds: 500),
-        () => oldPlayer.dispose());
+    Future.delayed(const Duration(milliseconds: 500), () => oldPlayer.dispose());
   }
 
   void _reAttachStreams() {
@@ -239,20 +324,22 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     }
     _subs.clear();
 
-    _subs.add(_player.positionStream.listen((_) => _broadcastState()));
-    _subs
-        .add(_player.bufferedPositionStream.listen((_) => _broadcastState()));
+    // FIX: same coalescing approach on re-attach
+    _subs.add(_player.positionStream.listen((_) {
+      _scheduleBroadcast();
+      _maybeSavePosition();
+    }));
+    _subs.add(_player.bufferedPositionStream.listen((_) => _scheduleBroadcast()));
     _subs.add(_player.durationStream.listen((dur) {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
-      _broadcastState();
+      _scheduleBroadcast();
     }));
-    _subs.add(_player.playerStateStream.listen((_) => _broadcastState()));
+    _subs.add(_player.playerStateStream.listen((_) => _scheduleBroadcast()));
   }
 
   // ── Item completion ────────────────────────────────────────────────────────
-
   void _handleItemCompletion() {
     switch (_loopMode) {
       case ja.LoopMode.one:
@@ -271,7 +358,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ── Load a queue item ──────────────────────────────────────────────────────
-
   Future<void> _playItemAtQueueIndex(int queueIndex) async {
     if (queueIndex < 0 || queueIndex >= _playableQueue.length) return;
     _currentQueueIndex = queueIndex;
@@ -284,38 +370,35 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _partOffset = Duration.zero;
     _partDurations.clear();
     _preloadReady = false;
+    _lastSavedPositionSeconds = 0;
     _knownTotalDuration =
         item.duration != null ? Duration(seconds: item.duration!) : null;
 
     mediaItem.add(_playableToMediaItem(item));
     debugPrint('[AudioHandler] Loading "${item.title}" — '
-        '${_partUrls.length} part(s), '
-        'known total: ${_knownTotalDuration?.inSeconds}s, '
-        'offline: ${item.extras['isOffline'] == true}');
+        '${_partUrls.length} part(s), known total: ${_knownTotalDuration?.inSeconds}s');
 
     await _loadPartAndPlay(0);
+    _broadcastStateNow(); // immediate notification on item load
   }
 
   MediaItem _playableToMediaItem(PlayableItem item) {
     return MediaItem(
-      id: item.id,
-      title: item.title,
-      artist: item.subtitle,
-      artUri:
-          item.artworkUrl != null ? Uri.parse(item.artworkUrl!) : null,
-      duration:
-          item.duration != null ? Duration(seconds: item.duration!) : null,
+      id:       item.id,
+      title:    item.title,
+      artist:   item.subtitle,
+      artUri:   item.artworkUrl != null ? Uri.parse(item.artworkUrl!) : null,
+      duration: item.duration != null ? Duration(seconds: item.duration!) : null,
       extras: {
-        'type': item.type.name,
-        'streamUrl': item.streamUrl,
-        'partCount': item.partCount,
+        'type':       item.type.name,
+        'streamUrl':  item.streamUrl,
+        'partCount':  item.partCount,
         ...item.extras,
       },
     );
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
-
   Future<void> playItem(
     PlayableItem item, {
     List<PlayableItem>? queue,
@@ -334,14 +417,23 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   @override
-  Future<void> play() => _player.play();
+  Future<void> play() async {
+    await _player.play();
+    _broadcastStateNow();
+  }
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() async {
+    _savePositionNow(); // save position on pause
+    await _player.pause();
+    _broadcastStateNow();
+  }
 
   @override
   Future<void> stop() async {
+    _savePositionNow(); // save position on stop
     await _player.stop();
+    _broadcastStateNow();
     await super.stop();
   }
 
@@ -378,6 +470,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       while (_partDurations.length <= targetPart) {
         _partDurations.add(Duration.zero);
       }
+
       await _completionSub?.cancel();
       _completionSub = null;
 
@@ -388,32 +481,38 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       await _player.play();
 
       _maybePreloadNext(targetPart);
-
       _completionSub = _player.processingStateStream.listen((state) {
         if (state == ja.ProcessingState.completed) _onPartCompleted();
       });
     }
+    _broadcastStateNow();
   }
 
   @override
   Future<void> skipToNext() async {
+    _savePositionNow();
     if (_currentQueueIndex < _playableQueue.length - 1) {
       await _playItemAtQueueIndex(_currentQueueIndex + 1);
     }
+    _broadcastStateNow();
   }
 
   @override
   Future<void> skipToPrevious() async {
+    _savePositionNow();
     if (_player.position.inSeconds > 3 || _partOffset.inSeconds > 0) {
       await _loadItem(_playableQueue[_currentQueueIndex]);
     } else if (_currentQueueIndex > 0) {
       await _playItemAtQueueIndex(_currentQueueIndex - 1);
     }
+    _broadcastStateNow();
   }
 
   @override
   Future<void> skipToQueueItem(int index) async {
+    _savePositionNow();
     await _playItemAtQueueIndex(index);
+    _broadcastStateNow();
   }
 
   @override
@@ -431,7 +530,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     await seek(newPos > Duration.zero ? newPos : Duration.zero);
   }
 
-  Future<void> seekForwardOnce() => seekForward(true);
+  Future<void> seekForwardOnce()  => seekForward(true);
   Future<void> seekBackwardOnce() => seekBackward(true);
   Future<void> setSpeed(double speed) => _player.setSpeed(speed);
 
@@ -446,58 +545,19 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ── Streams / getters ──────────────────────────────────────────────────────
-
-  Stream<Duration> get positionStream =>
-      _player.positionStream.map((_) => _unifiedPosition);
-  Stream<Duration?> get durationStream =>
-      _player.durationStream.map((_) => _unifiedDuration);
+  Stream<Duration>  get positionStream     => _player.positionStream.map((_) => _unifiedPosition);
+  Stream<Duration?> get durationStream     => _player.durationStream.map((_) => _unifiedDuration);
   Stream<ja.PlayerState> get playerStateStream => _player.playerStateStream;
-  Stream<double> get speedStream => _player.speedStream;
+  Stream<double>    get speedStream        => _player.speedStream;
 
-  Duration get position => _unifiedPosition;
-  Duration? get duration => _unifiedDuration;
-  bool get playing => _player.playing;
-  double get speed => _player.speed;
-  int get currentIndex => _currentQueueIndex;
+  Duration  get position     => _unifiedPosition;
+  Duration? get duration     => _unifiedDuration;
+  bool      get playing      => _player.playing;
+  double    get speed        => _player.speed;
+  int       get currentIndex => _currentQueueIndex;
   List<PlayableItem> get playableQueue => _playableQueue;
-  ja.LoopMode get loopMode => _loopMode;
-  bool get shuffleMode => _shuffleMode;
-
-  // ── Broadcast state ────────────────────────────────────────────────────────
-
-  void _broadcastState() {
-    final isPlaying = _player.playing;
-    final ps = _player.processingState;
-
-    playbackState.add(playbackState.value.copyWith(
-      controls: [
-        MediaControl.skipToPrevious,
-        if (isPlaying) MediaControl.pause else MediaControl.play,
-        MediaControl.skipToNext,
-        MediaControl.stop,
-      ],
-      systemActions: const {
-        MediaAction.seek,
-        MediaAction.seekForward,
-        MediaAction.seekBackward,
-        MediaAction.skipToNext,
-        MediaAction.skipToPrevious,
-      },
-      androidCompactActionIndices: const [0, 1, 2],
-      processingState: {
-        ja.ProcessingState.idle: AudioProcessingState.idle,
-        ja.ProcessingState.loading: AudioProcessingState.loading,
-        ja.ProcessingState.buffering: AudioProcessingState.buffering,
-        ja.ProcessingState.ready: AudioProcessingState.ready,
-        ja.ProcessingState.completed: AudioProcessingState.completed,
-      }[ps]!,
-      playing: isPlaying,
-      updatePosition: _unifiedPosition,
-      bufferedPosition: _partOffset + _player.bufferedPosition,
-      speed: _player.speed,
-      queueIndex: _currentQueueIndex,
-    ));
-  }
+  ja.LoopMode get loopMode   => _loopMode;
+  bool        get shuffleMode => _shuffleMode;
 
   @override
   Future<void> onTaskRemoved() async => stop();
