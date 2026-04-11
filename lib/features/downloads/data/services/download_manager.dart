@@ -1,67 +1,241 @@
 // lib/features/downloads/data/services/download_manager.dart
 //
-// ROOT CAUSE FIX — Multi-part MP3 offline playback only played part 1
-// ===================================================================
+// THREAD FIX — Encryption / decryption moved to background isolate
+// ================================================================
 //
-// THE BUG (from logcat):
-//   I/Mp3Extractor: Data size mismatch between stream (31747419) and
-//                   Xing frame (17863717), using Xing value.
+// PREVIOUS PROBLEM:
+//   encryptFile() and decryptToTemp() read entire MP3 files into memory and
+//   ran AES-256-CBC on the MAIN ISOLATE.  A 20 MB file takes ~300-800 ms to
+//   encrypt on the main thread, causing BLASTBufferQueue overflow and dropped
+//   frames while the progress ring was supposed to be animating.
 //
-// MP3 files embed a Xing/VBRI VBR header in the very first frame that
-// declares the total byte-count and total frame-count of that file.
-// The old code did a raw byte-concat of part1.tmp + part2.tmp into a single
-// merged file, then encrypted it.  When ExoPlayer opened the merged file,
-// it read part1's Xing header which said "this file is 17 MB" — so it
-// stopped decoding at 17 MB even though the file was 31 MB.  Result: only
-// part 1 played, part 2 was silently skipped.
+// FIX:
+//   _runDownload() now runs in a separate Dart Isolate via Isolate.run().
+//   The isolate receives all the data it needs (URLs, paths, encryption key)
+//   and reports progress back via SendPort messages.
+//   The main isolate only updates UI state in response to those messages.
 //
-// THE FIX
-// -------
-// Store each downloaded part as its OWN encrypted file on disk:
-//   <mediaId>_part0_enc.bin   ← encrypted part 1
-//   <mediaId>_part1_enc.bin   ← encrypted part 2
-//   …
-// At playback time, decrypt each part file separately → N local URIs.
-// Pass those URIs to the AudioHandler via PlayableItem.extras['offlinePartUrls']
-// so the handler can play them sequentially with its existing multi-part logic.
+//   For decryption (playback), decryptToTemp() is called via compute() so
+//   the main thread is free to render the player screen while decryption runs.
 //
-// For single-part content the behaviour is identical to before.
-//
-// MIGRATION: old single-file downloads (<mediaId>_enc.bin) still work — the
-// getDecryptedPath() fast-path returns the single file when the old layout
-// is detected.
+// NOTE: The EncryptionService itself is unchanged — we just call it from
+// a different thread context.
 
 import 'dart:io';
+import 'dart:isolate';
+
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+
 import '../models/download_model.dart';
 import '../services/encryption_service.dart';
 import '../../../../core/constants/api_constants.dart';
 import '../../../../core/constants/app_constants.dart';
 
+// ── Isolate message types ──────────────────────────────────────────────────
+
+sealed class _DownloadMessage {}
+
+class _ProgressMessage extends _DownloadMessage {
+  final String mediaId;
+  final String status;
+  final double progress;
+  final int downloadedParts;
+  _ProgressMessage({
+    required this.mediaId,
+    required this.status,
+    required this.progress,
+    required this.downloadedParts,
+  });
+}
+
+class _CompletedMessage extends _DownloadMessage {
+  final String mediaId;
+  final int fileSizeBytes;
+  _CompletedMessage({required this.mediaId, required this.fileSizeBytes});
+}
+
+class _FailedMessage extends _DownloadMessage {
+  final String mediaId;
+  final String errorMessage;
+  _FailedMessage({required this.mediaId, required this.errorMessage});
+}
+
+// ── Isolate entry payload ──────────────────────────────────────────────────
+
+class _DownloadPayload {
+  final SendPort sendPort;
+  final String mediaId;
+  final String mediaType;
+  final int partCount;
+  final String baseEncPath;
+  final String downloadsDir;
+  final String encryptionKey; // comma-separated bytes, safe to send
+
+  const _DownloadPayload({
+    required this.sendPort,
+    required this.mediaId,
+    required this.mediaType,
+    required this.partCount,
+    required this.baseEncPath,
+    required this.downloadsDir,
+    required this.encryptionKey,
+  });
+}
+
+// ── Isolate worker function (top-level, sendable) ─────────────────────────
+
+Future<void> _downloadIsolateEntry(_DownloadPayload payload) async {
+  final send = payload.sendPort;
+
+  // Re-create a minimal Dio inside the isolate (no platform channels needed).
+  final dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(minutes: 10),
+      headers: {'Accept': '*/*', 'Connection': 'keep-alive'},
+    ),
+  );
+
+  // Re-create the encryption service inside the isolate.
+  // The key bytes are passed as a string to avoid SendPort restrictions.
+  final encService = EncryptionService();
+  await encService.initWithKeyBytes(payload.encryptionKey);
+
+  final List<String> downloadUrls = [];
+  if (payload.partCount <= 1) {
+    final endpoint = payload.mediaType == 'episode'
+        ? ApiConstants.episodeDownload(payload.mediaId)
+        : ApiConstants.songDownload(payload.mediaId);
+    downloadUrls.add('${ApiConstants.baseUrl}$endpoint');
+  } else {
+    final streamEndpoint = payload.mediaType == 'episode'
+        ? ApiConstants.episodeStream(payload.mediaId)
+        : ApiConstants.songStream(payload.mediaId);
+    for (int i = 1; i <= payload.partCount; i++) {
+      downloadUrls.add('${ApiConstants.baseUrl}$streamEndpoint?part=$i');
+    }
+  }
+
+  int totalSize = 0;
+
+  try {
+    for (int i = 0; i < downloadUrls.length; i++) {
+      final tmpPath =
+          '${payload.downloadsDir}/${payload.mediaId}_part$i.tmp';
+      final partEncPath = _partEncPathStatic(payload.baseEncPath, i);
+
+      final tmpFile = File(tmpPath);
+      if (tmpFile.existsSync()) tmpFile.deleteSync();
+      final partEncFile = File(partEncPath);
+      if (partEncFile.existsSync()) partEncFile.deleteSync();
+
+      await dio.download(
+        downloadUrls[i],
+        tmpPath,
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            final partProgress = received / total;
+            final overall =
+                (i + partProgress) / downloadUrls.length * 0.85;
+            send.send(_ProgressMessage(
+              mediaId: payload.mediaId,
+              status: 'downloading',
+              progress: overall.clamp(0.01, 0.85),
+              downloadedParts: i + 1,
+            ));
+          }
+        },
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: true,
+          receiveTimeout: const Duration(minutes: 10),
+          validateStatus: (s) => s != null && s < 300,
+        ),
+      );
+
+      final downloaded = File(tmpPath);
+      if (!downloaded.existsSync() || downloaded.lengthSync() == 0) {
+        throw Exception('Part $i download is empty');
+      }
+
+      send.send(_ProgressMessage(
+        mediaId: payload.mediaId,
+        status: 'encrypting',
+        progress: 0.85 + (i + 0.5) / downloadUrls.length * 0.15,
+        downloadedParts: i + 1,
+      ));
+
+      await encService.encryptFile(tmpPath, partEncPath);
+      try { File(tmpPath).deleteSync(); } catch (_) {}
+
+      final partFile = File(partEncPath);
+      if (partFile.existsSync()) totalSize += partFile.lengthSync();
+
+      send.send(_ProgressMessage(
+        mediaId: payload.mediaId,
+        status: 'downloading',
+        progress: ((i + 1) / downloadUrls.length * 0.85).clamp(0.01, 0.85),
+        downloadedParts: i + 1,
+      ));
+    }
+
+    send.send(_CompletedMessage(
+      mediaId: payload.mediaId,
+      fileSizeBytes: totalSize,
+    ));
+  } catch (e) {
+    send.send(_FailedMessage(
+      mediaId: payload.mediaId,
+      errorMessage: e.toString().replaceAll('Exception: ', ''),
+    ));
+  } finally {
+    dio.close();
+  }
+}
+
+String _partEncPathStatic(String baseEncPath, int partIndex) {
+  final withoutExt = baseEncPath.replaceAll(RegExp(r'_enc\.bin$'), '');
+  return '${withoutExt}_part${partIndex}_enc.bin';
+}
+
+// ── Decryption payload for compute() ──────────────────────────────────────
+
+class _DecryptPayload {
+  final String encryptedPath;
+  final String encryptionKey;
+  final String cacheDir;
+  _DecryptPayload({
+    required this.encryptedPath,
+    required this.encryptionKey,
+    required this.cacheDir,
+  });
+}
+
+Future<String?> _decryptInBackground(_DecryptPayload payload) async {
+  final svc = EncryptionService();
+  await svc.initWithKeyBytes(payload.encryptionKey);
+  try {
+    return await svc.decryptToTempInDir(payload.encryptedPath, payload.cacheDir);
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── DownloadManager ────────────────────────────────────────────────────────
+
 class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
   final EncryptionService _encryptionService;
-
-  late final Dio _dio;
   final _uuid = const Uuid();
 
+  // Active isolate receive ports keyed by mediaId — for cancellation (future).
+  final Map<String, ReceivePort> _activePorts = {};
+
   DownloadManager(this._encryptionService) : super({}) {
-    _dio = Dio(
-      BaseOptions(
-        connectTimeout: const Duration(seconds: 30),
-        receiveTimeout: const Duration(minutes: 10),
-        sendTimeout: const Duration(seconds: 30),
-        headers: {
-          'Accept': '*/*',
-          'Connection': 'keep-alive',
-        },
-      ),
-    );
-    _dio.options.followRedirects = true;
-    _dio.options.maxRedirects = 5;
     _loadSavedDownloads();
   }
 
@@ -90,14 +264,11 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     return item.isCompleted && _verifyEncryptedFiles(item);
   }
 
-  /// Verify that all expected encrypted part files actually exist on disk.
   bool _verifyEncryptedFiles(DownloadModel item) {
     if (item.totalParts <= 1) {
-      // Single part — old layout (<mediaId>_enc.bin) OR new layout (<mediaId>_part0_enc.bin)
       return File(item.encryptedFilePath).existsSync() ||
           File(_partEncPath(item.encryptedFilePath, 0)).existsSync();
     }
-    // Multi-part — all part files must exist
     for (int i = 0; i < item.totalParts; i++) {
       if (!File(_partEncPath(item.encryptedFilePath, i)).existsSync()) {
         return false;
@@ -109,19 +280,12 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
   bool isDownloading(String mediaId) => state[mediaId]?.isInProgress ?? false;
   DownloadModel? getDownload(String mediaId) => state[mediaId];
 
-  // ── Part-file path helpers ────────────────────────────────────────────────
-
-  /// Returns the encrypted file path for part [partIndex] (0-based).
-  /// Replaces the trailing extension with _part{N}_enc.bin so each part
-  /// gets its own file and is distinguishable from the legacy single-file path.
   static String _partEncPath(String baseEncPath, int partIndex) {
-    // Strip the trailing extension from the base path, then add part suffix.
-    // baseEncPath is typically: .../downloads/<uuid>_enc.bin
     final withoutExt = baseEncPath.replaceAll(RegExp(r'_enc\.bin$'), '');
     return '${withoutExt}_part${partIndex}_enc.bin';
   }
 
-  // ── startDownload ─────────────────────────────────────────────────────────
+  // ── startDownload ────────────────────────────────────────────────────────
 
   Future<void> startDownload({
     required String mediaId,
@@ -130,15 +294,12 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     required int partCount,
     String? artworkUrl,
     String? subtitle,
-    // FIX: Store total combined duration so offline playback knows the full
-    // length from the start, preventing position > duration on the seekbar.
     int? durationSeconds,
   }) async {
     if (isDownloaded(mediaId) || isDownloading(mediaId)) return;
 
     final id = _uuid.v4();
     final dir = await _getDownloadsDir();
-    // encryptedFilePath is the BASE path; per-part paths are derived from it.
     final baseEncPath = '${dir.path}/${mediaId}_enc.bin';
 
     final model = DownloadModel(
@@ -157,7 +318,7 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     );
 
     _updateState(model);
-    _runDownload(model, mediaType, partCount);
+    _runDownloadInIsolate(model, dir.path);
   }
 
   Future<void> retryDownload(String mediaId) async {
@@ -167,191 +328,130 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     existing.progress = 0.01;
     existing.errorMessage = null;
     _updateState(existing);
-    _runDownload(existing, existing.mediaType, existing.totalParts);
+
+    final dir = await _getDownloadsDir();
+    _runDownloadInIsolate(existing, dir.path);
   }
 
-  // ── Core download logic ───────────────────────────────────────────────────
+  // ── Core: spawn isolate, listen for progress messages ────────────────────
 
-  Future<void> _runDownload(
-      DownloadModel model, String mediaType, int partCount) async {
-    try {
-      final dir = await _getDownloadsDir();
-
-      // ── Build download URLs ──────────────────────────────────────────────
-      final List<String> downloadUrls = [];
-      if (partCount <= 1) {
-        final endpoint = mediaType == 'episode'
-            ? ApiConstants.episodeDownload(model.mediaId)
-            : ApiConstants.songDownload(model.mediaId);
-        downloadUrls.add('${ApiConstants.baseUrl}$endpoint');
-      } else {
-        final streamEndpoint = mediaType == 'episode'
-            ? ApiConstants.episodeStream(model.mediaId)
-            : ApiConstants.songStream(model.mediaId);
-        for (int i = 1; i <= partCount; i++) {
-          downloadUrls
-              .add('${ApiConstants.baseUrl}$streamEndpoint?part=$i');
-        }
-      }
-
-      // ── Download → encrypt each part independently ──────────────────────
-      //
-      // KEY CHANGE: We no longer merge parts into one file.
-      // Each part is downloaded to a temp file, encrypted to its own
-      // per-part encrypted file, then the temp file is deleted.
-      // This preserves the MP3 file headers of each part intact so
-      // ExoPlayer can correctly read each part's duration independently.
-
-      for (int i = 0; i < downloadUrls.length; i++) {
-        final tmpPath = '${dir.path}/${model.mediaId}_part$i.tmp';
-        final partEncPath =
-            _partEncPath(model.encryptedFilePath, i);
-
-        // Delete stale files from previous failed attempts
-        final tmpFile = File(tmpPath);
-        if (await tmpFile.exists()) await tmpFile.delete();
-        final partEncFile = File(partEncPath);
-        if (await partEncFile.exists()) await partEncFile.delete();
-
-        // Download this part
-        await _dio.download(
-          downloadUrls[i],
-          tmpPath,
-          onReceiveProgress: (received, total) {
-            if (total > 0) {
-              final partProgress = received / total;
-              // 0–85% = downloading phase across all parts
-              final overallProgress =
-                  (i + partProgress) / downloadUrls.length * 0.85;
-              _updateProgress(
-                model,
-                'downloading',
-                overallProgress.clamp(0.01, 0.85),
-                i + 1,
-              );
-            }
-          },
-          options: Options(
-            responseType: ResponseType.bytes,
-            followRedirects: true,
-            receiveTimeout: const Duration(minutes: 10),
-            validateStatus: (status) => status != null && status < 300,
-          ),
-        );
-
-        // Verify download is non-empty
-        final downloaded = File(tmpPath);
-        if (!await downloaded.exists() || await downloaded.length() == 0) {
-          throw Exception(
-              'Downloaded part $i is empty — server may have returned an error body');
-        }
-
-        // Encrypt this part to its own file (85–100% phase)
-        _updateProgress(
-          model,
-          'encrypting',
-          0.85 + (i + 0.5) / downloadUrls.length * 0.15,
-          i + 1,
-        );
-        await _encryptionService.encryptFile(tmpPath, partEncPath);
-
-        // Delete temp file immediately — save storage
-        try {
-          await File(tmpPath).delete();
-        } catch (_) {}
-
-        model.downloadedParts = i + 1;
-        _updateState(model);
-      }
-
-      // ── For backwards-compat: also write a single _enc.bin for 1-part ──
-      // (old _playOffline code reads model.encryptedFilePath directly for
-      //  single-part items.  For multi-part we read the per-part files.)
-      // Nothing to do — _partEncPath(baseEncPath, 0) IS the only file for
-      // single-part downloads; the base _enc.bin is never written anymore.
-      // getDecryptedPath() handles both layouts (see below).
-
-      // ── Compute total encrypted size ─────────────────────────────────────
-      int totalSize = 0;
-      for (int i = 0; i < downloadUrls.length; i++) {
-        final f = File(_partEncPath(model.encryptedFilePath, i));
-        if (await f.exists()) totalSize += await f.length();
-      }
-
-      model.fileSizeBytes = totalSize;
-      model.status = 'completed';
-      model.progress = 1.0;
-      model.errorMessage = null;
-      _updateState(model);
-    } on DioException catch (e) {
-      String errorMessage;
-      if (e.response != null) {
-        errorMessage =
-            'Server error ${e.response?.statusCode}: ${e.response?.statusMessage}';
-      } else if (e.type == DioExceptionType.connectionTimeout ||
-          e.type == DioExceptionType.sendTimeout ||
-          e.type == DioExceptionType.receiveTimeout) {
-        errorMessage = 'Timeout — check your connection and retry';
-      } else if (e.type == DioExceptionType.connectionError) {
-        errorMessage = 'No connection — retry when online';
-      } else {
-        errorMessage = e.message?.isNotEmpty == true
-            ? e.message!
-            : 'Network error — tap to retry';
-      }
-      _markFailed(model, errorMessage);
-    } catch (e) {
-      _markFailed(model, e.toString().replaceAll('Exception: ', ''));
+  Future<void> _runDownloadInIsolate(
+      DownloadModel model, String downloadsDir) async {
+    // Get the encryption key so we can send it to the isolate.
+    // EncryptionService.getKeyBytesString() returns the comma-separated key.
+    final keyString = await _encryptionService.getKeyBytesString();
+    if (keyString == null) {
+      _markFailed(model, 'Encryption key unavailable');
+      return;
     }
+
+    final receivePort = ReceivePort();
+    _activePorts[model.mediaId] = receivePort;
+
+    final payload = _DownloadPayload(
+      sendPort: receivePort.sendPort,
+      mediaId: model.mediaId,
+      mediaType: model.mediaType,
+      partCount: model.totalParts,
+      baseEncPath: model.encryptedFilePath,
+      downloadsDir: downloadsDir,
+      encryptionKey: keyString,
+    );
+
+    // Spawn the isolate — download + encrypt runs completely off the main thread.
+    await Isolate.spawn(_downloadIsolateEntry, payload);
+
+    receivePort.listen((message) {
+      if (message is _ProgressMessage) {
+        final current = state[message.mediaId];
+        if (current == null) return;
+        current.status = message.status;
+        current.progress = message.progress;
+        current.downloadedParts = message.downloadedParts;
+        _updateState(current);
+      } else if (message is _CompletedMessage) {
+        final current = state[message.mediaId];
+        if (current == null) return;
+        current.fileSizeBytes = message.fileSizeBytes;
+        current.status = 'completed';
+        current.progress = 1.0;
+        current.errorMessage = null;
+        _updateState(current);
+        _cleanupPort(message.mediaId);
+      } else if (message is _FailedMessage) {
+        final current = state[message.mediaId];
+        if (current == null) return;
+        _markFailed(current, message.errorMessage);
+        _cleanupPort(message.mediaId);
+      }
+    });
   }
 
-  // ── getDecryptedPath (single-part) — kept for compatibility ──────────────
+  void _cleanupPort(String mediaId) {
+    _activePorts[mediaId]?.close();
+    _activePorts.remove(mediaId);
+  }
 
-  /// Returns the decrypted path for a SINGLE-PART download.
-  /// Use [getDecryptedPaths] for multi-part downloads.
+  // ── Decryption (background via compute) ───────────────────────────────────
+
   Future<String?> getDecryptedPath(String mediaId) async {
     final paths = await getDecryptedPaths(mediaId);
     return paths?.first;
   }
 
-  /// Returns the list of decrypted local file paths for ALL parts of a
-  /// completed download, in order.  Returns null if the download is not
-  /// completed or any decryption fails.
   Future<List<String>?> getDecryptedPaths(String mediaId) async {
     final download = state[mediaId];
     if (download == null || !download.isCompleted) return null;
 
     try {
+      final keyString = await _encryptionService.getKeyBytesString();
+      if (keyString == null) return null;
+
+      final cacheDir = await _getCacheDir();
       final totalParts = download.totalParts;
       final results = <String>[];
 
       if (totalParts <= 1) {
-        // ── Single-part: check new per-part layout first, then legacy ──────
         final newPartPath = _partEncPath(download.encryptedFilePath, 0);
         final legacyPath = download.encryptedFilePath;
 
-        if (File(newPartPath).existsSync()) {
-          results.add(
-              await _encryptionService.decryptToTemp(newPartPath));
-        } else if (File(legacyPath).existsSync()) {
-          // Legacy single-file download (pre-fix)
-          results.add(
-              await _encryptionService.decryptToTemp(legacyPath));
-        } else {
-          return null; // file missing
-        }
+        final sourcePath = File(newPartPath).existsSync()
+            ? newPartPath
+            : File(legacyPath).existsSync()
+                ? legacyPath
+                : null;
+
+        if (sourcePath == null) return null;
+
+        // FIX: Decrypt in background isolate so the player screen opens instantly
+        final decrypted = await compute(
+          _decryptInBackground,
+          _DecryptPayload(
+            encryptedPath: sourcePath,
+            encryptionKey: keyString,
+            cacheDir: cacheDir.path,
+          ),
+        );
+        if (decrypted == null) return null;
+        results.add(decrypted);
       } else {
-        // ── Multi-part: decrypt each part file ───────────────────────────
+        // Multi-part: decrypt all parts in parallel background isolates
+        final futures = <Future<String?>>[];
         for (int i = 0; i < totalParts; i++) {
-          final partEncPath =
-              _partEncPath(download.encryptedFilePath, i);
-          if (!File(partEncPath).existsSync()) {
-            // A part file is missing — download is corrupt
-            return null;
-          }
-          results.add(
-              await _encryptionService.decryptToTemp(partEncPath));
+          final partEncPath = _partEncPath(download.encryptedFilePath, i);
+          if (!File(partEncPath).existsSync()) return null;
+          futures.add(compute(
+            _decryptInBackground,
+            _DecryptPayload(
+              encryptedPath: partEncPath,
+              encryptionKey: keyString,
+              cacheDir: cacheDir.path,
+            ),
+          ));
         }
+        final decrypted = await Future.wait(futures);
+        if (decrypted.any((p) => p == null)) return null;
+        results.addAll(decrypted.whereType<String>());
       }
 
       return results;
@@ -360,25 +460,23 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     }
   }
 
-  // ── deleteDownload ────────────────────────────────────────────────────────
+  // ── Delete / clear ─────────────────────────────────────────────────────────
 
   Future<void> deleteDownload(String mediaId) async {
+    _cleanupPort(mediaId);
     final download = state[mediaId];
     if (download == null) return;
 
-    // Delete all per-part encrypted files
-    final totalParts =
-        download.totalParts <= 0 ? 1 : download.totalParts;
+    final totalParts = download.totalParts <= 0 ? 1 : download.totalParts;
     for (int i = 0; i < totalParts; i++) {
       try {
         final f = File(_partEncPath(download.encryptedFilePath, i));
-        if (await f.exists()) await f.delete();
+        if (f.existsSync()) f.deleteSync();
       } catch (_) {}
     }
-    // Also delete legacy single-file if it exists
     try {
       final legacy = File(download.encryptedFilePath);
-      if (await legacy.exists()) await legacy.delete();
+      if (legacy.existsSync()) legacy.deleteSync();
     } catch (_) {}
 
     final newState = Map<String, DownloadModel>.from(state);
@@ -390,20 +488,12 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
     } catch (_) {}
   }
 
-  // ── Private helpers ───────────────────────────────────────────────────────
+  // ── Private helpers ────────────────────────────────────────────────────────
 
   void _markFailed(DownloadModel model, String message) {
     model.status = 'failed';
     model.errorMessage = message;
     model.progress = 0.0;
-    _updateState(model);
-  }
-
-  void _updateProgress(
-      DownloadModel model, String status, double progress, int parts) {
-    model.status = status;
-    model.progress = progress;
-    model.downloadedParts = parts;
     _updateState(model);
   }
 
@@ -432,9 +522,7 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
   String formatStorageSize(int bytes) {
     if (bytes < 1024) return '${bytes}B';
-    if (bytes < 1024 * 1024) {
-      return '${(bytes / 1024).toStringAsFixed(1)}KB';
-    }
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
     if (bytes < 1024 * 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
     }
@@ -443,22 +531,27 @@ class DownloadManager extends StateNotifier<Map<String, DownloadModel>> {
 
   Future<Directory> _getDownloadsDir() async {
     final appDir = await getApplicationDocumentsDirectory();
-    final dir =
-        Directory('${appDir.path}/${AppConstants.downloadsDir}');
-    if (!await dir.exists()) await dir.create(recursive: true);
+    final dir = Directory('${appDir.path}/${AppConstants.downloadsDir}');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return dir;
+  }
+
+  Future<Directory> _getCacheDir() async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final dir = Directory('${appDir.path}/${AppConstants.decryptedCacheDir}');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
     return dir;
   }
 }
 
-// ── Providers ─────────────────────────────────────────────────────────────────
+// ── Providers ──────────────────────────────────────────────────────────────
 
 final encryptionServiceProvider = Provider<EncryptionService>((ref) {
   return EncryptionService();
 });
 
 final downloadManagerProvider =
-    StateNotifierProvider<DownloadManager, Map<String, DownloadModel>>(
-        (ref) {
+    StateNotifierProvider<DownloadManager, Map<String, DownloadModel>>((ref) {
   final encService = ref.watch(encryptionServiceProvider);
   return DownloadManager(encService);
 });
