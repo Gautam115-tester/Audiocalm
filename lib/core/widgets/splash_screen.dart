@@ -70,10 +70,23 @@ const List<String> _kTips = [
 
 class SplashNotifier {
   final _controller = StreamController<int>.broadcast();
+
+  // Buffer every event so the widget can replay them if it mounts late.
+  final List<int> _history = [];
+  int _lastStage = -1;
+
   Stream<int> get stream => _controller.stream;
+
+  /// The most recent stage index fired (or -1 if none yet).
+  int get lastStage => _lastStage;
+
+  /// All stage indices fired so far (in order).
+  List<int> get history => List.unmodifiable(_history);
 
   /// Call this as each init step completes. [stageIndex] = 0..9.
   void advance(int stageIndex) {
+    _lastStage = stageIndex;
+    _history.add(stageIndex);
     if (!_controller.isClosed) _controller.add(stageIndex);
   }
 
@@ -140,10 +153,10 @@ class _SplashScreenState extends State<SplashScreen>
     _glowCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 3200))..repeat(reverse: true);
     _barsCtrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 700))..repeat(reverse: true);
 
-    // Start logo animation, then panel
-    _logoCtrl.forward().then((_) {
-      if (mounted) _panelCtrl.forward();
-    });
+    // Start logo animation; also start panel immediately so it's visible
+    // even if the logo takes a full second to animate in.
+    _logoCtrl.forward();
+    _panelCtrl.forward();
 
     // Smooth progress ticker: nudges _displayPct toward _targetPct each frame
     _progressTicker = createTicker((_) {
@@ -155,7 +168,13 @@ class _SplashScreenState extends State<SplashScreen>
       }
     })..start();
 
-    // Listen for stage advances
+    // ── Replay any stage events that fired BEFORE this widget mounted ──────
+    // main() starts init before runApp(), so several stages may already be
+    // done by the time initState() runs. Replay them all synchronously, then
+    // subscribe for future events.
+    for (final stage in widget.notifier.history) {
+      _onStage(stage);
+    }
     _stageSub = widget.notifier.stream.listen(_onStage);
   }
 
@@ -305,6 +324,7 @@ class _SplashScreenState extends State<SplashScreen>
                     width: 160,
                     height: 160,
                     fit: BoxFit.contain,
+                    // Graceful fallback if asset path differs
                     errorBuilder: (_, __, ___) => _FallbackLogo(glow: _glowCtrl),
                   ),
                 ),
