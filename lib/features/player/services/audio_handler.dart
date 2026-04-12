@@ -56,6 +56,14 @@ import 'multi_part_url_service.dart';
 import 'playback_position_service.dart';
 
 class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  // ── Stable broadcast streams ───────────────────────────────────────────────
+  // These never change reference even when _player is swapped (gapless).
+  // AudioPlayerNotifier subscribes ONCE to these; _reAttachStreams() re-pipes
+  // events from whichever _player is current so the UI never goes stale.
+  final _positionController    = StreamController<Duration>.broadcast();
+  final _durationController    = StreamController<Duration?>.broadcast();
+  final _playerStateController = StreamController<ja.PlayerState>.broadcast();
+
   // ── Primary player ─────────────────────────────────────────────────────────
   ja.AudioPlayer _player = ja.AudioPlayer();
 
@@ -110,22 +118,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   void _init() {
-    _subs.add(_player.positionStream.listen((_) {
-      _schedulePositionBroadcast();
-      _maybeSavePosition();
-    }));
-    _subs.add(
-        _player.bufferedPositionStream.listen((_) => _scheduleBroadcast(structural: false)));
-    _subs.add(_player.durationStream.listen((dur) {
-      if (dur != null && _currentPartIndex < _partDurations.length) {
-        _partDurations[_currentPartIndex] = dur;
-      }
-      // When duration becomes known, reschedule the next-item preload timer
-      // in case we couldn't schedule it at load time (duration was unknown).
-      _maybeReschedulePreloadTimer();
-      _scheduleBroadcast(structural: true);
-    }));
-    _subs.add(_player.playerStateStream.listen((_) => _scheduleBroadcast(structural: true)));
+    // Delegate to _reAttachStreams so the stable controllers are wired up
+    // immediately — and every future player swap re-calls this same method.
+    _reAttachStreams();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -181,14 +176,18 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   /// Cancel any pending next-item preload (e.g. on skip).
+  /// NOTIFICATION FIX: We NO LONGER dispose+recreate _nextItemPlayer here.
+  /// Repeated dispose() calls on AudioPlayer accumulate Android MediaSession
+  /// state changes that confuse audio_service and eventually kill the
+  /// foreground service notification. Instead we just stop the player and
+  /// clear its source — reuse the same instance across cancellations.
   void _cancelNextItemPreload() {
     _nextItemPreloadTimer?.cancel();
     _nextItemPreloadTimer = null;
     _nextItemPreloaded = false;
     _nextItemPreloadIndex = -1;
-    // Dispose and recreate so the old source is freed.
-    _nextItemPlayer.dispose();
-    _nextItemPlayer = ja.AudioPlayer();
+    // Stop silently — do NOT dispose. Reuse the player for the next preload.
+    _nextItemPlayer.stop().catchError((_) {});
   }
 
   /// Silently load the first part of queue item at [index] into the
@@ -239,6 +238,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     // Promote the pre-loaded player to primary.
     final oldPlayer = _player;
     _player = _nextItemPlayer;
+    // NOTIFICATION FIX: Don't dispose+recreate here. Create a fresh player
+    // for future preloads without the overhead of dispose (which triggers
+    // Android MediaSession state changes that accumulate and kill the
+    // foreground notification after several tracks).
     _nextItemPlayer = ja.AudioPlayer();
     _nextItemPreloaded = false;
     _nextItemPreloadIndex = -1;
@@ -326,6 +329,24 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   void _broadcastStateNow() {
     final isPlaying = _player.playing;
     final ps = _player.processingState;
+
+    // NOTIFICATION FIX: Never send AudioProcessingState.completed upward to
+    // audio_service. When 'completed' is broadcast, audio_service interprets
+    // it as "session ended" and stops the foreground service — killing the
+    // notification. _handleItemCompletion() immediately starts the next track,
+    // so mapping completed→ready here is correct: we are still in an active
+    // session. The actual "nothing more to play" case (last track, no loop)
+    // just leaves the player idle, which maps to idle below.
+    final mappedState = switch (ps) {
+      ja.ProcessingState.idle      => AudioProcessingState.idle,
+      ja.ProcessingState.loading   => AudioProcessingState.loading,
+      ja.ProcessingState.buffering => AudioProcessingState.buffering,
+      ja.ProcessingState.ready     => AudioProcessingState.ready,
+      // Map completed → ready so audio_service never stops the foreground
+      // service between tracks.
+      ja.ProcessingState.completed => AudioProcessingState.ready,
+    };
+
     playbackState.add(playbackState.value.copyWith(
       controls: [
         MediaControl.skipToPrevious,
@@ -333,32 +354,27 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         MediaControl.skipToNext,
         MediaControl.stop,
       ],
+      // NOTIFICATION FIX: Remove seekForward / seekBackward from systemActions.
+      // These tell Android to show rewind/fast-forward arrows in the
+      // notification instead of clean prev/next/play controls.
       systemActions: const {
         MediaAction.seek,
-        MediaAction.seekForward,
-        MediaAction.seekBackward,
         MediaAction.skipToNext,
         MediaAction.skipToPrevious,
       },
       androidCompactActionIndices: const [0, 1, 2],
-      processingState: {
-        ja.ProcessingState.idle:      AudioProcessingState.idle,
-        ja.ProcessingState.loading:   AudioProcessingState.loading,
-        ja.ProcessingState.buffering: AudioProcessingState.buffering,
-        ja.ProcessingState.ready:     AudioProcessingState.ready,
-        ja.ProcessingState.completed: AudioProcessingState.completed,
-      }[ps]!,
+      processingState:  mappedState,
       playing:          isPlaying,
       updatePosition:   _unifiedPosition,
       bufferedPosition: _partOffset + _player.bufferedPosition,
       speed:            _player.speed,
       queueIndex:       _currentQueueIndex,
     ));
-    _lastBroadcastPlaying = isPlaying;
-    _lastBroadcastLoading = (ps == ja.ProcessingState.loading ||
+    _lastBroadcastPlaying    = isPlaying;
+    _lastBroadcastLoading    = (ps == ja.ProcessingState.loading ||
         ps == ja.ProcessingState.buffering);
     _lastBroadcastQueueIndex = _currentQueueIndex;
-    _lastBroadcastDuration = _unifiedDuration;
+    _lastBroadcastDuration   = _unifiedDuration;
   }
 
   // ── Position save ──────────────────────────────────────────────────────────
@@ -492,8 +508,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     if (nextPart >= _partUrls.length) return;
 
     final url = _partUrls[nextPart];
-    _preloadPlayer.dispose();
-    _preloadPlayer = ja.AudioPlayer();
+    // NOTIFICATION FIX: stop() instead of dispose()+recreate to avoid
+    // accumulating Android MediaSession state changes that kill the notification.
+    _preloadPlayer.stop().catchError((_) {});
 
     _preloadPlayer
         .setAudioSource(ja.AudioSource.uri(Uri.parse(url)))
@@ -519,21 +536,38 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     for (final s in _subs) { s.cancel(); }
     _subs.clear();
 
-    _subs.add(_player.positionStream.listen((_) {
+    // Position → stable controller + internal side-effects
+    _subs.add(_player.positionStream.listen((pos) {
+      if (!_positionController.isClosed) {
+        _positionController.add(_unifiedPosition);
+      }
       _schedulePositionBroadcast();
       _maybeSavePosition();
     }));
+
+    // Buffered position → internal broadcast only
     _subs.add(_player.bufferedPositionStream
         .listen((_) => _scheduleBroadcast(structural: false)));
+
+    // Duration → stable controller + internal side-effects
     _subs.add(_player.durationStream.listen((dur) {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
+      if (!_durationController.isClosed) {
+        _durationController.add(_unifiedDuration);
+      }
       _maybeReschedulePreloadTimer();
       _scheduleBroadcast(structural: true);
     }));
-    _subs.add(_player.playerStateStream
-        .listen((_) => _scheduleBroadcast(structural: true)));
+
+    // PlayerState → stable controller + internal broadcast
+    _subs.add(_player.playerStateStream.listen((ps) {
+      if (!_playerStateController.isClosed) {
+        _playerStateController.add(ps);
+      }
+      _scheduleBroadcast(structural: true);
+    }));
   }
 
   // ── Item completion ────────────────────────────────────────────────────────
@@ -662,6 +696,11 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> seek(Duration position) async {
     if (_partUrls.length <= 1) {
       await _player.seek(position);
+      // Push immediately into stable stream so UI snaps without waiting for
+      // the next positionStream tick.
+      if (!_positionController.isClosed) {
+        _positionController.add(_unifiedPosition);
+      }
       _broadcastCritical();
       return;
     }
@@ -706,6 +745,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       _completionSub = _player.processingStateStream.listen((state) {
         if (state == ja.ProcessingState.completed) _onPartCompleted();
       });
+    }
+    if (!_positionController.isClosed) {
+      _positionController.add(_unifiedPosition);
     }
     _broadcastCritical();
   }
@@ -776,10 +818,12 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ── Streams / getters ──────────────────────────────────────────────────────
-  Stream<Duration>  get positionStream     => _player.positionStream.map((_) => _unifiedPosition);
-  Stream<Duration?> get durationStream     => _player.durationStream.map((_) => _unifiedDuration);
-  Stream<ja.PlayerState> get playerStateStream => _player.playerStateStream;
-  Stream<double>    get speedStream        => _player.speedStream;
+  // STABLE STREAMS: never change reference even when _player is swapped.
+  // AudioPlayerNotifier subscribes once and keeps receiving events forever.
+  Stream<Duration>       get positionStream    => _positionController.stream;
+  Stream<Duration?>      get durationStream    => _durationController.stream;
+  Stream<ja.PlayerState> get playerStateStream => _playerStateController.stream;
+  Stream<double>         get speedStream       => _player.speedStream;
 
   Duration  get position     => _unifiedPosition;
   Duration? get duration     => _unifiedDuration;
@@ -798,6 +842,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _nextItemPreloadTimer?.cancel();
     await _completionSub?.cancel();
     for (final s in _subs) { s.cancel(); }
+    await _positionController.close();
+    await _durationController.close();
+    await _playerStateController.close();
     await _player.dispose();
     await _preloadPlayer.dispose();
     await _nextItemPlayer.dispose();

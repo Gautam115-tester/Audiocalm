@@ -151,8 +151,10 @@ Future<AudioCalmHandler> _initAudioService() async {
           AppConstants.audioServiceNotificationChannelId,
       androidNotificationChannelName:
           AppConstants.audioServiceNotificationChannelName,
+      // androidNotificationOngoing: true keeps the notification pinned as a
+      // foreground-service notification at all times — it cannot be swiped
+      // away and the OS will not kill it during gapless track transitions.
       androidNotificationOngoing:      true,
-      androidStopForegroundOnPause:    true,
       notificationColor:               AppColors.primary,
       artDownscaleHeight:              200,
       artDownscaleWidth:               200,
