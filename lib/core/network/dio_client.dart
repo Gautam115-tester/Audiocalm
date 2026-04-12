@@ -1,13 +1,24 @@
 // lib/core/network/dio_client.dart
 //
-// FIXES:
-// 1. Increased receiveTimeout from 15s → 45s so Render free-tier cold-starts
-//    don't cause cascading timeout failures on every album detail request.
-// 2. Added in-flight request deduplication: if the same URL is already being
-//    fetched, subsequent callers await the same Future instead of firing a
-//    duplicate request. This is the PRIMARY fix for the 22-concurrent-request
-//    flood seen in the logs (11 albums × 2 = 22 requests all at once).
-// 3. Kept the compact single-line logger (no LogInterceptor banner spam).
+// CHANGES:
+// 1. followRedirects: true + maxRedirects: 5
+//    The backend now sends 302 redirects to Telegram CDN for all stream URLs.
+//    Dio must follow these redirects to reach the audio content.
+//
+// 2. receiveTimeout: 45s (unchanged — still needed for cold-start tolerance)
+//
+// 3. In-flight request deduplication (unchanged — prevents parallel floods)
+//
+// 4. X-Force-Refresh header support:
+//    When a stream request fails with 401/403 (expired Telegram signed URL),
+//    the caller can retry with the X-Force-Refresh header set to '1'.
+//    The backend will then force-evict its URL cache and re-resolve from
+//    Telegram before sending a fresh redirect.
+//
+// NOTE: just_audio handles its own HTTP redirects internally and does NOT
+// use this DioClient for stream requests. This client is only used for
+// API calls (metadata, album lists, etc.). Stream URLs are handled by
+// just_audio's built-in HTTP client which follows redirects by default.
 
 import 'dart:async';
 import 'package:dio/dio.dart';
@@ -17,10 +28,7 @@ import '../errors/app_exceptions.dart';
 class DioClient {
   late final Dio _dio;
 
-  // ── In-flight deduplication ───────────────────────────────────────────────
-  // Key: full URL string. Value: the pending Future for that request.
-  // When a second caller asks for the same URL while the first is still
-  // in-flight, they share the same Future — zero duplicate network requests.
+  // In-flight deduplication: same URL → same Future, no duplicate requests
   final Map<String, Future<dynamic>> _inFlight = {};
 
   static DioClient? _instance;
@@ -32,22 +40,25 @@ class DioClient {
   DioClient._internal() {
     _dio = Dio(
       BaseOptions(
-        baseUrl: ApiConstants.baseUrl,
+        baseUrl:        ApiConstants.baseUrl,
         connectTimeout: const Duration(milliseconds: ApiConstants.connectTimeout),
-        // FIX: was 15 000 ms — too short for Render free-tier cold starts.
-        // Render free instances spin down after 15 min of inactivity and take
-        // up to 50 s to cold-start. 45 s gives them a realistic chance.
         receiveTimeout: const Duration(seconds: 45),
+        // Must follow redirects — backend sends 302 to Telegram CDN
+        followRedirects: true,
+        maxRedirects:    5,
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Connection': 'keep-alive',
+          'Accept':       'application/json',
+          'Connection':   'keep-alive',
         },
         responseType: ResponseType.json,
+        // Validate all 2xx and 3xx as success
+        // (Dio's redirect handling uses this internally)
+        validateStatus: (status) => status != null && status < 400,
       ),
     );
 
-    // Compact single-line logger — no LogInterceptor banner flood.
+    // Compact single-line debug logger
     assert(() {
       _dio.interceptors.add(
         InterceptorsWrapper(
@@ -70,34 +81,21 @@ class DioClient {
       );
       return true;
     }());
-
-    _dio.interceptors.add(
-      InterceptorsWrapper(
-        onError: (error, handler) {
-          handler.next(error);
-        },
-      ),
-    );
   }
 
   Dio get dio => _dio;
 
   /// GET with in-flight deduplication.
-  ///
-  /// If an identical [path] + [queryParameters] request is already pending,
-  /// this returns the same Future — no duplicate network call is made.
-  /// The dedup key is cleared as soon as the first request completes
-  /// (success or error), so the next independent call goes through normally.
+  /// If an identical [path]+[queryParameters] request is already in-flight,
+  /// returns the same Future — no duplicate network call.
   Future<T> get<T>(
     String path, {
     Map<String, dynamic>? queryParameters,
     Options? options,
   }) async {
-    // Build a stable cache key from path + sorted query params
     final key = _buildKey(path, queryParameters);
 
     if (_inFlight.containsKey(key)) {
-      // Another caller is already fetching this — join their Future.
       return await (_inFlight[key] as Future<T>);
     }
 
@@ -110,9 +108,23 @@ class DioClient {
       final result = await future;
       return result;
     } finally {
-      // Always clear the in-flight entry so future independent calls work.
       _inFlight.remove(key);
     }
+  }
+
+  /// GET with forced cache refresh — used after a 401 from Telegram CDN.
+  /// Appends X-Force-Refresh: 1 header so the backend evicts its URL cache.
+  Future<T> getRefreshed<T>(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+  }) async {
+    return _doGet<T>(
+      path,
+      queryParameters: queryParameters,
+      options: Options(
+        headers: {'X-Force-Refresh': '1'},
+      ),
+    );
   }
 
   Future<T> _doGet<T>(

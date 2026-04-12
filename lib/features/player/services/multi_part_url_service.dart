@@ -1,6 +1,16 @@
 // lib/features/player/services/multi_part_url_service.dart
 //
 // Resolves audio part URLs by querying the /parts backend endpoint.
+// The backend returns /stream?part=N URLs which the backend then
+// 302-redirects to Telegram CDN URLs. just_audio follows those
+// redirects transparently.
+//
+// CHANGES:
+// 1. buildPartsFromCount() now produces URLs that work with the redirect
+//    architecture — no behaviour change needed since the URL format is the same.
+// 2. Added buildRefreshUrl() — appends ?refresh=1 to force server-side
+//    URL cache eviction when a URL has expired.
+// 3. resolveAudioParts() unchanged in API surface.
 //
 // Backend response shape for /api/episodes/:id/parts and /api/songs/:id/parts:
 // {
@@ -9,17 +19,12 @@
 //   "title": "...",
 //   "isMultiPart": true,
 //   "partCount": 2,
-//   "duration": 3600,          ← total seconds (may be null)
+//   "duration": 3600,
 //   "parts": [
 //     { "partNumber": 1, "streamUrl": "...", "downloadUrl": "..." },
 //     { "partNumber": 2, "streamUrl": "...", "downloadUrl": "..." }
 //   ]
 // }
-//
-// NOTE: The backend does NOT include per-part durationSeconds — only the
-// episode/song-level `duration` (total seconds). We therefore leave
-// AudioPart.knownDuration null for each part; the player reads the real
-// duration from just_audio once buffering begins.
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -37,14 +42,14 @@ final multiPartUrlServiceProvider = Provider<MultiPartUrlService>((ref) {
 // ── Service ───────────────────────────────────────────────────────────────────
 
 class MultiPartUrlService {
-  final dynamic _client; // DioClient — typed as dynamic to avoid circular import
+  final dynamic _client; // DioClient — dynamic to avoid circular import
 
   MultiPartUrlService(this._client);
 
   // ── buildStreamUrl ────────────────────────────────────────────────────────
 
-  /// Returns the direct stream URL for a content item (no network call).
-  /// Used as fallback and for single-part items.
+  /// Returns the backend stream URL for a content item (no network call).
+  /// The backend will 302-redirect this to Telegram CDN when requested.
   String buildStreamUrl(String contentType, String id) {
     if (contentType == 'episodes') {
       return '${ApiConstants.baseUrl}${ApiConstants.episodeStream(id)}';
@@ -52,62 +57,57 @@ class MultiPartUrlService {
     return '${ApiConstants.baseUrl}${ApiConstants.songStream(id)}';
   }
 
+  /// Returns a stream URL with ?refresh=1 appended.
+  /// Used to force the backend to evict its URL cache and get a fresh
+  /// Telegram signed URL when the previous one has expired.
+  String buildRefreshUrl(String contentType, String id, {int part = 1}) {
+    final base = buildStreamUrl(contentType, id);
+    if (part > 1) {
+      return '$base?part=$part&refresh=1';
+    }
+    return '$base?refresh=1';
+  }
+
   // ── resolveAudioParts ─────────────────────────────────────────────────────
 
   /// Resolve audio parts for a content item via the /parts API endpoint.
-  ///
-  /// [baseId]      — the episode or song ID (e.g. "abc-123")
-  /// [contentType] — 'episodes' or 'songs'
-  /// [knownPartCount] — if > 1 and the /parts call fails, we still build
-  ///                    the correct number of ?part=N URLs without a network
-  ///                    round-trip (avoids double-failure).
-  ///
-  /// Returns a list of [AudioPart] objects, one per file part.
-  /// Falls back gracefully to a single-part stream on any error.
   Future<List<AudioPart>> resolveAudioParts({
     required String baseId,
-    required String contentType, // 'episodes' | 'songs'
+    required String contentType,
     int knownPartCount = 1,
   }) async {
-    // Fast path: no need to hit the network for single-part content.
     if (knownPartCount <= 1) {
       return [_singlePart(contentType, baseId)];
     }
 
-    // Endpoint: /api/episodes/:id/parts  or  /api/songs/:id/parts
     final partsPath = '/api/$contentType/$baseId/parts';
 
     try {
       final data = await _client.get<Map<String, dynamic>>(partsPath);
-
       final partsList = data['parts'] as List<dynamic>? ?? [];
 
       if (partsList.isEmpty) {
-        debugPrint('[MultiPart] /parts returned empty list → ?part=N fallback');
+        debugPrint('[MultiPart] /parts returned empty → ?part=N fallback');
         return _buildQueryParamParts(contentType, baseId, knownPartCount);
       }
 
       final parts = partsList.map((p) {
-        final map = p as Map<String, dynamic>;
-        // Backend field is 'streamUrl', not 'url'.
+        final map       = p as Map<String, dynamic>;
         final streamUrl = map['streamUrl'] as String? ?? '';
         if (streamUrl.isEmpty) {
           throw FormatException('part missing streamUrl: $map');
         }
-        // Backend does not provide per-part duration — leave null so
-        // just_audio resolves it from the stream itself.
         return AudioPart(
-          partId: '${baseId}_part${map['partNumber'] ?? ''}',
+          partId:    '${baseId}_part${map['partNumber'] ?? ''}',
           streamUrl: streamUrl,
-          knownDuration: null,
+          knownDuration: null, // backend doesn't provide per-part duration
         );
       }).toList();
 
-      debugPrint(
-          '[MultiPart] $baseId → ${parts.length} part(s) from /parts endpoint');
+      debugPrint('[MultiPart] $baseId → ${parts.length} parts from /parts');
       return parts;
     } catch (e) {
-      debugPrint('[MultiPart] /parts error for $baseId: $e → ?part=N fallback');
+      debugPrint('[MultiPart] /parts error for $baseId: $e → fallback');
       return _buildQueryParamParts(contentType, baseId, knownPartCount);
     }
   }
@@ -115,7 +115,7 @@ class MultiPartUrlService {
   // ── buildPartsFromCount ───────────────────────────────────────────────────
 
   /// Build parts from a known count WITHOUT a network call.
-  /// Uses the ?part=N query parameter pattern the backend already supports.
+  /// Uses ?part=N URLs that the backend redirects to Telegram CDN.
   List<AudioPart> buildPartsFromCount({
     required String baseId,
     required String contentType,
@@ -131,19 +131,18 @@ class MultiPartUrlService {
 
   AudioPart _singlePart(String contentType, String id) {
     return AudioPart(
-      partId: id,
+      partId:    id,
       streamUrl: buildStreamUrl(contentType, id),
     );
   }
 
-  /// Builds ?part=1, ?part=2 … ?part=N URLs — exactly what the backend
-  /// expects when streaming multi-part files.
   List<AudioPart> _buildQueryParamParts(
       String contentType, String baseId, int partCount) {
     return List.generate(partCount, (i) {
       final partNum = i + 1;
       return AudioPart(
-        partId: '${baseId}_part${partNum.toString().padLeft(2, '0')}',
+        partId:    '${baseId}_part${partNum.toString().padLeft(2, '0')}',
+        // Backend will 302-redirect this to Telegram CDN
         streamUrl: '${buildStreamUrl(contentType, baseId)}?part=$partNum',
       );
     });
