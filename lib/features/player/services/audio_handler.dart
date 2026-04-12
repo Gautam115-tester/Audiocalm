@@ -537,16 +537,26 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ── Item completion ────────────────────────────────────────────────────────
+  //
+  // Loop mode behaviour after this fix:
+  //   LoopMode.off  — advances track-by-track through the queue, stops at end.
+  //   LoopMode.all  — wraps back to index 0 when last track finishes.
+  //                   (1st loop-button tap — "repeat album/queue")
+  //   LoopMode.one  — replays current track forever.
+  //                   (2nd loop-button tap — "repeat single")
   void _handleItemCompletion() {
     switch (_loopMode) {
       case ja.LoopMode.one:
+        // Repeat same track forever.
         _playItemAtQueueIndex(_currentQueueIndex);
         break;
       case ja.LoopMode.all:
+        // Repeat whole queue — wrap to index 0 after last track.
         final nextIdx = (_currentQueueIndex + 1) % _playableQueue.length;
         _handleTransitionTo(nextIdx);
         break;
       case ja.LoopMode.off:
+        // Play linearly; stop naturally when last track finishes.
         if (_currentQueueIndex < _playableQueue.length - 1) {
           _handleTransitionTo(_currentQueueIndex + 1);
         }
@@ -706,6 +716,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _cancelNextItemPreload();
     if (_currentQueueIndex < _playableQueue.length - 1) {
       await _playItemAtQueueIndex(_currentQueueIndex + 1);
+    } else if (_loopMode == ja.LoopMode.all && _playableQueue.isNotEmpty) {
+      // FIX: When on last track with loop-all active, wrap to first track.
+      await _playItemAtQueueIndex(0);
     }
     _broadcastCritical();
   }
