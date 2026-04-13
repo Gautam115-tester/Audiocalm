@@ -1,34 +1,5 @@
 // lib/core/widgets/app_shell.dart
-//
-// BLAST BUFFER QUEUE FIX — GRANULAR PROVIDER SELECTION
-// =====================================================
-//
-// ROOT CAUSE:
-//   ref.watch(audioPlayerProvider) subscribes to the ENTIRE AudioPlayerState.
-//   AudioPlayerState.position updates every ~100ms while audio plays.
-//   This caused AppShell.build() to run every 100ms, triggering a full
-//   widget subtree rebuild including:
-//     - Column (bottomNavigationBar)
-//     - MiniPlayer (which itself watches audioPlayerProvider)
-//     - _BottomNav
-//
-//   Even though AppShell only needs `playerState.hasMedia`, it rebuilt
-//   everything on every position tick. Each rebuild → Flutter schedules
-//   a frame → SurfaceView queues a buffer.
-//
-//   At 10 position ticks/second with a ~16ms frame budget:
-//     10 AppShell rebuilds/sec + 10 MiniPlayer rebuilds/sec = 20 rebuilds/sec
-//     Plus audio_handler.dart notification broadcasts (now fixed to 60fps max)
-//     = total buffer production >> SurfaceFlinger consumption rate
-//
-// FIX:
-//   Use ref.watch(audioPlayerProvider.select((s) => s.hasMedia)) so AppShell
-//   ONLY rebuilds when hasMedia changes (i.e. when audio starts or stops
-//   entirely). This reduces AppShell rebuilds from 10/sec to ~0/sec during
-//   normal playback.
-//
-//   MiniPlayer still watches the full state (it needs position, isPlaying, etc.)
-//   but it's now isolated by RepaintBoundary so its repaints don't cascade up.
+// VYNCE APP SHELL — Purple/Cyan bottom nav
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -39,19 +10,12 @@ import '../theme/app_theme.dart';
 
 class AppShell extends ConsumerWidget {
   final Widget child;
-
   const AppShell({super.key, required this.child});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // FIX: Only watch hasMedia — not the full state.
-    // AppShell rebuilds ONLY when audio starts or stops (hasMedia changes).
-    // Position ticks (10Hz) no longer cause AppShell to rebuild.
-    final hasMedia = ref.watch(
-      audioPlayerProvider.select((s) => s.hasMedia),
-    );
-
-    final location = GoRouterState.of(context).uri.toString();
+    final hasMedia     = ref.watch(audioPlayerProvider.select((s) => s.hasMedia));
+    final location     = GoRouterState.of(context).uri.toString();
     final currentIndex = _locationToIndex(location);
 
     return Scaffold(
@@ -60,33 +24,27 @@ class AppShell extends ConsumerWidget {
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // FIX: RepaintBoundary isolates MiniPlayer repaints from the
-          // BottomNav and the rest of the shell. MiniPlayer repaints at
-          // 10Hz (position ticks) but BottomNav only needs to repaint
-          // when the selected tab changes. Without RepaintBoundary, the
-          // BottomNav's RenderObject gets invalidated on every MiniPlayer
-          // rebuild, queuing unnecessary frames.
-          if (hasMedia)
-            const RepaintBoundary(child: MiniPlayer()),
-          _BottomNav(currentIndex: currentIndex),
+          if (hasMedia) const RepaintBoundary(child: MiniPlayer()),
+          _VynceBottomNav(currentIndex: currentIndex),
         ],
       ),
     );
   }
 
   int _locationToIndex(String location) {
-    if (location.startsWith('/stories')) return 1;
-    if (location.startsWith('/music')) return 2;
-    if (location.startsWith('/search')) return 3;
+    if (location.startsWith('/stories'))   return 1;
+    if (location.startsWith('/music'))     return 2;
+    if (location.startsWith('/search'))    return 3;
     if (location.startsWith('/downloads')) return 4;
     return 0;
   }
 }
 
-class _BottomNav extends StatelessWidget {
-  final int currentIndex;
+// ─── Bottom Nav ───────────────────────────────────────────────────────────────
 
-  const _BottomNav({required this.currentIndex});
+class _VynceBottomNav extends StatelessWidget {
+  final int currentIndex;
+  const _VynceBottomNav({required this.currentIndex});
 
   @override
   Widget build(BuildContext context) {
@@ -94,60 +52,90 @@ class _BottomNav extends StatelessWidget {
       decoration: BoxDecoration(
         color: AppColors.surface,
         border: Border(
-          top: BorderSide(
-            color: AppColors.primary.withOpacity(0.1),
-            width: 1,
-          ),
+          top: BorderSide(color: const Color(0xFF7C3AED).withOpacity(0.12), width: 1),
         ),
       ),
       child: SafeArea(
         top: false,
-        child: BottomNavigationBar(
-          currentIndex: currentIndex,
-          backgroundColor: Colors.transparent,
-          elevation: 0,
-          type: BottomNavigationBarType.fixed,
-          selectedItemColor: AppColors.primary,
-          unselectedItemColor: AppColors.textTertiary,
-          selectedFontSize: 11,
-          unselectedFontSize: 11,
-          onTap: (i) => _onTap(context, i),
-          items: const [
-            BottomNavigationBarItem(
-              icon: Icon(Icons.home_rounded),
-              activeIcon: Icon(Icons.home_rounded),
-              label: 'Home',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.auto_stories_rounded),
-              activeIcon: Icon(Icons.auto_stories_rounded),
-              label: 'Stories',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.music_note_rounded),
-              activeIcon: Icon(Icons.music_note_rounded),
-              label: 'Music',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.search_rounded),
-              activeIcon: Icon(Icons.search_rounded),
-              label: 'Search',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.download_rounded),
-              activeIcon: Icon(Icons.download_rounded),
-              label: 'Downloads',
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _NavItem(index: 0, current: currentIndex, icon: Icons.home_rounded, label: 'Home'),
+              _NavItem(index: 1, current: currentIndex, icon: Icons.auto_stories_rounded, label: 'Stories'),
+              _NavItem(index: 2, current: currentIndex, icon: Icons.music_note_rounded, label: 'Music'),
+              _NavItem(index: 3, current: currentIndex, icon: Icons.search_rounded, label: 'Search'),
+              _NavItem(index: 4, current: currentIndex, icon: Icons.download_rounded, label: 'Downloads'),
+            ],
+          ),
         ),
       ),
     );
   }
+}
 
-  void _onTap(BuildContext context, int index) {
-    final routes = ['/home', '/stories', '/music', '/search', '/downloads'];
-    if (index < routes.length) {
-      context.go(routes[index]);
-    }
+class _NavItem extends StatelessWidget {
+  final int index;
+  final int current;
+  final IconData icon;
+  final String label;
+  const _NavItem({required this.index, required this.current, required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    final isActive = index == current;
+    final routes   = ['/home', '/stories', '/music', '/search', '/downloads'];
+
+    return GestureDetector(
+      onTap: () => context.go(routes[index]),
+      behavior: HitTestBehavior.opaque,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isActive)
+              ShaderMask(
+                shaderCallback: (r) => const LinearGradient(
+                  colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+                ).createShader(r),
+                child: Icon(icon, size: 22, color: Colors.white),
+              )
+            else
+              Icon(icon, size: 22, color: const Color(0xFF4B5563)),
+            const SizedBox(height: 3),
+            if (isActive)
+              ShaderMask(
+                shaderCallback: (r) => const LinearGradient(
+                  colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+                ).createShader(r),
+                child: Text(label,
+                    style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w600, color: Colors.white)),
+              )
+            else
+              Text(label, style: const TextStyle(fontSize: 9, color: Color(0xFF4B5563))),
+            if (isActive)
+              const SizedBox(
+                height: 4,
+                child: Center(
+                  child: SizedBox(
+                    width: 4,
+                    height: 4,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xFF7C3AED),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            else
+              const SizedBox(height: 4),
+          ],
+        ),
+      ),
+    );
   }
 }

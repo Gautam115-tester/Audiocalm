@@ -1,4 +1,4 @@
-package com.audiocalm.app
+package com.audio.vynce
 
 import android.content.Context
 import android.media.audiofx.Equalizer
@@ -12,7 +12,6 @@ object EqualizerManager {
     private var isEnabled: Boolean = false
 
     fun handleMethodCall(call: MethodCall, result: MethodChannel.Result, context: Context) {
-        println("🎧 EqualizerManager: ${call.method}")
         when (call.method) {
             "init" -> {
                 val sessionId = call.argument<Int>("audioSessionId") ?: 0
@@ -23,7 +22,7 @@ object EqualizerManager {
                 setEnabled(enabled, result)
             }
             "setBandLevel" -> {
-                val band = call.argument<Int>("band") ?: 0
+                val band  = call.argument<Int>("band")  ?: 0
                 val level = call.argument<Int>("level") ?: 0
                 setBandLevel(band, level, result)
             }
@@ -31,17 +30,13 @@ object EqualizerManager {
                 val band = call.argument<Int>("band") ?: 0
                 getBandLevel(band, result)
             }
-            "getProperties" -> {
-                getProperties(result)
-            }
+            "getProperties"   -> getProperties(result)
             "getBandFreqRange" -> {
                 val band = call.argument<Int>("band") ?: 0
                 getBandFreqRange(band, result)
             }
-            "release" -> {
-                release(result)
-            }
-            else -> result.notImplemented()
+            "release" -> release(result)
+            else      -> result.notImplemented()
         }
     }
 
@@ -51,10 +46,8 @@ object EqualizerManager {
             audioSessionId = sessionId
             equalizer = Equalizer(0, sessionId)
             equalizer?.enabled = isEnabled
-            println("✅ Equalizer initialized with sessionId=$sessionId, bands=${equalizer?.numberOfBands}")
             result.success(true)
         } catch (e: Exception) {
-            println("❌ Equalizer init failed: ${e.message}")
             result.error("EQ_INIT_ERROR", "Failed to init equalizer: ${e.message}", null)
         }
     }
@@ -63,70 +56,47 @@ object EqualizerManager {
         isEnabled = enabled
         try {
             equalizer?.enabled = enabled
-            println("✅ Equalizer enabled=$enabled")
             result.success(true)
-        } catch (e: Exception) {
-            println("❌ setEnabled failed: ${e.message}")
-            result.success(false)
-        }
+        } catch (e: Exception) { result.success(false) }
     }
 
     private fun setBandLevel(band: Int, levelMillibels: Int, result: MethodChannel.Result) {
         try {
             val eq = equalizer
-            if (eq == null) {
-                result.success(false)
-                return
-            }
+            if (eq == null) { result.success(false); return }
             val bandCount = eq.numberOfBands.toInt()
-            if (band < 0 || band >= bandCount) {
-                result.success(false)
-                return
-            }
-            val range = eq.bandLevelRange
-            val min = range[0].toInt()
-            val max = range[1].toInt()
+            if (band < 0 || band >= bandCount) { result.success(false); return }
+            val range   = eq.bandLevelRange
+            val min     = range[0].toInt()
+            val max     = range[1].toInt()
             val clamped = levelMillibels.coerceIn(min, max).toShort()
             eq.setBandLevel(band.toShort(), clamped)
             result.success(true)
-        } catch (e: Exception) {
-            println("❌ setBandLevel failed: ${e.message}")
-            result.success(false)
-        }
+        } catch (e: Exception) { result.success(false) }
     }
 
     private fun getBandLevel(band: Int, result: MethodChannel.Result) {
         try {
             val level = equalizer?.getBandLevel(band.toShort())?.toInt() ?: 0
             result.success(level)
-        } catch (e: Exception) {
-            result.success(0)
-        }
+        } catch (e: Exception) { result.success(0) }
     }
 
     private fun getProperties(result: MethodChannel.Result) {
         try {
             val eq = equalizer
             if (eq == null) {
-                result.success(mapOf(
-                    "bandCount" to 5,
-                    "minDb" to -1500,
-                    "maxDb" to 1500
-                ))
+                result.success(mapOf("bandCount" to 5, "minDb" to -1500, "maxDb" to 1500))
                 return
             }
             val range = eq.bandLevelRange
             result.success(mapOf(
                 "bandCount" to eq.numberOfBands.toInt(),
-                "minDb" to range[0].toInt(),
-                "maxDb" to range[1].toInt()
+                "minDb"     to range[0].toInt(),
+                "maxDb"     to range[1].toInt()
             ))
         } catch (e: Exception) {
-            result.success(mapOf(
-                "bandCount" to 5,
-                "minDb" to -1500,
-                "maxDb" to 1500
-            ))
+            result.success(mapOf("bandCount" to 5, "minDb" to -1500, "maxDb" to 1500))
         }
     }
 
@@ -134,23 +104,14 @@ object EqualizerManager {
         try {
             val range = equalizer?.getBandFreqRange(band.toShort())
             result.success(range?.map { it.toInt() } ?: listOf(0, 0))
-        } catch (e: Exception) {
-            result.success(listOf(0, 0))
-        }
+        } catch (e: Exception) { result.success(listOf(0, 0)) }
     }
 
     private fun release(result: MethodChannel.Result?) {
-        try {
-            equalizer?.release()
-            equalizer = null
-            println("✅ Equalizer released")
-        } catch (e: Exception) {
-            println("⚠️ Equalizer release error: ${e.message}")
-        }
+        try { equalizer?.release(); equalizer = null }
+        catch (e: Exception) {}
         result?.success(true)
     }
 
-    fun releaseAll() {
-        release(null)
-    }
+    fun releaseAll() { release(null) }
 }

@@ -1,8 +1,5 @@
 // lib/features/home/presentation/home_screen.dart
-//
-// FIX: Music section now correctly shows "X tracks" or artist name
-// instead of "X episodes". A dedicated _AlbumCard widget replaces the
-// reused _SeriesCard in _MusicSection.
+// VYNCE HOME — Purple/Cyan identity
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -47,34 +44,72 @@ class HomeScreen extends ConsumerWidget {
     return SliverAppBar(
       floating: true,
       backgroundColor: AppColors.background,
-      expandedHeight: 80,
+      expandedHeight: 72,
       flexibleSpace: FlexibleSpaceBar(
-        titlePadding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        titlePadding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
         title: Row(
           children: [
             Image.asset(
               'assets/icons/logo.png',
-              width: 36,
-              height: 36,
+              width: 32,
+              height: 32,
               fit: BoxFit.contain,
+              errorBuilder: (_, __, ___) => const _VLogoSmall(),
             ),
             const SizedBox(width: 10),
-            Text(
-              'Audio Calm',
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.textPrimary,
-                  ),
+            ShaderMask(
+              shaderCallback: (r) => const LinearGradient(
+                colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+              ).createShader(r),
+              child: const Text(
+                'VYNCE',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 4,
+                  color: Colors.white,
+                ),
+              ),
             ),
           ],
         ),
       ),
-      actions: const [],
     );
   }
 }
 
-// ─── Continue Listening ──────────────────────────────────────────────────────
+// ─── Small V logo fallback ────────────────────────────────────────────────────
+
+class _VLogoSmall extends StatelessWidget {
+  const _VLogoSmall();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 32,
+      height: 32,
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+        ),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: const Center(
+        child: Text(
+          'V',
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+            fontSize: 18,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Continue Listening ───────────────────────────────────────────────────────
+
 class _ContinueListeningSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -84,12 +119,12 @@ class _ContinueListeningSection extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SectionHeader(title: 'Continue Listening'),
+        _VynceSectionHeader(title: 'Continue Listening'),
         SizedBox(
           height: 88,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 20),
+            padding: const EdgeInsets.symmetric(horizontal: 18),
             itemCount: items.length,
             separatorBuilder: (_, __) => const SizedBox(width: 12),
             itemBuilder: (context, i) => _ContinueItem(item: items[i]),
@@ -117,43 +152,33 @@ class _ContinueItem extends ConsumerWidget {
         decoration: BoxDecoration(
           color: AppColors.cardColor,
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: AppColors.primary.withOpacity(0.1),
-          ),
+          border: Border.all(color: AppColors.primary.withOpacity(0.15)),
         ),
         child: Row(
           children: [
-            CoverImage(url: item.artworkUrl, size: 52, borderRadius: 10),
+            CoverImage(url: item.artworkUrl, size: 50, borderRadius: 10),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    item.title,
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleMedium
-                        ?.copyWith(fontSize: 13),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  Text(item.title,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(fontSize: 12),
+                      maxLines: 2, overflow: TextOverflow.ellipsis),
                   if (item.subtitle != null)
-                    Text(
-                      item.subtitle!,
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(fontSize: 11),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    Text(item.subtitle!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(fontSize: 10),
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
                 ],
               ),
             ),
-            const Icon(Icons.play_circle_rounded,
-                color: AppColors.primary, size: 28),
+            ShaderMask(
+              shaderCallback: (r) => const LinearGradient(
+                colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+              ).createShader(r),
+              child: const Icon(Icons.play_circle_rounded, color: Colors.white, size: 28),
+            ),
           ],
         ),
       ),
@@ -161,82 +186,81 @@ class _ContinueItem extends ConsumerWidget {
   }
 }
 
-// ─── Featured Banner ─────────────────────────────────────────────────────────
+// ─── Featured Banner ──────────────────────────────────────────────────────────
+
 class _FeaturedBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      margin: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-      height: 160,
+      margin: const EdgeInsets.fromLTRB(18, 16, 18, 0),
+      height: 150,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(18),
         gradient: const LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [Color(0xFF0D3B35), Color(0xFF1A4A7A)],
+          colors: [Color(0xFF1A0533), Color(0xFF0C1A4A)],
         ),
+        border: Border.all(color: const Color(0xFF7C3AED).withOpacity(0.2)),
       ),
       child: Stack(
         children: [
+          // decorative circles
           Positioned(
-            right: -20,
-            top: -20,
+            right: -20, top: -20,
             child: Container(
-              width: 160,
-              height: 160,
+              width: 140, height: 140,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: AppColors.primary.withOpacity(0.15),
+                color: const Color(0xFFA855F7).withOpacity(0.08),
               ),
             ),
           ),
           Positioned(
-            right: 20,
-            bottom: -30,
+            right: 30, bottom: -30,
             child: Container(
-              width: 100,
-              height: 100,
+              width: 90, height: 90,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: AppColors.secondary.withOpacity(0.1),
+                color: const Color(0xFF06B6D4).withOpacity(0.06),
               ),
             ),
           ),
           Padding(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(22),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: AppColors.primary.withOpacity(0.3),
-                    borderRadius: BorderRadius.circular(8),
+                    color: const Color(0xFFA855F7).withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
                   ),
-                  child: Text(
+                  child: const Text(
                     'FEATURED',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: AppColors.primary,
-                          letterSpacing: 1.5,
-                        ),
+                    style: TextStyle(
+                      fontSize: 9,
+                      color: Color(0xFFA855F7),
+                      letterSpacing: 2,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Find Your Inner Peace',
+                  'Stories in Every Beat',
                   style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                      ),
+                    color: Colors.white, fontWeight: FontWeight.w600,
+                  ),
                 ),
-                const SizedBox(height: 6),
+                const SizedBox(height: 4),
                 Text(
-                  'Guided meditations for restful sleep',
+                  'Immersive audio for every mood',
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: AppColors.textSecondary,
-                      ),
+                    color: AppColors.textSecondary,
+                  ),
                 ),
               ],
             ),
@@ -247,7 +271,38 @@ class _FeaturedBanner extends StatelessWidget {
   }
 }
 
-// ─── Stories Section ─────────────────────────────────────────────────────────
+// ─── Section header ───────────────────────────────────────────────────────────
+
+class _VynceSectionHeader extends StatelessWidget {
+  final String title;
+  final VoidCallback? onSeeAll;
+  const _VynceSectionHeader({required this.title, this.onSeeAll});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 22, 16, 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(title, style: Theme.of(context).textTheme.headlineSmall),
+          ),
+          if (onSeeAll != null)
+            GestureDetector(
+              onTap: onSeeAll,
+              child: const Text(
+                'See all',
+                style: TextStyle(fontSize: 11, color: Color(0xFF7C3AED), fontWeight: FontWeight.w500),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Stories Section ──────────────────────────────────────────────────────────
+
 class _StoriesSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -256,28 +311,32 @@ class _StoriesSection extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SectionHeader(
+        _VynceSectionHeader(
           title: 'Calm Stories',
           onSeeAll: () => context.go('/stories'),
         ),
         SizedBox(
-          height: 180,
+          height: 176,
           child: seriesAsync.when(
-            loading: () => _buildShimmerList(),
+            loading: () => _buildShimmer(),
             error: (_, __) => const Center(child: Text('Failed to load')),
             data: (series) => series.isEmpty
                 ? const Center(child: Text('No stories available'))
                 : ListView.separated(
                     scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
                     itemCount: series.length,
-                    separatorBuilder: (_, __) => const SizedBox(width: 14),
+                    separatorBuilder: (_, __) => const SizedBox(width: 12),
                     itemBuilder: (context, i) {
                       final s = series[i];
-                      return _SeriesCard(
+                      return _VynceCard(
                         title: s.title,
+                        subtitle: '${s.episodeCount} episodes',
                         coverUrl: s.coverUrl,
-                        episodeCount: s.episodeCount,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft, end: Alignment.bottomRight,
+                          colors: [Color(0xFF1E1040), Color(0xFF0A1A40)],
+                        ),
                         onTap: () => context.push('/stories/${s.id}'),
                       );
                     },
@@ -288,19 +347,17 @@ class _StoriesSection extends ConsumerWidget {
     );
   }
 
-  Widget _buildShimmerList() {
-    return ListView.separated(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      itemCount: 4,
-      separatorBuilder: (_, __) => const SizedBox(width: 14),
-      itemBuilder: (_, __) =>
-          const ShimmerBox(width: 130, height: 180, borderRadius: 16),
-    );
-  }
+  Widget _buildShimmer() => ListView.separated(
+    scrollDirection: Axis.horizontal,
+    padding: const EdgeInsets.symmetric(horizontal: 18),
+    itemCount: 4,
+    separatorBuilder: (_, __) => const SizedBox(width: 12),
+    itemBuilder: (_, __) => const ShimmerBox(width: 120, height: 176, borderRadius: 14),
+  );
 }
 
 // ─── Music Section ────────────────────────────────────────────────────────────
+
 class _MusicSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -309,32 +366,34 @@ class _MusicSection extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SectionHeader(
+        _VynceSectionHeader(
           title: 'Calm Music',
           onSeeAll: () => context.go('/music'),
         ),
         SizedBox(
-          height: 180,
+          height: 176,
           child: albumsAsync.when(
-            loading: () => _buildShimmerList(),
+            loading: () => _buildShimmer(),
             error: (_, __) => const Center(child: Text('Failed to load')),
             data: (albums) => albums.isEmpty
                 ? const Center(child: Text('No albums available'))
                 : ListView.separated(
                     scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
                     itemCount: albums.length,
-                    separatorBuilder: (_, __) => const SizedBox(width: 14),
+                    separatorBuilder: (_, __) => const SizedBox(width: 12),
                     itemBuilder: (context, i) {
                       final a = albums[i];
-                      // FIX: Use _AlbumCard instead of _SeriesCard.
-                      // _SeriesCard hardcodes "episodes" — _AlbumCard shows
-                      // artist name or "X tracks".
-                      return _AlbumCard(
+                      return _VynceCard(
                         title: a.title,
-                        artist: a.artist,
+                        subtitle: (a.artist != null && a.artist!.isNotEmpty)
+                            ? a.artist!
+                            : '${a.trackCount} tracks',
                         coverUrl: a.coverUrl,
-                        trackCount: a.trackCount,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft, end: Alignment.bottomRight,
+                          colors: [Color(0xFF041A2A), Color(0xFF071C2E)],
+                        ),
                         onTap: () => context.push('/music/${a.id}'),
                       );
                     },
@@ -345,29 +404,29 @@ class _MusicSection extends ConsumerWidget {
     );
   }
 
-  Widget _buildShimmerList() {
-    return ListView.separated(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      itemCount: 4,
-      separatorBuilder: (_, __) => const SizedBox(width: 14),
-      itemBuilder: (_, __) =>
-          const ShimmerBox(width: 130, height: 180, borderRadius: 16),
-    );
-  }
+  Widget _buildShimmer() => ListView.separated(
+    scrollDirection: Axis.horizontal,
+    padding: const EdgeInsets.symmetric(horizontal: 18),
+    itemCount: 4,
+    separatorBuilder: (_, __) => const SizedBox(width: 12),
+    itemBuilder: (_, __) => const ShimmerBox(width: 120, height: 176, borderRadius: 14),
+  );
 }
 
-// ─── Series Card (used only for Stories section) ──────────────────────────────
-class _SeriesCard extends StatelessWidget {
+// ─── Vynce Card ───────────────────────────────────────────────────────────────
+
+class _VynceCard extends StatelessWidget {
   final String title;
+  final String subtitle;
   final String? coverUrl;
-  final int episodeCount;
+  final LinearGradient gradient;
   final VoidCallback onTap;
 
-  const _SeriesCard({
+  const _VynceCard({
     required this.title,
-    this.coverUrl,
-    required this.episodeCount,
+    required this.subtitle,
+    required this.coverUrl,
+    required this.gradient,
     required this.onTap,
   });
 
@@ -375,99 +434,43 @@ class _SeriesCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: SizedBox(
-        width: 130,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(14),
-              child: CoverImage(
-                url: coverUrl,
-                size: 110,
-                borderRadius: 14,
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              title,
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    color: AppColors.textPrimary,
-                    fontSize: 12,
-                  ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            Text(
-              '$episodeCount episodes',
-              style: Theme.of(context).textTheme.bodySmall,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
+      child: Container(
+        width: 120,
+        decoration: BoxDecoration(
+          color: AppColors.cardColor,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFF6366F1).withOpacity(0.12)),
         ),
-      ),
-    );
-  }
-}
-
-// ─── Album Card (used only for Music section) ─────────────────────────────────
-//
-// FIX: Shows artist name if available, else "$trackCount tracks".
-// Never says "episodes" — previously _MusicSection wrongly reused _SeriesCard.
-class _AlbumCard extends StatelessWidget {
-  final String title;
-  final String? artist;
-  final String? coverUrl;
-  final int trackCount;
-  final VoidCallback onTap;
-
-  const _AlbumCard({
-    required this.title,
-    this.artist,
-    this.coverUrl,
-    required this.trackCount,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: SizedBox(
-        width: 130,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(14),
-              child: CoverImage(
-                url: coverUrl,
-                size: 110,
-                borderRadius: 14,
+            Expanded(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
+                child: coverUrl != null && coverUrl!.isNotEmpty
+                    ? CoverImage(url: coverUrl, size: double.infinity, borderRadius: 0, memCacheWidth: 240)
+                    : Container(
+                        decoration: BoxDecoration(gradient: gradient),
+                        child: const Center(
+                          child: Icon(Icons.music_note_rounded, size: 36, color: Color(0xFF7C3AED)),
+                        ),
+                      ),
               ),
             ),
-            const SizedBox(height: 6),
-            Text(
-              title,
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    color: AppColors.textPrimary,
-                    fontSize: 12,
-                  ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            Text(
-              // Show artist if available, otherwise show track count.
-              // "7 tracks" not "7 episodes".
-              (artist != null && artist!.isNotEmpty)
-                  ? artist!
-                  : '$trackCount tracks',
-              style: Theme.of(context).textTheme.bodySmall,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+            Padding(
+              padding: const EdgeInsets.all(9),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0)),
+                      maxLines: 2, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Text(subtitle,
+                      style: const TextStyle(fontSize: 9, color: Color(0xFF4B5563)),
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                ],
+              ),
             ),
           ],
         ),

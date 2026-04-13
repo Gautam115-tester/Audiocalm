@@ -1,20 +1,14 @@
 // lib/features/player/providers/audio_player_provider.dart
 //
-// CHANGES IN THIS VERSION
-// =======================
-// 1. AudioPlayerNotifier accepts `Ref` so it can call other providers.
-// 2. playerStateStream listener detects ProcessingState.completed and calls
-//    completedEpisodesProvider.notifier.markCompleted(item.id).
-//    Works for BOTH online streaming and offline downloaded playback.
-// 3. cycleLoopMode() order FIXED:
-//      OLD: off → one → all → off
-//      NEW: off → all → one → off
-//    First tap  = repeat whole album/queue  (LoopMode.all)
-//    Second tap = repeat single track       (LoopMode.one)
-//    Third tap  = off
-//    Matches Spotify / Apple Music / YouTube Music UX standard.
-// 4. All other logic unchanged (optimistic state, mini-player instant render,
-//    history saving, position restore).
+// VYNCE FIXES:
+// 1. cycleLoopMode order: off → all (repeat queue) → one (repeat single) → off
+//    First tap = repeat whole album/queue
+//    Second tap = repeat only the current single track
+//    Third tap = off (no loop)
+// 2. When album finishes and loopMode=off, auto-advance to next queue item
+//    is already handled in audio_handler.dart via _handleItemCompletion().
+//    The provider correctly reflects state from the handler.
+// 3. completion detection → markCompleted unchanged.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -70,17 +64,17 @@ class AudioPlayerState {
     bool clearError = false,
   }) =>
       AudioPlayerState(
-        currentItem:   currentItem  ?? this.currentItem,
-        isPlaying:     isPlaying    ?? this.isPlaying,
-        isLoading:     isLoading    ?? this.isLoading,
-        position:      position     ?? this.position,
-        duration:      duration     ?? this.duration,
-        speed:         speed        ?? this.speed,
-        loopMode:      loopMode     ?? this.loopMode,
-        shuffleMode:   shuffleMode  ?? this.shuffleMode,
-        queue:         queue        ?? this.queue,
-        currentIndex:  currentIndex ?? this.currentIndex,
-        error:         clearError ? null : (error ?? this.error),
+        currentItem:  currentItem  ?? this.currentItem,
+        isPlaying:    isPlaying    ?? this.isPlaying,
+        isLoading:    isLoading    ?? this.isLoading,
+        position:     position     ?? this.position,
+        duration:     duration     ?? this.duration,
+        speed:        speed        ?? this.speed,
+        loopMode:     loopMode     ?? this.loopMode,
+        shuffleMode:  shuffleMode  ?? this.shuffleMode,
+        queue:        queue        ?? this.queue,
+        currentIndex: currentIndex ?? this.currentIndex,
+        error:        clearError ? null : (error ?? this.error),
       );
 }
 
@@ -107,7 +101,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     }));
 
     _subs.add(_handler.playerStateStream.listen((ps) {
-      // Detect track completion → persist to completed episodes
       if (ps.processingState == ja.ProcessingState.completed &&
           state.currentItem != null) {
         _ref
@@ -142,8 +135,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     } catch (_) {}
   }
 
-  /// Optimistic update: sets currentItem synchronously so MiniPlayer renders
-  /// immediately, then fires the handler load in the background.
   Future<void> playItem(
     PlayableItem item, {
     List<PlayableItem>? queue,
@@ -159,9 +150,7 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
       isLoading:    true,
       error:        null,
       position:     Duration.zero,
-      duration:     item.duration != null
-          ? Duration(seconds: item.duration!)
-          : null,
+      duration:     item.duration != null ? Duration(seconds: item.duration!) : null,
     );
 
     _handler.playItem(item, queue: queue, index: index).then((_) {
@@ -191,29 +180,27 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     else await _handler.play();
   }
 
-  Future<void> seek(Duration position)  => _handler.seek(position);
-  Future<void> skipForward()            => _handler.seekForwardOnce();
-  Future<void> skipBackward()           => _handler.seekBackwardOnce();
-  Future<void> skipToNext()             => _handler.skipToNext();
-  Future<void> skipToPrevious()         => _handler.skipToPrevious();
+  Future<void> seek(Duration position) => _handler.seek(position);
+  Future<void> skipForward()           => _handler.seekForwardOnce();
+  Future<void> skipBackward()          => _handler.seekBackwardOnce();
+  Future<void> skipToNext()            => _handler.skipToNext();
+  Future<void> skipToPrevious()        => _handler.skipToPrevious();
 
   Future<void> setSpeed(double speed) async {
     await _handler.setSpeed(speed);
     state = state.copyWith(speed: speed);
   }
 
-  /// FIX: Loop cycle order — off → all → one → off
+  /// VYNCE LOOP ORDER: off → all → one → off
   ///
-  ///   off → all  : Repeat whole album/queue (1st tap)
-  ///   all → one  : Repeat single track      (2nd tap)
-  ///   one → off  : No looping               (3rd tap)
-  ///
-  /// This is the standard order used by Spotify, Apple Music, YT Music.
+  /// off  →  all  : 1st tap — repeat whole album/queue
+  /// all  →  one  : 2nd tap — repeat only the current single track
+  /// one  →  off  : 3rd tap — no looping
   Future<void> cycleLoopMode() async {
     final nextMode = switch (state.loopMode) {
-      ja.LoopMode.off => ja.LoopMode.all,  // 1st tap → repeat album
-      ja.LoopMode.all => ja.LoopMode.one,  // 2nd tap → repeat single
-      ja.LoopMode.one => ja.LoopMode.off,  // 3rd tap → off
+      ja.LoopMode.off => ja.LoopMode.all,   // 1st tap → repeat whole queue
+      ja.LoopMode.all => ja.LoopMode.one,   // 2nd tap → repeat single track
+      ja.LoopMode.one => ja.LoopMode.off,   // 3rd tap → off
     };
     await _handler.setLoopMode(nextMode);
     state = state.copyWith(loopMode: nextMode);

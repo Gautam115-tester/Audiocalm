@@ -1,13 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  Path: android/app/src/main/res/values/colors.xml
-  
-  Light mode colors (default) — used when phone is in normal/light mode.
--->
 <resources>
-    <!-- Light splash background — AppColors.lightBackground -->
-    <color name="launch_background">#F4F7FA</color>
-
-    <!-- Light launcher icon background -->
-    <color name="ic_launcher_background">#F4F7FA</color>
+    <!-- Vynce splash background (always dark) -->
+    <color name="launch_background">#05050F</color>
+    <color name="ic_launcher_background">#05050F</color>
 </resources>
