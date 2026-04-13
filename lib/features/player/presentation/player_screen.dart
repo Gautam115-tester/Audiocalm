@@ -1,5 +1,12 @@
 // lib/features/player/presentation/player_screen.dart
 // VYNCE PLAYER — Full screen, Purple/Cyan gradient identity with glow effects
+//
+// FIXES:
+// 1. SEEKBAR PIXEL OVERFLOW — thumb was rendering outside track bounds when
+//    progress was near 1.0. Fixed by clamping fillW so the thumb center never
+//    exceeds the track width, and using a ClipRect on the fill bar.
+// 2. TAP-TO-SEEK — added onTapDown handler so a single tap (not just drag)
+//    also seeks to the tapped position.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -40,7 +47,6 @@ class _PlayerBody extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final notifier = ref.read(audioPlayerProvider.notifier);
-    final screenHeight = MediaQuery.of(context).size.height;
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -61,15 +67,10 @@ class _PlayerBody extends ConsumerWidget {
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      // Artwork — takes up more vertical space
                       const _ArtworkSection(),
-                      // Title + favorite
                       const _TitleSection(),
-                      // Seek bar
                       const RepaintBoundary(child: _SeekBarSection()),
-                      // Main controls
                       const _MainControlsSection(),
-                      // Bottom controls
                       const _BottomControlsSection(),
                     ],
                   ),
@@ -162,7 +163,7 @@ class _TopBar extends ConsumerWidget {
   }
 }
 
-// ─── Artwork — larger to fill screen ─────────────────────────────────────────
+// ─── Artwork ──────────────────────────────────────────────────────────────────
 
 class _ArtworkSection extends ConsumerStatefulWidget {
   const _ArtworkSection();
@@ -192,10 +193,10 @@ class _ArtworkSectionState extends ConsumerState<_ArtworkSection>
 
   @override
   Widget build(BuildContext context) {
-    final isPlaying = ref.watch(audioPlayerProvider.select((s) => s.isPlaying));
+    final isPlaying  = ref.watch(audioPlayerProvider.select((s) => s.isPlaying));
     final artworkUrl = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.artworkUrl));
     final screenWidth = MediaQuery.of(context).size.width;
-    final artworkSize = screenWidth - 48.0; // full width minus padding
+    final artworkSize = screenWidth - 48.0;
 
     if (isPlaying) _ctrl.forward();
     else _ctrl.reverse();
@@ -306,6 +307,14 @@ class _TitleSection extends ConsumerWidget {
 }
 
 // ─── Seek Bar ─────────────────────────────────────────────────────────────────
+//
+// FIX 1: PIXEL OVERFLOW — thumb was painted outside track bounds when progress ≈ 1.0
+//   Root cause: `left: fillW - 7` could place the 14px thumb so its right edge
+//   exceeded `totalW`, causing a RenderFlex overflow pixel.
+//   Fix: clamp the thumb's left position to `totalW - 14` so it never escapes.
+//
+// FIX 2: TAP-TO-SEEK — onTapDown now seeks immediately on a single tap.
+//   Previously only drag worked; tapping had no effect.
 
 class _SeekBarSection extends ConsumerStatefulWidget {
   const _SeekBarSection();
@@ -318,11 +327,21 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
   bool   _isSeeking = false;
   double _seekValue = 0;
 
+  // Convert a local x offset to a 0..1 progress value, clamped.
+  double _xToProgress(double x, double totalWidth) {
+    return (x / totalWidth).clamp(0.0, 1.0);
+  }
+
+  void _commitSeek(double progress, Duration? duration) {
+    if (duration == null || duration == Duration.zero) return;
+    final ms = (progress * duration.inMilliseconds).toInt();
+    ref.read(audioPlayerProvider.notifier).seek(Duration(milliseconds: ms));
+  }
+
   @override
   Widget build(BuildContext context) {
     final position = ref.watch(audioPlayerProvider.select((s) => s.position));
     final duration = ref.watch(audioPlayerProvider.select((s) => s.duration));
-    final notifier = ref.read(audioPlayerProvider.notifier);
 
     final displayPos = _isSeeking
         ? Duration(milliseconds: (_seekValue * (duration?.inMilliseconds ?? 0)).toInt())
@@ -338,58 +357,102 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
         children: [
           LayoutBuilder(builder: (_, constraints) {
             final totalW = constraints.maxWidth;
-            final fillW  = totalW * progress;
+            // FIX 1: clamp fill so the 14px thumb never overflows totalW.
+            // fillW can equal totalW; thumb left is clamped to totalW - 14.
+            final rawFillW = totalW * progress;
+            final fillW    = rawFillW.clamp(0.0, totalW);
+            final thumbLeft = (fillW - 7.0).clamp(0.0, totalW - 14.0);
+
             return GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onHorizontalDragStart: (_) => setState(() => _isSeeking = true),
-              onHorizontalDragUpdate: (d) {
-                final p = (d.localPosition.dx / totalW).clamp(0.0, 1.0);
-                setState(() => _seekValue = p);
+              // FIX 2: tap-to-seek
+              onTapDown: (details) {
+                final p = _xToProgress(details.localPosition.dx, totalW);
+                setState(() {
+                  _isSeeking  = false;
+                  _seekValue  = p;
+                });
+                _commitSeek(p, duration);
+              },
+              onHorizontalDragStart: (details) {
+                setState(() {
+                  _isSeeking = true;
+                  _seekValue = _xToProgress(details.localPosition.dx, totalW);
+                });
+              },
+              onHorizontalDragUpdate: (details) {
+                setState(() {
+                  _seekValue = _xToProgress(details.localPosition.dx, totalW);
+                });
               },
               onHorizontalDragEnd: (_) {
+                final p = _seekValue;
                 setState(() => _isSeeking = false);
-                final ms = (_seekValue * (duration?.inMilliseconds ?? 0)).toInt();
-                notifier.seek(Duration(milliseconds: ms));
+                _commitSeek(p, duration);
               },
               child: SizedBox(
-                height: 28,
+                height: 36, // taller hit area for easier touch
                 child: Stack(
                   alignment: Alignment.centerLeft,
+                  clipBehavior: Clip.none,
                   children: [
-                    Container(
-                      height: 4,
-                      width: totalW,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1A1A2E),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                    ),
-                    Container(
-                      height: 4,
-                      width: fillW,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(4),
-                        gradient: const LinearGradient(
-                          colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
+                    // Track background
+                    Positioned(
+                      top: 0, bottom: 0,
+                      left: 0, right: 0,
+                      child: Center(
+                        child: Container(
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1A1A2E),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
                         ),
                       ),
                     ),
-                    if (fillW > 4)
-                      Positioned(
-                        left: fillW - 7,
-                        child: Container(
-                          width: 14,
-                          height: 14,
-                          decoration: const BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Color(0xFFA855F7),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Color(0xFFA855F7),
-                                blurRadius: 10,
-                                spreadRadius: 2,
+                    // Filled portion — clipped so it never overflows
+                    Positioned(
+                      top: 0, bottom: 0, left: 0,
+                      child: Center(
+                        child: ClipRect(
+                          child: Container(
+                            height: 4,
+                            width: fillW,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(4),
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
                               ),
-                            ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    // Thumb — FIX 1: left is clamped so thumb stays on screen
+                    if (fillW > 0)
+                      Positioned(
+                        left: thumbLeft,
+                        top: 0,
+                        bottom: 0,
+                        child: Center(
+                          child: Container(
+                            width: 14,
+                            height: 14,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _isSeeking
+                                  ? const Color(0xFF06B6D4)
+                                  : const Color(0xFFA855F7),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: _isSeeking
+                                      ? const Color(0xFF06B6D4)
+                                      : const Color(0xFFA855F7),
+                                  blurRadius: _isSeeking ? 14 : 10,
+                                  spreadRadius: _isSeeking ? 3 : 2,
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ),
@@ -443,13 +506,11 @@ class _MainControlsSection extends ConsumerWidget {
           size: 30,
         ),
         const SizedBox(width: 8),
-        // -10s backward
         _VynceCtrlBtn(
           widget: _SkipWidget(label: '-10s', onTap: notifier.skipBackward, forward: false),
           size: 30,
         ),
         const SizedBox(width: 16),
-        // Play / Pause — bigger button
         GestureDetector(
           onTap: notifier.togglePlayPause,
           child: Container(
@@ -483,7 +544,6 @@ class _MainControlsSection extends ConsumerWidget {
           ),
         ),
         const SizedBox(width: 16),
-        // +15s forward
         _VynceCtrlBtn(
           widget: _SkipWidget(label: '+15s', onTap: notifier.skipForward, forward: true),
           size: 30,
@@ -563,10 +623,6 @@ class _BottomControlsSection extends ConsumerWidget {
     final isSong      = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.isSong ?? false));
     final notifier    = ref.read(audioPlayerProvider.notifier);
 
-    // Loop icon:
-    //  off → album loop icon
-    //  all → album loop active (whole queue)
-    //  one → single track loop active
     final loopIcon = switch (loopMode) {
       ja.LoopMode.off => Icons.repeat_rounded,
       ja.LoopMode.all => Icons.repeat_rounded,

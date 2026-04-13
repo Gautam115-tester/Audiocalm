@@ -1,45 +1,29 @@
 // lib/features/player/services/audio_handler.dart
 //
-// FIXES IN THIS VERSION
-// =====================
+// RESUME FIX — Seek AFTER stream is ready, not via initialPosition
+// ================================================================
 //
-// FIX 1 — AUTO-PLAY NEXT ALBUM WHEN CURRENT ALBUM COMPLETES
-// ----------------------------------------------------------
-// PROBLEM: When the last song of an album finishes and loopMode == off,
-// _handleItemCompletion() fell into the final `else` branch and did nothing.
-// The player went silent even though there are more albums in the queue.
+// ROOT CAUSE OF RESUME FAILURE:
+//   _loadPartAndPlay() was passing `initialPosition` to setAudioSource().
+//   For streaming URLs (HTTP 302 redirects to Telegram CDN), just_audio
+//   calls setAudioSource() which resolves the redirect, then tries to
+//   seek to initialPosition BEFORE the stream is fully buffered.
+//   Telegram CDN supports Range requests, but the seek fires too early
+//   and is silently dropped — playback always starts from 0.
 //
-// ROOT CAUSE: The queue passed from AlbumDetailScreen only contains songs
-// from ONE album. When that queue is exhausted there is nothing to advance to.
+// FIX:
+//   1. _loadPartAndPlay() no longer passes initialPosition to setAudioSource().
+//      Instead it stores the target seek position in _pendingSeekAfterLoad.
+//   2. In _reAttachStreams(), the durationStream listener now checks
+//      _pendingSeekAfterLoad. When duration arrives (stream is ready),
+//      it calls _player.seek() with the stored position and clears it.
+//      This guarantees the seek fires only after the stream is actually ready.
+//   3. For the app-restart resume case (called from audio_player_provider
+//      _restoreLastSession), the same mechanism works automatically.
 //
-// FIX: AudioCalmHandler now exposes a `onQueueExhausted` callback.
-// The AudioPlayerNotifier sets this callback to request the next album's
-// songs from allAlbumsRawProvider and call playItem() with the full new queue.
-// This keeps the handler stateless w.r.t. album ordering — all album
-// navigation logic stays in the provider layer.
-//
-// FIX 2 — RESUME AUDIO SERIES FROM LAST SAVED POSITION
-// -----------------------------------------------------
-// PROBLEM: When a user closes the app mid-episode and reopens it, tapping
-// the episode starts from position 0 instead of resuming.
-//
-// ROOT CAUSE: _loadItem() always calls _loadPartAndPlay(0) with no
-// initialPosition, discarding the saved position from PlaybackPositionService.
-//
-// FIX: playItem() now accepts an optional `resumeFromSaved` flag (default true
-// for episodes, false for songs — configurable by caller). When true,
-// _loadItem() reads PlaybackPositionService.get(item.id) and passes the
-// saved position as initialPosition to _loadPartAndPlay(). Multi-part
-// episodes: the saved position is resolved across parts using accumulated
-// part durations.
-//
-// EXISTING ARCHITECTURE (unchanged):
-//   • Backend sends 302 redirects to Telegram CDN — just_audio follows them.
-//   • Stable broadcast streams (_positionController etc.) never change ref.
-//   • Gapless within-item part pre-loading via _preloadPlayer.
-//   • Next-item pre-loading via _nextItemPlayer + timer.
-//   • URL expiry handled via ?refresh=1 retry.
-//   • Broadcast throttling to 60 fps max.
+// OTHER FIXES (unchanged from previous version):
+//   FIX 1 — AUTO-PLAY NEXT ALBUM WHEN CURRENT ALBUM COMPLETES
+//   FIX 2 — RESUME AUDIO SERIES FROM LAST SAVED POSITION (now actually works)
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -85,6 +69,12 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final List<Duration> _partDurations = [];
   Duration?    _knownTotalDuration;
 
+  // ── RESUME FIX: pending seek after stream becomes ready ───────────────────
+  // Set in _loadPartAndPlay when a resume position is needed.
+  // Consumed (and cleared) in _reAttachStreams durationStream listener
+  // when duration arrives, meaning the stream is ready to seek.
+  Duration? _pendingSeekAfterLoad;
+
   // ── Subscriptions ──────────────────────────────────────────────────────────
   final List<StreamSubscription> _subs = [];
   StreamSubscription? _completionSub;
@@ -104,10 +94,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   static const int _kPreloadLeadSeconds = 30;
 
   // ── FIX 1: Queue-exhausted callback ───────────────────────────────────────
-  // Set by AudioPlayerNotifier. Called when the last item in the current
-  // queue finishes and loopMode == off. The notifier can then load the next
-  // album's songs and call playItem() to continue playback seamlessly.
-  // Kept nullable — if not set, behaviour is the same as before (silence).
   void Function()? onQueueExhausted;
 
   AudioCalmHandler() {
@@ -145,8 +131,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       final idx = _nextQueueIndex();
       if (idx != null) _doPreloadNextItem(idx);
     });
-
-    debugPrint('[AudioHandler] Next-item preload in ${remaining.inSeconds}s for queue[$nextIndex]');
   }
 
   void _cancelNextItemPreloadTimer() {
@@ -175,7 +159,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       );
       _nextItemPreloaded    = true;
       _nextItemPreloadIndex = index;
-      debugPrint('[AudioHandler] ✓ Preloaded queue[$index] "${item.title}"');
     } catch (e) {
       debugPrint('[AudioHandler] Preload failed queue[$index]: $e');
       if (e.toString().contains('403') || e.toString().contains('401')) {
@@ -195,7 +178,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       );
       _nextItemPreloaded    = true;
       _nextItemPreloadIndex = index;
-      debugPrint('[AudioHandler] ✓ Preloaded (after URL refresh) queue[$index]');
     } catch (e) {
       debugPrint('[AudioHandler] Preload retry failed queue[$index]: $e');
       _nextItemPreloaded = false;
@@ -239,6 +221,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _partDurations.clear();
     _preloadReady              = false;
     _lastSavedPositionSeconds  = 0;
+    _pendingSeekAfterLoad      = null; // clear any pending seek
     _knownTotalDuration = item.duration != null
         ? Duration(seconds: item.duration!)
         : null;
@@ -263,8 +246,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     if (_partUrls.length > 1) {
       _maybePreloadNextPart(0);
     }
-
-    debugPrint('[AudioHandler] ✓ Gapless swap complete "${item.title}"');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -283,11 +264,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         .setAudioSource(ja.AudioSource.uri(Uri.parse(url)), preload: true)
         .then((_) {
           _preloadReady = true;
-          debugPrint('[AudioHandler] ✓ Part ${nextPart + 1}/${_partUrls.length} preloaded');
         })
         .catchError((e) {
           _preloadReady = false;
-          debugPrint('[AudioHandler] Part preload failed: $e');
           if (e.toString().contains('403') || e.toString().contains('401')) {
             final freshUrl = _appendRefreshParam(url);
             _preloadPlayer
@@ -332,10 +311,13 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     try {
       final freshUrl = _appendRefreshParam(url);
       debugPrint('[AudioHandler] Refreshing URL (expired): $freshUrl');
+      // RESUME FIX: don't use initialPosition here either — store as pending
       await _player.setAudioSource(
         ja.AudioSource.uri(Uri.parse(freshUrl)),
-        initialPosition: startAt,
       );
+      if (startAt > Duration.zero) {
+        _pendingSeekAfterLoad = startAt;
+      }
       await _player.play();
       return true;
     } catch (e) {
@@ -345,7 +327,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // PART LOADING
+  // PART LOADING — RESUME FIX IS HERE
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _loadPartAndPlay(int partIndex,
@@ -359,15 +341,25 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _completionSub = null;
 
     final url = _partUrls[partIndex];
-    debugPrint('[AudioHandler] Loading part ${partIndex + 1}/${_partUrls.length}: $url');
+    debugPrint('[AudioHandler] Loading part ${partIndex + 1}/${_partUrls.length}: $url'
+        '${startAt > Duration.zero ? ' (resume at ${startAt.inSeconds}s)' : ''}');
+
+    // RESUME FIX: Store the seek target — DO NOT pass as initialPosition.
+    // initialPosition fails silently on streaming/redirect URLs because the
+    // player tries to seek before the stream is actually ready.
+    // Instead, we set _pendingSeekAfterLoad and the durationStream listener
+    // in _reAttachStreams() will fire the seek once duration (= stream ready).
+    if (startAt > Duration.zero) {
+      _pendingSeekAfterLoad = startAt;
+    }
 
     try {
       if (startAt == Duration.zero && partIndex > 0 && _preloadReady) {
         await _swapToPreloadedPart();
       } else {
+        // DO NOT pass initialPosition — see RESUME FIX above
         await _player.setAudioSource(
           ja.AudioSource.uri(Uri.parse(url)),
-          initialPosition: startAt,
         );
         await _player.play();
       }
@@ -399,7 +391,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           ? _partDurations[_currentPartIndex]
           : (_player.duration ?? Duration.zero);
       _partOffset += completed;
-      debugPrint('[AudioHandler] Part ${_currentPartIndex + 1} done → loading part ${nextPart + 1}');
       _loadPartAndPlay(nextPart);
     } else {
       final item = _currentQueueIndex < _playableQueue.length
@@ -425,13 +416,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         break;
       case ja.LoopMode.off:
         if (_currentQueueIndex < _playableQueue.length - 1) {
-          // More songs in this album queue — advance normally.
           _handleTransitionTo(_currentQueueIndex + 1);
         } else {
-          // FIX 1: Last item in current queue finished.
-          // Notify the notifier layer so it can load the next album's queue.
-          // If the callback is not set (no next album), player goes idle.
-          debugPrint('[AudioHandler] Queue exhausted — invoking onQueueExhausted callback');
+          debugPrint('[AudioHandler] Queue exhausted — invoking onQueueExhausted');
           onQueueExhausted?.call();
         }
         break;
@@ -453,14 +440,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> _playItemAtQueueIndex(int queueIndex) async {
     if (queueIndex < 0 || queueIndex >= _playableQueue.length) return;
     _currentQueueIndex = queueIndex;
-    // When auto-advancing within the queue (skip / auto-next), do NOT resume
-    // from a saved position — start from the beginning.
     await _loadItem(_playableQueue[queueIndex], resumePosition: false);
   }
 
-  // ── FIX 2: resumePosition flag ────────────────────────────────────────────
-  // When resumePosition == true, _loadItem reads PlaybackPositionService and
-  // seeks to the saved offset before starting playback.
   Future<void> _loadItem(PlayableItem item, {bool resumePosition = false}) async {
     _partUrls         = _buildPartUrls(item);
     _currentPartIndex = 0;
@@ -468,79 +450,38 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _partDurations.clear();
     _preloadReady             = false;
     _lastSavedPositionSeconds = 0;
+    _pendingSeekAfterLoad     = null; // clear any stale pending seek
     _knownTotalDuration = item.duration != null
         ? Duration(seconds: item.duration!)
         : null;
 
     mediaItem.add(_playableToMediaItem(item));
     debugPrint('[AudioHandler] Loading "${item.title}" — ${_partUrls.length} part(s)'
-        '${resumePosition ? ' (will resume saved position)' : ''}');
+        '${resumePosition ? ' (resume mode ON)' : ''}');
 
-    // FIX 2: Resolve saved position and map it to the correct part + offset.
+    // RESUME FIX: Read saved position and store it as _pendingSeekAfterLoad.
+    // The actual seek fires in _reAttachStreams() durationStream listener
+    // once the player reports a duration (= stream is ready and seekable).
     Duration resumeAt = Duration.zero;
     if (resumePosition) {
       final savedSeconds = PlaybackPositionService.get(item.id);
-      if (savedSeconds != null && savedSeconds > 0) {
+      if (savedSeconds != null && savedSeconds > 5) {
         resumeAt = Duration(seconds: savedSeconds);
-        debugPrint('[AudioHandler] Resuming "${item.title}" from ${savedSeconds}s');
+        debugPrint('[AudioHandler] Will resume "${item.title}" at ${savedSeconds}s '
+            '(seek fires after stream ready)');
       }
     }
 
-    if (resumeAt == Duration.zero || _partUrls.length <= 1) {
-      // Single-part or no saved position: simple load.
-      await _loadPartAndPlay(0, startAt: resumeAt);
-    } else {
-      // Multi-part: we need to figure out which part contains resumeAt.
-      // Since we don't know part durations yet (they come from just_audio
-      // after loading), we load part 0 first to get its duration, then
-      // decide. For episodes where duration IS known ahead of time via
-      // _knownTotalDuration, we try to estimate.
-      //
-      // Strategy: load part 0, let position accumulate, then seek via the
-      // public seek() method which handles multi-part seeking correctly.
-      await _loadPartAndPlay(0);
-      // Once part 0 is loaded its duration will arrive via durationStream.
-      // Defer the seek slightly so just_audio has time to resolve duration.
-      if (resumeAt > Duration.zero) {
-        Future.delayed(const Duration(milliseconds: 400), () async {
-          // seek() handles multi-part logic internally.
-          await seek(resumeAt);
-          debugPrint('[AudioHandler] Multi-part resume: seeked to $resumeAt');
-        });
-      }
-    }
+    // Always load from beginning — seek will happen post-ready via
+    // _pendingSeekAfterLoad mechanism in _reAttachStreams().
+    await _loadPartAndPlay(0, startAt: resumeAt);
 
     _broadcastCritical();
     _scheduleNextItemPreload();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // URL BUILDING
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  List<String> _buildPartUrls(PlayableItem item) {
-    final offlinePartUrls = item.extras['offlinePartUrls'] as String?;
-    if (offlinePartUrls != null && offlinePartUrls.isNotEmpty) {
-      final parts = offlinePartUrls.split('|').where((s) => s.isNotEmpty).toList();
-      if (parts.isNotEmpty) return parts;
-    }
-    if (item.streamUrl.startsWith('file://') || item.streamUrl.startsWith('/')) {
-      return [item.streamUrl];
-    }
-
-    final contentType = item.isEpisode ? 'episodes' : 'songs';
-    return _urlService
-        .buildPartsFromCount(
-          baseId:      item.id,
-          contentType: contentType,
-          partCount:   item.partCount,
-        )
-        .map((p) => p.streamUrl)
-        .toList();
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STREAM RE-ATTACHMENT
+  // STREAM RE-ATTACHMENT — RESUME FIX: seek fires here when duration arrives
   // ═══════════════════════════════════════════════════════════════════════════
 
   void _reAttachStreams() {
@@ -562,6 +503,25 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       if (dur != null && _currentPartIndex < _partDurations.length) {
         _partDurations[_currentPartIndex] = dur;
       }
+
+      // RESUME FIX: Fire the pending seek now that duration is known,
+      // meaning the stream is ready and HTTP range requests will work.
+      if (dur != null && dur > Duration.zero && _pendingSeekAfterLoad != null) {
+        final seekTo = _pendingSeekAfterLoad!;
+        _pendingSeekAfterLoad = null; // consume immediately to prevent double-seek
+
+        // Only seek if the target is within the stream duration
+        if (seekTo < dur) {
+          debugPrint('[AudioHandler] Stream ready — executing pending seek to ${seekTo.inSeconds}s');
+          _player.seek(seekTo).catchError((e) {
+            debugPrint('[AudioHandler] Pending seek failed: $e');
+          });
+        } else {
+          debugPrint('[AudioHandler] Pending seek ${seekTo.inSeconds}s >= '
+              'duration ${dur.inSeconds}s — skipping');
+        }
+      }
+
       if (!_durationController.isClosed) {
         _durationController.add(_unifiedDuration);
       }
@@ -680,6 +640,8 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         ? _playableQueue[_currentQueueIndex]
         : null;
     if (item == null) return;
+    // Don't save position while we're still seeking to the resume point
+    if (_pendingSeekAfterLoad != null) return;
     final posSeconds = _unifiedPosition.inSeconds;
     if ((posSeconds - _lastSavedPositionSeconds).abs() < _saveIntervalSeconds) return;
     _lastSavedPositionSeconds = posSeconds;
@@ -695,6 +657,8 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         ? _playableQueue[_currentQueueIndex]
         : null;
     if (item == null) return;
+    // Don't overwrite the saved resume point with position=0 during load
+    if (_pendingSeekAfterLoad != null) return;
     PlaybackPositionService.save(
       item.id,
       _unifiedPosition.inSeconds,
@@ -723,9 +687,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   // PUBLIC API
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /// FIX 2: Added [resumeFromSaved] parameter (default false).
-  /// Pass true for episodes so the handler seeks to the last saved position.
-  /// Songs always start from the beginning (resumeFromSaved = false).
   Future<void> playItem(
     PlayableItem item, {
     List<PlayableItem>? queue,
@@ -771,6 +732,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   @override
   Future<void> seek(Duration position) async {
+    // Clear any pending seek since the user is manually seeking
+    _pendingSeekAfterLoad = null;
+
     if (_partUrls.length <= 1) {
       await _player.seek(position);
       if (!_positionController.isClosed) {
@@ -844,7 +808,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     } else if (_loopMode == ja.LoopMode.all && _playableQueue.isNotEmpty) {
       await _playItemAtQueueIndex(0);
     } else {
-      // Queue exhausted via manual skip — same behaviour as auto-completion.
       debugPrint('[AudioHandler] skipToNext: queue end — invoking onQueueExhausted');
       onQueueExhausted?.call();
     }

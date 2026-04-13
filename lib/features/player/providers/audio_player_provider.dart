@@ -3,44 +3,42 @@
 // FIXES IN THIS VERSION
 // =====================
 //
-// FIX 1 — AUTO-PLAY NEXT ALBUM WHEN CURRENT ALBUM COMPLETES
-// ----------------------------------------------------------
-// AudioPlayerNotifier now sets _handler.onQueueExhausted to a callback that:
-//   1. Reads allAlbumsRawProvider to get the full ordered album list.
-//   2. Finds the currently playing album by matching any song's albumId.
-//   3. Gets the next album in the list (wraps to first if at the end).
-//   4. Builds a PlayableItem queue from that album's songs.
-//   5. Calls _handler.playItem() with the new queue.
-// This makes album playback continuous — finishing an album seamlessly
-// starts the next one, exactly like a music player queue.
+// FIX 3 — RESUME LAST SESSION ON APP RESTART
+// -------------------------------------------
+// PROBLEM: After killing and reopening the app, the last-played audio always
+// started from position 0 instead of the saved position.
 //
-// FIX 2 — RESUME AUDIO SERIES FROM LAST SAVED POSITION
-// -----------------------------------------------------
-// playItem() now accepts a `resumeFromSaved` parameter.
-// For EPISODES this defaults to TRUE so that tapping an episode that has a
-// saved position automatically resumes from where the user left off.
-// For SONGS this defaults to FALSE — songs always start from the beginning.
-// The caller (series_detail_screen, album_detail_screen, downloads_screen)
-// can override this per tap if needed.
+// ROOT CAUSE: The provider never read the persisted last-media-id / last-
+// position from Hive on startup. PlaybackPositionService.save() was called
+// correctly during playback, but nothing called PlaybackPositionService.get()
+// to restore it when the app opened fresh.
 //
-// The actual seek logic is inside AudioCalmHandler._loadItem() — the
-// provider layer just passes the flag through.
+// FIX: AudioPlayerNotifier._init() now calls _restoreLastSession() which:
+//   1. Reads the last mediaId and last position from the Hive playback box.
+//   2. Searches allSeriesRawProvider and allAlbumsRawProvider for the item.
+//   3. If found, calls playItem() with resumeFromSaved = true so the
+//      audio_handler seeks to the exact saved second.
+//   4. Immediately pauses after loading (user chooses when to resume).
+//   5. State is marked hasMedia = true so the mini-player is visible.
+//
+// FIX 1 — AUTO-PLAY NEXT ALBUM (unchanged from previous version)
+// FIX 2 — RESUME FROM SAVED POSITION ON TAP (unchanged)
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 import '../domain/media_item_model.dart';
 import '../services/audio_handler.dart';
+import '../services/playback_position_service.dart';
 import '../../../../core/constants/app_constants.dart';
-import '../../calm_stories/providers/completed_episodes_provider.dart';
-// FIX 1: import album provider to resolve next-album queue
+import '../../../../core/constants/api_constants.dart';
+import '../../calm_stories/providers/calm_stories_provider.dart';
 import '../../calm_music/providers/calm_music_provider.dart';
 import '../../calm_music/data/models/song_model.dart';
-import '../../../core/constants/api_constants.dart';
-import 'package:flutter/foundation.dart';
-
+import '../../calm_stories/providers/completed_episodes_provider.dart';
 
 class AudioPlayerState {
   final PlayableItem? currentItem;
@@ -111,8 +109,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   void _init() {
-    // FIX 1: Register the queue-exhausted callback so the handler can
-    // request the next album's songs when the current album finishes.
     _handler.onQueueExhausted = _onQueueExhausted;
 
     _subs.add(_handler.positionStream.listen((pos) {
@@ -149,26 +145,118 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
         }
       }
     }));
+
+    // FIX 3: Restore the last session a frame after providers are ready.
+    Future.delayed(const Duration(milliseconds: 500), _restoreLastSession);
+  }
+
+  // ── FIX 3: Restore last session ────────────────────────────────────────────
+  //
+  // Reads the Hive playback box for the last mediaId, finds the matching
+  // PlayableItem across episodes and songs, then loads it paused at the
+  // saved position so the mini-player shows immediately on app open.
+  Future<void> _restoreLastSession() async {
+    if (!mounted) return;
+    try {
+      final box = Hive.box(AppConstants.playbackBox);
+      final lastMediaId = box.get(AppConstants.lastMediaIdKey) as String?;
+      if (lastMediaId == null || lastMediaId.isEmpty) return;
+
+      final savedPos = PlaybackPositionService.get(lastMediaId);
+
+      // Search episodes first
+      try {
+        final seriesBatch = await _ref.read(allSeriesRawProvider.future)
+            .timeout(const Duration(seconds: 10));
+
+        for (final entry in seriesBatch.episodesBySeriesId.entries) {
+          final seriesId = entry.key;
+          final episodes = entry.value;
+          final epIdx = episodes.indexWhere((ep) => ep.id == lastMediaId);
+          if (epIdx >= 0) {
+            final ep = episodes[epIdx];
+            final series = seriesBatch.seriesList
+                .firstWhere((s) => s.id == seriesId, orElse: () => seriesBatch.seriesList.first);
+
+            final queue = episodes.map((e) => PlayableItem(
+              id:         e.id,
+              title:      e.title,
+              subtitle:   series.title,
+              artworkUrl: series.coverUrl,
+              duration:   e.duration,
+              partCount:  e.partCount,
+              type:       MediaType.episode,
+              streamUrl:  '${ApiConstants.baseUrl}${ApiConstants.episodeStream(e.id)}',
+            )).toList();
+
+            debugPrint('[AudioPlayerNotifier] Restoring episode "${ep.title}" '
+                'at ${savedPos ?? 0}s');
+
+            await playItem(
+              queue[epIdx],
+              queue: queue,
+              index: epIdx,
+              resumeFromSaved: true,
+            );
+            // Load paused — user decides when to continue
+            await Future.delayed(const Duration(milliseconds: 300));
+            if (mounted) await _handler.pause();
+            return;
+          }
+        }
+      } catch (e) {
+        debugPrint('[AudioPlayerNotifier] Could not restore episode: $e');
+      }
+
+      // Search songs
+      try {
+        final albumBatch = await _ref.read(allAlbumsRawProvider.future)
+            .timeout(const Duration(seconds: 10));
+
+        for (final entry in albumBatch.songsByAlbumId.entries) {
+          final albumId = entry.key;
+          final songs   = entry.value;
+          final songIdx = songs.indexWhere((s) => s.id == lastMediaId);
+          if (songIdx >= 0) {
+            final album = albumBatch.albums
+                .firstWhere((a) => a.id == albumId, orElse: () => albumBatch.albums.first);
+
+            final queue = songs.map((s) => _songToPlayable(s, album)).toList();
+
+            debugPrint('[AudioPlayerNotifier] Restoring song "${songs[songIdx].title}" '
+                'at ${savedPos ?? 0}s');
+
+            await playItem(
+              queue[songIdx],
+              queue: queue,
+              index: songIdx,
+              // Songs: only resume if a real saved position exists
+              resumeFromSaved: savedPos != null && savedPos > 5,
+            );
+            await Future.delayed(const Duration(milliseconds: 300));
+            if (mounted) await _handler.pause();
+            return;
+          }
+        }
+      } catch (e) {
+        debugPrint('[AudioPlayerNotifier] Could not restore song: $e');
+      }
+    } catch (e) {
+      debugPrint('[AudioPlayerNotifier] _restoreLastSession error: $e');
+      // Non-fatal — app opens normally without restored session.
+    }
   }
 
   // ── FIX 1: Queue-exhausted handler ─────────────────────────────────────────
-  // Called by AudioCalmHandler when the last song of the current queue finishes
-  // and loopMode == off. We find the next album in allAlbumsRawProvider and
-  // start playing it from the first song.
   void _onQueueExhausted() {
-    // Run async work off the hot path — handler callback must return quickly.
     _loadAndPlayNextAlbum();
   }
 
   Future<void> _loadAndPlayNextAlbum() async {
     try {
-      // 1. Get the full album+songs batch (already cached by the provider).
       final batch = await _ref.read(allAlbumsRawProvider.future);
       if (batch.albums.isEmpty) return;
 
-      // 2. Identify the current album from the playing item.
-      //    Songs carry albumId in their streamUrl path OR we can match by
-      //    looking at which album's song list contains the current item id.
       final currentItemId = state.currentItem?.id;
       if (currentItemId == null) return;
 
@@ -180,37 +268,25 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
         }
       }
 
-      // 3. If the current item isn't a song (e.g. it's an episode), don't
-      //    auto-advance albums — episodes have their own series queue logic.
       if (currentAlbumId == null) return;
 
-      // 4. Find the current album's position in the ordered list.
       final albums = batch.albums;
       final currentAlbumIndex = albums.indexWhere((a) => a.id == currentAlbumId);
       if (currentAlbumIndex < 0) return;
 
-      // 5. Get the next album (wrap around to first when at end).
       final nextAlbumIndex = (currentAlbumIndex + 1) % albums.length;
       final nextAlbum      = albums[nextAlbumIndex];
       final nextSongs      = batch.songsByAlbumId[nextAlbum.id] ?? [];
       if (nextSongs.isEmpty) return;
 
-      // 6. Build the PlayableItem queue for the next album.
       final queue = nextSongs.map((s) => _songToPlayable(s, nextAlbum)).toList();
-
-      debugPrint('[AudioPlayerNotifier] Auto-advancing to album "${nextAlbum.title}" '
-          '(${queue.length} songs)');
-
-      // 7. Play the first song of the next album — no resume (fresh start).
+      debugPrint('[AudioPlayerNotifier] Auto-advancing to album "${nextAlbum.title}"');
       await playItem(queue.first, queue: queue, index: 0);
-
     } catch (e) {
       debugPrint('[AudioPlayerNotifier] _loadAndPlayNextAlbum error: $e');
-      // Non-fatal — player simply stays idle if this fails.
     }
   }
 
-  /// Convert a SongModel + album into a PlayableItem.
   PlayableItem _songToPlayable(SongModel song, dynamic album) {
     return PlayableItem(
       id:         song.id,
@@ -235,9 +311,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   // ── FIX 2: resumeFromSaved parameter ───────────────────────────────────────
-  // For episodes: defaults to true so tapping resumes from last position.
-  // For songs:    defaults to false so songs always start from the beginning.
-  // Callers can explicitly set resumeFromSaved to override the default.
   Future<void> playItem(
     PlayableItem item, {
     List<PlayableItem>? queue,
@@ -245,8 +318,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     bool? resumeFromSaved,
   }) async {
     final q = queue ?? [item];
-
-    // Determine whether to resume: episodes resume by default, songs don't.
     final shouldResume = resumeFromSaved ?? (item.type == MediaType.episode);
 
     state = state.copyWith(
@@ -303,10 +374,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     state = state.copyWith(speed: speed);
   }
 
-  /// LOOP ORDER:
-  ///   off  →  all  : repeat whole album/queue forever
-  ///   all  →  one  : repeat single track forever
-  ///   one  →  off  : no repeat
   Future<void> cycleLoopMode() async {
     final nextMode = switch (state.loopMode) {
       ja.LoopMode.off => ja.LoopMode.all,
@@ -324,7 +391,6 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   @override
   void dispose() {
-    // Clear the callback to avoid a dangling reference after disposal.
     _handler.onQueueExhausted = null;
     for (final sub in _subs) { sub.cancel(); }
     super.dispose();
