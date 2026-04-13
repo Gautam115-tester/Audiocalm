@@ -20,7 +20,13 @@
 //   3. AlbumPrefetchController remains a no-op stub — all data still comes
 //      from the single /api/albums/all-with-songs endpoint.
 //
-// All public API names and types are unchanged — no screen edits required.
+// PUBLIC API FIX:
+//   allAlbumsRawProvider is now PUBLIC (was _allAlbumsRawProvider).
+//   music_screen.dart's _AllMusicTab and _ArtistSongsTab need to access the
+//   _ParsedAlbumBatch to read songsByAlbumId — they cannot reference a
+//   private symbol from another file.
+//   _ParsedAlbumBatch and _AlbumParsePayload are also made public so
+//   music_screen.dart can reference the batch type in its watch() call.
 
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -33,19 +39,19 @@ import '../../../core/di/providers.dart';
 // ── Top-level parse helpers (must be top-level for compute / Isolate.run) ────
 
 // Payload type passed to the isolate — must be sendable (no Flutter objects).
-class _AlbumParsePayload {
+class AlbumParsePayload {
   final List<Map<String, dynamic>> rawList;
-  const _AlbumParsePayload(this.rawList);
+  const AlbumParsePayload(this.rawList);
 }
 
-class _ParsedAlbumBatch {
+class ParsedAlbumBatch {
   final List<AlbumModel> albums;
   final Map<String, List<SongModel>> songsByAlbumId;
-  const _ParsedAlbumBatch(this.albums, this.songsByAlbumId);
+  const ParsedAlbumBatch(this.albums, this.songsByAlbumId);
 }
 
 /// Runs in a background isolate — no Flutter engine calls allowed here.
-_ParsedAlbumBatch _parseAlbumsAndSongs(_AlbumParsePayload payload) {
+ParsedAlbumBatch _parseAlbumsAndSongs(AlbumParsePayload payload) {
   final albums = <AlbumModel>[];
   final songsByAlbumId = <String, List<SongModel>>{};
 
@@ -61,16 +67,20 @@ _ParsedAlbumBatch _parseAlbumsAndSongs(_AlbumParsePayload payload) {
         .toList();
   }
 
-  return _ParsedAlbumBatch(albums, songsByAlbumId);
+  return ParsedAlbumBatch(albums, songsByAlbumId);
 }
 
 // ── Internal raw-fetch provider ───────────────────────────────────────────────
 //
-// Fetches the combined all-with-songs payload ONCE.  All derived providers
+// PUBLIC (was _allAlbumsRawProvider).
+// music_screen.dart's _AllMusicTab and _ArtistSongsTab watch this directly
+// to access songsByAlbumId across all albums in one place.
+//
+// Fetches the combined all-with-songs payload ONCE. All derived providers
 // read from this cache — zero extra network calls.
 
-final _allAlbumsRawProvider =
-    FutureProvider<_ParsedAlbumBatch>((ref) async {
+final allAlbumsRawProvider =
+    FutureProvider<ParsedAlbumBatch>((ref) async {
   ref.keepAlive();
 
   final dio = ref.watch(dioClientProvider);
@@ -86,7 +96,7 @@ final _allAlbumsRawProvider =
   // compute() uses Isolate.run — the result is sent back via a message port.
   final parsed = await compute(
     _parseAlbumsAndSongs,
-    _AlbumParsePayload(rawList),
+    AlbumParsePayload(rawList),
   );
 
   return parsed;
@@ -97,7 +107,7 @@ final _allAlbumsRawProvider =
 final albumsListProvider = FutureProvider<List<AlbumModel>>((ref) async {
   ref.keepAlive();
 
-  final batch = await ref.watch(_allAlbumsRawProvider.future);
+  final batch = await ref.watch(allAlbumsRawProvider.future);
 
   // FIX: Yield a microtask so the first frame can paint before we update state.
   // Without this, the provider resolves synchronously after the background
@@ -113,7 +123,7 @@ final songsProvider =
     FutureProvider.family<List<SongModel>, String>((ref, albumId) async {
   ref.keepAlive();
 
-  final batch = await ref.watch(_allAlbumsRawProvider.future);
+  final batch = await ref.watch(allAlbumsRawProvider.future);
   return batch.songsByAlbumId[albumId] ?? const [];
 });
 
@@ -123,7 +133,7 @@ final albumDetailProvider =
     FutureProvider.family<AlbumModel?, String>((ref, id) async {
   ref.keepAlive();
 
-  final batch = await ref.watch(_allAlbumsRawProvider.future);
+  final batch = await ref.watch(allAlbumsRawProvider.future);
   try {
     return batch.albums.firstWhere((a) => a.id == id);
   } catch (_) {
@@ -138,7 +148,7 @@ final albumWithSongsProvider = FutureProvider.family<
     String>((ref, albumId) async {
   ref.keepAlive();
 
-  final batch = await ref.watch(_allAlbumsRawProvider.future);
+  final batch = await ref.watch(allAlbumsRawProvider.future);
 
   AlbumModel? album;
   try {
@@ -155,8 +165,8 @@ final albumWithSongsProvider = FutureProvider.family<
 
 // ── AlbumPrefetchController (no-op stub) ──────────────────────────────────────
 //
-// Everything is loaded by _allAlbumsRawProvider in a single background-parsed
-// batch.  warmRange() is intentionally empty.
+// Everything is loaded by allAlbumsRawProvider in a single background-parsed
+// batch. warmRange() is intentionally empty.
 
 class AlbumPrefetchController {
   // ignore: unused_field

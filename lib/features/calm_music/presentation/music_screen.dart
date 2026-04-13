@@ -2,6 +2,11 @@
 // VYNCE MUSIC SCREEN
 // RENAMED: "Calm Music" → "Music"
 // ADDED: Logo on left, All Music tab, Artist Songs section
+//
+// FIX: Replaced references to private `_allAlbumsRawProvider` and
+// `_ParsedAlbumBatch` with the now-public `allAlbumsRawProvider` and
+// `ParsedAlbumBatch` exported from calm_music_provider.dart.
+// No functionality changes — purely a visibility/scoping fix.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -327,8 +332,8 @@ class _AllMusicTab extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Collect all songs across all albums from the batch provider
-    final batchAsync = ref.watch(_allAlbumsRawProvider);
+    // FIX: use public allAlbumsRawProvider (was _allAlbumsRawProvider)
+    final batchAsync = ref.watch(allAlbumsRawProvider);
 
     return batchAsync.when(
       loading: () => const Center(child: CircularProgressIndicator(color: AppColors.primary)),
@@ -542,7 +547,8 @@ class _ArtistSongsTab extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final artistAlbums = albums.where((a) => (a.artist ?? 'Unknown Artist') == artist).toList();
-    final batchAsync = ref.watch(_allAlbumsRawProvider);
+    // FIX: use public allAlbumsRawProvider (was _allAlbumsRawProvider)
+    final batchAsync = ref.watch(allAlbumsRawProvider);
 
     return batchAsync.when(
       loading: () => const Center(child: CircularProgressIndicator(color: AppColors.primary)),
