@@ -105,6 +105,45 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // BUILD PART URLS — resolves stream URLs for a PlayableItem
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Builds the list of stream URL strings for a [PlayableItem].
+  ///
+  /// • Offline items: reads pipe-separated file paths from extras['offlinePartUrls'].
+  /// • Single-part online items: returns [item.streamUrl] as-is.
+  /// • Multi-part online items: appends ?part=1 … ?part=N to the base streamUrl,
+  ///   matching the backend's /api/episodes/:id/stream?part=N pattern.
+  List<String> _buildPartUrls(PlayableItem item) {
+    final isOffline = item.extras['isOffline'] == true;
+
+    if (isOffline) {
+      // Offline playback: file paths are stored as a '|'-separated string
+      final offlineParts = item.extras['offlinePartUrls'] as String?;
+      if (offlineParts != null && offlineParts.isNotEmpty) {
+        return offlineParts.split('|').where((u) => u.isNotEmpty).toList();
+      }
+      // Fallback to streamUrl if offlinePartUrls is missing
+      return item.streamUrl.isNotEmpty ? [item.streamUrl] : [];
+    }
+
+    final partCount = item.partCount;
+
+    if (partCount <= 1) {
+      return item.streamUrl.isNotEmpty ? [item.streamUrl] : [];
+    }
+
+    // Multi-part: append ?part=N to the base stream URL
+    // Backend routes handle: /api/episodes/:id/stream?part=N
+    //                    and /api/songs/:id/stream?part=N
+    final base = item.streamUrl;
+    return List.generate(
+      partCount,
+      (i) => '$base?part=${i + 1}',
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // NEXT-ITEM PRE-LOADING
   // ═══════════════════════════════════════════════════════════════════════════
 
