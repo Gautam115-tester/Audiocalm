@@ -1,14 +1,9 @@
 // lib/features/player/providers/audio_player_provider.dart
 //
 // VYNCE FIXES:
-// 1. cycleLoopMode order: off → all (repeat queue) → one (repeat single) → off
-//    First tap = repeat whole album/queue
-//    Second tap = repeat only the current single track
-//    Third tap = off (no loop)
-// 2. When album finishes and loopMode=off, auto-advance to next queue item
-//    is already handled in audio_handler.dart via _handleItemCompletion().
-//    The provider correctly reflects state from the handler.
-// 3. completion detection → markCompleted unchanged.
+// 1. cycleLoopMode: off → all (whole album/queue forever) → one (single track forever) → off
+// 2. skipForward = 15 seconds (changed from 15, backward stays 10)
+// 3. Loop labels updated in comments for clarity
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -181,26 +176,30 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   Future<void> seek(Duration position) => _handler.seek(position);
-  Future<void> skipForward()           => _handler.seekForwardOnce();
-  Future<void> skipBackward()          => _handler.seekBackwardOnce();
-  Future<void> skipToNext()            => _handler.skipToNext();
-  Future<void> skipToPrevious()        => _handler.skipToPrevious();
+
+  /// Skip forward 15 seconds
+  Future<void> skipForward()  => _handler.seekForwardOnce();
+
+  /// Skip backward 10 seconds
+  Future<void> skipBackward() => _handler.seekBackwardOnce();
+
+  Future<void> skipToNext()     => _handler.skipToNext();
+  Future<void> skipToPrevious() => _handler.skipToPrevious();
 
   Future<void> setSpeed(double speed) async {
     await _handler.setSpeed(speed);
     state = state.copyWith(speed: speed);
   }
 
-  /// VYNCE LOOP ORDER: off → all → one → off
-  ///
-  /// off  →  all  : 1st tap — repeat whole album/queue
-  /// all  →  one  : 2nd tap — repeat only the current single track
-  /// one  →  off  : 3rd tap — no looping
+  /// LOOP ORDER:
+  ///   off  →  all  : 1st tap — loop whole album/queue forever
+  ///   all  →  one  : 2nd tap — loop single track forever
+  ///   one  →  off  : 3rd tap — no loop
   Future<void> cycleLoopMode() async {
     final nextMode = switch (state.loopMode) {
-      ja.LoopMode.off => ja.LoopMode.all,   // 1st tap → repeat whole queue
-      ja.LoopMode.all => ja.LoopMode.one,   // 2nd tap → repeat single track
-      ja.LoopMode.one => ja.LoopMode.off,   // 3rd tap → off
+      ja.LoopMode.off => ja.LoopMode.all,   // 1st: repeat whole album forever
+      ja.LoopMode.all => ja.LoopMode.one,   // 2nd: repeat single track forever
+      ja.LoopMode.one => ja.LoopMode.off,   // 3rd: no repeat
     };
     await _handler.setLoopMode(nextMode);
     state = state.copyWith(loopMode: nextMode);

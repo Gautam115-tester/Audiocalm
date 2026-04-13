@@ -1,5 +1,5 @@
 // lib/features/player/presentation/player_screen.dart
-// VYNCE PLAYER — Purple/Cyan gradient identity with glow effects
+// VYNCE PLAYER — Full screen, Purple/Cyan gradient identity with glow effects
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -40,6 +40,7 @@ class _PlayerBody extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final notifier = ref.read(audioPlayerProvider.notifier);
+    final screenHeight = MediaQuery.of(context).size.height;
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -57,23 +58,20 @@ class _PlayerBody extends ConsumerWidget {
               children: [
                 const _TopBar(),
                 Expanded(
-                  child: SingleChildScrollView(
-                    physics: const NeverScrollableScrollPhysics(),
-                    child: Column(
-                      children: const [
-                        SizedBox(height: 14),
-                        _ArtworkSection(),
-                        SizedBox(height: 22),
-                        _TitleSection(),
-                        SizedBox(height: 20),
-                        RepaintBoundary(child: _SeekBarSection()),
-                        SizedBox(height: 14),
-                        _MainControlsSection(),
-                        SizedBox(height: 18),
-                        _BottomControlsSection(),
-                        SizedBox(height: 12),
-                      ],
-                    ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      // Artwork — takes up more vertical space
+                      const _ArtworkSection(),
+                      // Title + favorite
+                      const _TitleSection(),
+                      // Seek bar
+                      const RepaintBoundary(child: _SeekBarSection()),
+                      // Main controls
+                      const _MainControlsSection(),
+                      // Bottom controls
+                      const _BottomControlsSection(),
+                    ],
                   ),
                 ),
               ],
@@ -97,7 +95,7 @@ class _TopBar extends ConsumerWidget {
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 30),
+            icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 32),
             color: AppColors.textSecondary,
             onPressed: () => Navigator.of(context).pop(),
           ),
@@ -111,7 +109,7 @@ class _TopBar extends ConsumerWidget {
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.white,
-                  fontSize: 9,
+                  fontSize: 10,
                   fontWeight: FontWeight.w600,
                   letterSpacing: 2.5,
                 ),
@@ -119,7 +117,7 @@ class _TopBar extends ConsumerWidget {
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.more_horiz_rounded),
+            icon: const Icon(Icons.more_horiz_rounded, size: 28),
             color: AppColors.textSecondary,
             onPressed: () => _showOptions(context),
           ),
@@ -164,7 +162,7 @@ class _TopBar extends ConsumerWidget {
   }
 }
 
-// ─── Artwork ──────────────────────────────────────────────────────────────────
+// ─── Artwork — larger to fill screen ─────────────────────────────────────────
 
 class _ArtworkSection extends ConsumerStatefulWidget {
   const _ArtworkSection();
@@ -196,41 +194,43 @@ class _ArtworkSectionState extends ConsumerState<_ArtworkSection>
   Widget build(BuildContext context) {
     final isPlaying = ref.watch(audioPlayerProvider.select((s) => s.isPlaying));
     final artworkUrl = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.artworkUrl));
+    final screenWidth = MediaQuery.of(context).size.width;
+    final artworkSize = screenWidth - 48.0; // full width minus padding
 
     if (isPlaying) _ctrl.forward();
     else _ctrl.reverse();
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 34),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
       child: ScaleTransition(
         scale: _scale,
         child: Container(
-          height: 256,
-          width: double.infinity,
+          height: artworkSize,
+          width: artworkSize,
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(24),
             border: Border.all(color: const Color(0xFF8B5CF6).withOpacity(0.25)),
             boxShadow: [
               BoxShadow(
-                color: const Color(0xFF7C3AED).withOpacity(0.3),
-                blurRadius: 40,
-                spreadRadius: 2,
-                offset: const Offset(0, 14),
+                color: const Color(0xFF7C3AED).withOpacity(0.35),
+                blurRadius: 50,
+                spreadRadius: 4,
+                offset: const Offset(0, 16),
               ),
               BoxShadow(
-                color: const Color(0xFF06B6D4).withOpacity(0.12),
-                blurRadius: 60,
+                color: const Color(0xFF06B6D4).withOpacity(0.15),
+                blurRadius: 70,
                 spreadRadius: 0,
-                offset: const Offset(0, 20),
+                offset: const Offset(0, 24),
               ),
             ],
           ),
           child: ClipRRect(
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(24),
             child: CoverImage(
               url: artworkUrl,
               size: double.infinity,
-              borderRadius: 22,
+              borderRadius: 24,
               placeholder: Container(
                 decoration: const BoxDecoration(
                   gradient: LinearGradient(
@@ -240,7 +240,7 @@ class _ArtworkSectionState extends ConsumerState<_ArtworkSection>
                   ),
                 ),
                 child: const Center(
-                  child: Icon(Icons.music_note_rounded, size: 80, color: Color(0xFF7C3AED)),
+                  child: Icon(Icons.music_note_rounded, size: 100, color: Color(0xFF7C3AED)),
                 ),
               ),
             ),
@@ -264,7 +264,7 @@ class _TitleSection extends ConsumerWidget {
     if (item == null) return const SizedBox.shrink();
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 26),
+      padding: const EdgeInsets.symmetric(horizontal: 28),
       child: Row(
         children: [
           Expanded(
@@ -273,8 +273,8 @@ class _TitleSection extends ConsumerWidget {
               children: [
                 Text(item.title,
                     style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
                       color: Color(0xFFF0F0FF),
                     ),
                     maxLines: 2,
@@ -283,7 +283,7 @@ class _TitleSection extends ConsumerWidget {
                   const SizedBox(height: 4),
                   Text(
                     '${item.subtitle!} · Vynce',
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280)),
+                    style: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -295,7 +295,7 @@ class _TitleSection extends ConsumerWidget {
             icon: Icon(
               isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
               color: isFav ? AppColors.error : AppColors.textSecondary,
-              size: 26,
+              size: 28,
             ),
             onPressed: () => ref.read(favoritesProvider.notifier).toggle(item.id),
           ),
@@ -333,10 +333,9 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
         : 0.0;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 22),
+      padding: const EdgeInsets.symmetric(horizontal: 28),
       child: Column(
         children: [
-          // Custom gradient seek bar
           LayoutBuilder(builder: (_, constraints) {
             final totalW = constraints.maxWidth;
             final fillW  = totalW * progress;
@@ -352,68 +351,61 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
                 final ms = (_seekValue * (duration?.inMilliseconds ?? 0)).toInt();
                 notifier.seek(Duration(milliseconds: ms));
               },
-              child: Column(
-                children: [
-                  SizedBox(
-                    height: 20,
-                    child: Stack(
-                      alignment: Alignment.centerLeft,
-                      children: [
-                        // Track
-                        Container(
-                          height: 3,
-                          width: totalW,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF1A1A2E),
-                            borderRadius: BorderRadius.circular(3),
-                          ),
-                        ),
-                        // Fill
-                        Container(
-                          height: 3,
-                          width: fillW,
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(3),
-                            gradient: const LinearGradient(
-                              colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
-                            ),
-                          ),
-                        ),
-                        // Dot
-                        if (fillW > 4)
-                          Positioned(
-                            left: fillW - 6,
-                            child: Container(
-                              width: 11,
-                              height: 11,
-                              decoration: const BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: Color(0xFFA855F7),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Color(0xFFA855F7),
-                                    blurRadius: 8,
-                                    spreadRadius: 1,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                      ],
+              child: SizedBox(
+                height: 28,
+                child: Stack(
+                  alignment: Alignment.centerLeft,
+                  children: [
+                    Container(
+                      height: 4,
+                      width: totalW,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A1A2E),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
                     ),
-                  ),
-                ],
+                    Container(
+                      height: 4,
+                      width: fillW,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
+                        ),
+                      ),
+                    ),
+                    if (fillW > 4)
+                      Positioned(
+                        left: fillW - 7,
+                        child: Container(
+                          width: 14,
+                          height: 14,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Color(0xFFA855F7),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Color(0xFFA855F7),
+                                blurRadius: 10,
+                                spreadRadius: 2,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             );
           }),
-          const SizedBox(height: 6),
+          const SizedBox(height: 8),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 2),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(_fmt(displayPos), style: const TextStyle(fontSize: 9, color: Color(0xFF4B5563))),
-                Text(_fmt(displayDur), style: const TextStyle(fontSize: 9, color: Color(0xFF4B5563))),
+                Text(_fmt(displayPos), style: const TextStyle(fontSize: 11, color: Color(0xFF4B5563))),
+                Text(_fmt(displayDur), style: const TextStyle(fontSize: 11, color: Color(0xFF4B5563))),
               ],
             ),
           ),
@@ -448,20 +440,21 @@ class _MainControlsSection extends ConsumerWidget {
         _VynceCtrlBtn(
           icon: Icons.skip_previous_rounded,
           onTap: notifier.skipToPrevious,
-          size: 26,
+          size: 30,
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 8),
+        // -10s backward
         _VynceCtrlBtn(
-          widget: _Skip10Widget(label: '-10s', onTap: notifier.skipBackward),
-          size: 26,
+          widget: _SkipWidget(label: '-10s', onTap: notifier.skipBackward, forward: false),
+          size: 30,
         ),
-        const SizedBox(width: 14),
-        // Play / Pause
+        const SizedBox(width: 16),
+        // Play / Pause — bigger button
         GestureDetector(
           onTap: notifier.togglePlayPause,
           child: Container(
-            width: 60,
-            height: 60,
+            width: 72,
+            height: 72,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: const LinearGradient(
@@ -471,47 +464,48 @@ class _MainControlsSection extends ConsumerWidget {
               ),
               boxShadow: [
                 BoxShadow(
-                  color: const Color(0xFF7C3AED).withOpacity(0.45),
-                  blurRadius: 20,
-                  offset: const Offset(0, 6),
+                  color: const Color(0xFF7C3AED).withOpacity(0.5),
+                  blurRadius: 24,
+                  offset: const Offset(0, 8),
                 ),
               ],
             ),
             child: isLoading
                 ? const Padding(
-                    padding: EdgeInsets.all(16),
-                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                    padding: EdgeInsets.all(20),
+                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
                   )
                 : Icon(
                     isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
                     color: Colors.white,
-                    size: 32,
+                    size: 38,
                   ),
           ),
         ),
-        const SizedBox(width: 14),
+        const SizedBox(width: 16),
+        // +15s forward
         _VynceCtrlBtn(
-          widget: _Skip10Widget(label: '+10s', onTap: notifier.skipForward, forward: true),
-          size: 26,
+          widget: _SkipWidget(label: '+15s', onTap: notifier.skipForward, forward: true),
+          size: 30,
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 8),
         _VynceCtrlBtn(
           icon: Icons.skip_next_rounded,
           onTap: notifier.skipToNext,
-          size: 26,
+          size: 30,
         ),
       ],
     );
   }
 }
 
-// ─── 10s skip visual ──────────────────────────────────────────────────────────
+// ─── Skip visual ──────────────────────────────────────────────────────────────
 
-class _Skip10Widget extends StatelessWidget {
+class _SkipWidget extends StatelessWidget {
   final String label;
   final VoidCallback onTap;
   final bool forward;
-  const _Skip10Widget({required this.label, required this.onTap, this.forward = false});
+  const _SkipWidget({required this.label, required this.onTap, this.forward = false});
 
   @override
   Widget build(BuildContext context) {
@@ -521,36 +515,34 @@ class _Skip10Widget extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           SizedBox(
-            width: 36,
-            height: 36,
+            width: 44,
+            height: 44,
             child: Stack(
               alignment: Alignment.center,
               children: [
                 Container(
-                  width: 36,
-                  height: 36,
+                  width: 44,
+                  height: 44,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFF4B5563)),
+                    border: Border.all(color: const Color(0xFF4B5563), width: 1.5),
                   ),
                 ),
-                Positioned(
-                  child: Text(
-                    '10',
-                    style: const TextStyle(
-                      fontSize: 9,
-                      color: Color(0xFFC4B5FD),
-                      fontWeight: FontWeight.w600,
-                    ),
+                Text(
+                  forward ? '15' : '10',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFFC4B5FD),
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 3),
+          const SizedBox(height: 4),
           Text(
             label,
-            style: const TextStyle(fontSize: 7.5, color: Color(0xFF6B7280), letterSpacing: 0.3),
+            style: const TextStyle(fontSize: 9, color: Color(0xFF6B7280), letterSpacing: 0.3),
           ),
         ],
       ),
@@ -571,7 +563,10 @@ class _BottomControlsSection extends ConsumerWidget {
     final isSong      = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.isSong ?? false));
     final notifier    = ref.read(audioPlayerProvider.notifier);
 
-    // Loop icon: off → all → one → off
+    // Loop icon:
+    //  off → album loop icon
+    //  all → album loop active (whole queue)
+    //  one → single track loop active
     final loopIcon = switch (loopMode) {
       ja.LoopMode.off => Icons.repeat_rounded,
       ja.LoopMode.all => Icons.repeat_rounded,
@@ -580,7 +575,7 @@ class _BottomControlsSection extends ConsumerWidget {
     final loopActive = loopMode != ja.LoopMode.off;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 30),
+      padding: const EdgeInsets.symmetric(horizontal: 36),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -622,10 +617,10 @@ class _SpeedButton extends StatelessWidget {
     return GestureDetector(
       onTap: () => _showSpeedMenu(context),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
           color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(
             color: speed != 1.0
                 ? const Color(0xFF7C3AED).withOpacity(0.5)
@@ -635,7 +630,7 @@ class _SpeedButton extends StatelessWidget {
         child: Text(
           '${speed}x',
           style: TextStyle(
-            fontSize: 11,
+            fontSize: 13,
             fontWeight: FontWeight.w700,
             color: speed != 1.0 ? const Color(0xFFA855F7) : const Color(0xFF6B7280),
           ),
@@ -693,7 +688,7 @@ class _VynceCtrlBtn extends StatelessWidget {
   final Widget? widget;
   final VoidCallback? onTap;
   final double size;
-  const _VynceCtrlBtn({this.icon, this.widget, this.onTap, this.size = 24});
+  const _VynceCtrlBtn({this.icon, this.widget, this.onTap, this.size = 26});
 
   @override
   Widget build(BuildContext context) {
@@ -725,9 +720,9 @@ class _IconToggle extends StatelessWidget {
                 shaderCallback: (r) => const LinearGradient(
                   colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
                 ).createShader(r),
-                child: Icon(icon, size: 22, color: Colors.white),
+                child: Icon(icon, size: 24, color: Colors.white),
               )
-            : Icon(icon, size: 22, color: const Color(0xFF4B5563)),
+            : Icon(icon, size: 24, color: const Color(0xFF4B5563)),
       ),
     );
   }

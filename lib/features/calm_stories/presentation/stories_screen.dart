@@ -1,17 +1,9 @@
 // lib/features/calm_stories/presentation/stories_screen.dart
 //
-// FIX: Forces a fresh fetch of allSeriesRawProvider every time this screen
-// mounts by calling ref.invalidate(allSeriesRawProvider) in initState.
-//
-// WHY THIS IS NEEDED:
-// Even with keepAlive removed from all derived providers, there is a window
-// where allSeriesRawProvider could still be alive (e.g. if SeriesDetailScreen
-// is still in the navigator stack). ref.invalidate() is the guaranteed nuclear
-// option — it forces a fresh network request regardless of the provider's
-// current lifecycle state, ensuring the episode count is always up to date.
-//
-// The invalidation happens BEFORE the first build, so the loading shimmer
-// is shown briefly while fresh data arrives — correct UX behaviour.
+// RENAMED: "Calm Stories" → "Audio Story"
+// ADDED: Logo on left side of app bar
+// ADDED: Menu option (three-dot) in app bar
+// FIX: Forces fresh fetch on mount
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -34,18 +26,13 @@ class StoriesScreen extends ConsumerStatefulWidget {
 
 class _StoriesScreenState extends ConsumerState<StoriesScreen> {
   final _scrollController = ScrollController();
+  bool _gridView = true; // default grid
 
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
 
-    // CORE FIX: Invalidate allSeriesRawProvider every time StoriesScreen
-    // mounts. This forces a fresh network fetch, guaranteeing the episode
-    // count is always current regardless of any Riverpod keepAlive state.
-    //
-    // Using addPostFrameCallback so the widget tree is fully built before
-    // the invalidation triggers a rebuild — avoids setState-during-build errors.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         ref.invalidate(allSeriesRawProvider);
@@ -106,6 +93,63 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
     );
   }
 
+  void _showSortMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => SafeArea(
+        child: Container(
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          decoration: BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 12),
+              Container(
+                width: 36, height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.textTertiary,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 8),
+              ListTile(
+                leading: const Icon(Icons.grid_view_rounded, color: AppColors.primary),
+                title: const Text('Grid View'),
+                trailing: _gridView ? const Icon(Icons.check_rounded, color: AppColors.primary) : null,
+                onTap: () {
+                  setState(() => _gridView = true);
+                  Navigator.pop(ctx);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.list_rounded, color: AppColors.primary),
+                title: const Text('List View'),
+                trailing: !_gridView ? const Icon(Icons.check_rounded, color: AppColors.primary) : null,
+                onTap: () {
+                  setState(() => _gridView = false);
+                  Navigator.pop(ctx);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.refresh_rounded, color: AppColors.primary),
+                title: const Text('Refresh'),
+                onTap: () {
+                  ref.invalidate(allSeriesRawProvider);
+                  Navigator.pop(ctx);
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final seriesAsync = ref.watch(seriesListProvider);
@@ -113,7 +157,49 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        title: const Text('Calm Stories'),
+        backgroundColor: AppColors.background,
+        titleSpacing: 0,
+        title: Row(
+          children: [
+            const SizedBox(width: 16),
+            // Logo / V icon on left
+            ShaderMask(
+              shaderCallback: (r) => const LinearGradient(
+                colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+              ).createShader(r),
+              child: const Icon(Icons.headphones_rounded, color: Colors.white, size: 22),
+            ),
+            const SizedBox(width: 10),
+            ShaderMask(
+              shaderCallback: (r) => const LinearGradient(
+                colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
+              ).createShader(r),
+              child: const Text(
+                'Audio Story',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 18,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          // View toggle icon
+          IconButton(
+            icon: Icon(
+              _gridView ? Icons.list_rounded : Icons.grid_view_rounded,
+              color: AppColors.textSecondary,
+            ),
+            onPressed: () => setState(() => _gridView = !_gridView),
+          ),
+          // Menu (three dots)
+          IconButton(
+            icon: const Icon(Icons.more_vert_rounded, color: AppColors.textSecondary),
+            onPressed: () => _showSortMenu(context),
+          ),
+        ],
       ),
       body: seriesAsync.when(
         loading: () => _buildShimmer(),
@@ -134,20 +220,39 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
             if (mounted) _triggerPrefetch(series);
           });
 
-          return GridView.builder(
+          if (_gridView) {
+            return GridView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(_kPadding),
+              cacheExtent: 300,
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: _kCrossAxisCount,
+                mainAxisSpacing: _kSpacing,
+                crossAxisSpacing: _kSpacing,
+                childAspectRatio: _kItemAspectRatio,
+              ),
+              itemCount: series.length,
+              itemBuilder: (context, i) {
+                final s = series[i];
+                return _SeriesGridCard(
+                  title: s.title,
+                  description: s.description,
+                  coverUrl: s.coverUrl,
+                  episodeCount: s.episodeCount,
+                  onTap: () => context.push('/stories/${s.id}'),
+                );
+              },
+            );
+          }
+
+          // List view
+          return ListView.builder(
             controller: _scrollController,
-            padding: const EdgeInsets.all(_kPadding),
-            cacheExtent: 300,
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: _kCrossAxisCount,
-              mainAxisSpacing: _kSpacing,
-              crossAxisSpacing: _kSpacing,
-              childAspectRatio: _kItemAspectRatio,
-            ),
+            padding: const EdgeInsets.symmetric(vertical: 8),
             itemCount: series.length,
             itemBuilder: (context, i) {
               final s = series[i];
-              return _SeriesGridCard(
+              return _SeriesListTile(
                 title: s.title,
                 description: s.description,
                 coverUrl: s.coverUrl,
@@ -176,6 +281,8 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
     );
   }
 }
+
+// ─── Grid Card ────────────────────────────────────────────────────────────────
 
 class _SeriesGridCard extends StatelessWidget {
   final String title;
@@ -256,6 +363,48 @@ class _SeriesGridCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ─── List Tile ────────────────────────────────────────────────────────────────
+
+class _SeriesListTile extends StatelessWidget {
+  final String title;
+  final String? description;
+  final String? coverUrl;
+  final int episodeCount;
+  final VoidCallback onTap;
+
+  const _SeriesListTile({
+    required this.title,
+    this.description,
+    this.coverUrl,
+    required this.episodeCount,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      onTap: onTap,
+      leading: CoverImage(url: coverUrl, size: 52, borderRadius: 10),
+      title: Text(title,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0))),
+      subtitle: Text(
+        '$episodeCount episodes',
+        style: const TextStyle(fontSize: 11, color: Color(0xFF4B5563)),
+      ),
+      trailing: Container(
+        width: 32,
+        height: 32,
+        decoration: BoxDecoration(
+          border: Border.all(color: const Color(0xFF7C3AED).withOpacity(0.4)),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: const Icon(Icons.chevron_right_rounded, color: Color(0xFF7C3AED), size: 18),
       ),
     );
   }

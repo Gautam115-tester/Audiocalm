@@ -866,7 +866,7 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> seekForward(bool begin) async {
     if (!begin) return;
-    final newPos = _unifiedPosition + const Duration(seconds: 15);
+    final newPos = _unifiedPosition + const Duration(seconds: 10);
     final dur    = _unifiedDuration;
     await seek(newPos < dur ? newPos : dur);
   }

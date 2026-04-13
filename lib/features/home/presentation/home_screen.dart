@@ -1,5 +1,5 @@
 // lib/features/home/presentation/home_screen.dart
-// VYNCE HOME — Purple/Cyan identity
+// VYNCE HOME — Updated section labels: "Calm Stories" → "Audio Story", "Calm Music" → "Music"
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -78,8 +78,6 @@ class HomeScreen extends ConsumerWidget {
   }
 }
 
-// ─── Small V logo fallback ────────────────────────────────────────────────────
-
 class _VLogoSmall extends StatelessWidget {
   const _VLogoSmall();
 
@@ -97,11 +95,7 @@ class _VLogoSmall extends StatelessWidget {
       child: const Center(
         child: Text(
           'V',
-          style: TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.w700,
-            fontSize: 18,
-          ),
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 18),
         ),
       ),
     );
@@ -205,7 +199,6 @@ class _FeaturedBanner extends StatelessWidget {
       ),
       child: Stack(
         children: [
-          // decorative circles
           Positioned(
             right: -20, top: -20,
             child: Container(
@@ -240,12 +233,7 @@ class _FeaturedBanner extends StatelessWidget {
                   ),
                   child: const Text(
                     'FEATURED',
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: Color(0xFFA855F7),
-                      letterSpacing: 2,
-                      fontWeight: FontWeight.w600,
-                    ),
+                    style: TextStyle(fontSize: 9, color: Color(0xFFA855F7), letterSpacing: 2, fontWeight: FontWeight.w600),
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -301,7 +289,7 @@ class _VynceSectionHeader extends StatelessWidget {
   }
 }
 
-// ─── Stories Section ──────────────────────────────────────────────────────────
+// ─── Audio Story Section ──────────────────────────────────────────────────────
 
 class _StoriesSection extends ConsumerWidget {
   @override
@@ -312,7 +300,7 @@ class _StoriesSection extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _VynceSectionHeader(
-          title: 'Calm Stories',
+          title: 'Audio Story',           // RENAMED
           onSeeAll: () => context.go('/stories'),
         ),
         SizedBox(
@@ -367,7 +355,7 @@ class _MusicSection extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _VynceSectionHeader(
-          title: 'Calm Music',
+          title: 'Music',                  // RENAMED
           onSeeAll: () => context.go('/music'),
         ),
         SizedBox(

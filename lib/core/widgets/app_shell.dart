@@ -1,5 +1,5 @@
 // lib/core/widgets/app_shell.dart
-// VYNCE APP SHELL — Purple/Cyan bottom nav
+// VYNCE APP SHELL — Updated nav labels: Stories→Audio Story, Music→Music
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -62,11 +62,11 @@ class _VynceBottomNav extends StatelessWidget {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
-              _NavItem(index: 0, current: currentIndex, icon: Icons.home_rounded, label: 'Home'),
-              _NavItem(index: 1, current: currentIndex, icon: Icons.auto_stories_rounded, label: 'Stories'),
-              _NavItem(index: 2, current: currentIndex, icon: Icons.music_note_rounded, label: 'Music'),
-              _NavItem(index: 3, current: currentIndex, icon: Icons.search_rounded, label: 'Search'),
-              _NavItem(index: 4, current: currentIndex, icon: Icons.download_rounded, label: 'Downloads'),
+              _NavItem(index: 0, current: currentIndex, icon: Icons.home_rounded,        label: 'Home'),
+              _NavItem(index: 1, current: currentIndex, icon: Icons.headphones_rounded,  label: 'Stories'),
+              _NavItem(index: 2, current: currentIndex, icon: Icons.music_note_rounded,  label: 'Music'),
+              _NavItem(index: 3, current: currentIndex, icon: Icons.search_rounded,      label: 'Search'),
+              _NavItem(index: 4, current: currentIndex, icon: Icons.download_rounded,    label: 'Downloads'),
             ],
           ),
         ),
