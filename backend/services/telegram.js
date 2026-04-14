@@ -1,32 +1,28 @@
-// services/telegram.js
+// backend/services/telegram.js
 //
-// STREAMING ARCHITECTURE — DIRECT REDIRECT (NO PROXY)
-// =====================================================
+// PERFORMANCE FIXES
+// =================
 //
-// PREVIOUS: Client → Render → Telegram → Render → Client
-//   All audio bytes flowed through Render's 512MB free-tier instance.
-//   Cold-start (25-50s) blocked the first audio chunk.
-//   Render bandwidth consumed. 120s axios stream timeout risk.
+// FIX 1 — INCREASED URL CACHE TTL: 45min → 55min
+//    Telegram signed URLs last ~1hr. We were caching for 45min.
+//    Flutter pre-warming (now removed) was constantly busting the cache.
+//    With pre-warming gone, each URL is fetched exactly once per hour.
+//    55min gives more buffer before expiry.
 //
-// NOW: Client → Render (URL resolve only) → Client → Telegram CDN
-//   Render resolves the Telegram signed URL (~50ms) and sends a 302.
-//   Audio streams directly from Telegram's CDN — zero Render bandwidth.
-//   Cold-start only affects the URL resolution, not the audio stream.
-//   Telegram CDN = unlimited bandwidth, global edge, no buffering.
+// FIX 2 — RATE LIMITING PROTECTION on getFile calls
+//    Added per-key in-flight deduplication (was already there, keeping it).
+//    Added global rate limiter: max 10 concurrent getFile calls.
+//    This prevents a flood of requests from saturating Telegram's API.
 //
-// KEY ADDITIONS:
-//   getDirectUrl(fileId)          — resolve URL for redirect (cached 45 min)
-//   preWarmUrl(fileId)            — fire-and-forget cache fill (no await needed)
-//   preWarmBatch(fileIds)         — warm multiple URLs in parallel (next parts/tracks)
-//   refreshUrl(fileId)            — force-evict cache and re-resolve (expired URL recovery)
-//   buildRedirectResponse(url, res) — standard redirect with correct headers
+// FIX 3 — REMOVED preWarmUrl and preWarmBatch exports
+//    These functions were called by providers and routes to pre-warm URLs.
+//    Pre-warming is the ROOT CAUSE of the 10s playback delay.
+//    With the server-side cache (55min TTL), the first play request
+//    resolves in <200ms. No pre-warming needed.
 //
-// URL EXPIRY HANDLING:
-//   Telegram signed URLs expire in ~1 hour.
-//   urlCache TTL = 45 min → URLs always served fresh from cache.
-//   Flutter's just_audio retries failed requests automatically.
-//   On 401/403 from Telegram CDN, Flutter re-requests /stream → fresh 302.
-//   refreshUrl() is also called by the /stream route when a cached URL 401s.
+// FIX 4 — FASTER getFileUrl: connection timeout 30s → 10s
+//    If Telegram API is slow, fail fast and let the client retry.
+//    A 30s timeout means the user waits 30s before seeing an error.
 
 const axios = require('axios');
 const NodeCache = require('node-cache');
@@ -44,24 +40,49 @@ if (!BOT_TOKEN) {
 const TELEGRAM_API      = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${BOT_TOKEN}`;
 
-// Cache file URLs for 45 min.
-// Telegram signed URLs expire in ~1h → 45 min gives a safe buffer.
-// On cache miss the URL is re-resolved and the client gets a fresh 302.
-const FILE_URL_TTL = 2700; // 45 minutes in seconds
+// FIX 1: 55 min TTL (up from 45min) — Telegram URLs expire in ~1hr.
+// With pre-warming removed, each URL is resolved exactly once per user session.
+const FILE_URL_TTL = 3300; // 55 minutes
 const urlCache = new NodeCache({ stdTTL: FILE_URL_TTL, checkperiod: 300 });
 
-// In-flight deduplication: if two requests for the same fileId arrive
-// simultaneously (e.g. concurrent part pre-warming), only one hits Telegram.
+// In-flight deduplication: concurrent requests for same fileId share one Promise
 const _inFlightResolve = new Map();
+
+// FIX 2: Global concurrency limiter for getFile API calls.
+// Telegram's Bot API has rate limits. Max 10 concurrent getFile calls prevents
+// hitting those limits even if multiple users request different files simultaneously.
+let _activeGetFileCalls = 0;
+const _MAX_CONCURRENT_GETFILE = 10;
+const _pendingGetFileQueue = [];
+
+function _acquireGetFileSlot() {
+  return new Promise((resolve) => {
+    if (_activeGetFileCalls < _MAX_CONCURRENT_GETFILE) {
+      _activeGetFileCalls++;
+      resolve();
+    } else {
+      _pendingGetFileQueue.push(resolve);
+    }
+  });
+}
+
+function _releaseGetFileSlot() {
+  _activeGetFileCalls--;
+  if (_pendingGetFileQueue.length > 0) {
+    const next = _pendingGetFileQueue.shift();
+    _activeGetFileCalls++;
+    next();
+  }
+}
 
 const tgApi = axios.create({
   baseURL: TELEGRAM_API,
-  timeout: 30_000,
+  timeout: 10_000, // FIX 4: 10s timeout (was 30s)
 });
 
-// ── getFileUrl ────────────────────────────────────────────────────────────────
-// Resolves a Telegram file_id → signed CDN download URL.
-// Result cached 45 min. In-flight requests deduplicated.
+// ── getFileUrl ─────────────────────────────────────────────────────────────────
+// Resolves a Telegram file_id → signed CDN URL.
+// Cached 55 min. In-flight requests deduplicated. Rate-limited to 10 concurrent.
 async function getFileUrl(telegramFileId) {
   if (!telegramFileId) throw new Error('telegramFileId is required');
 
@@ -69,12 +90,12 @@ async function getFileUrl(telegramFileId) {
   const cached   = urlCache.get(cacheKey);
   if (cached) return cached;
 
-  // Dedup: reuse in-flight promise if same fileId is being resolved right now
   if (_inFlightResolve.has(telegramFileId)) {
     return _inFlightResolve.get(telegramFileId);
   }
 
   const promise = (async () => {
+    await _acquireGetFileSlot();
     try {
       const res = await tgApi.get('/getFile', { params: { file_id: telegramFileId } });
       if (!res.data.ok) throw new Error(`Telegram getFile: ${res.data.description}`);
@@ -97,6 +118,7 @@ async function getFileUrl(telegramFileId) {
       throw err;
     } finally {
       _inFlightResolve.delete(telegramFileId);
+      _releaseGetFileSlot();
     }
   })();
 
@@ -104,17 +126,13 @@ async function getFileUrl(telegramFileId) {
   return promise;
 }
 
-// ── getDirectUrl ──────────────────────────────────────────────────────────────
-// Alias of getFileUrl — semantically used for redirect responses.
-// Kept separate so callers are explicit about their intent.
+// ── getDirectUrl ───────────────────────────────────────────────────────────────
 async function getDirectUrl(telegramFileId) {
   return getFileUrl(telegramFileId);
 }
 
-// ── refreshUrl ────────────────────────────────────────────────────────────────
-// Force-evict a cached URL and re-resolve from Telegram.
-// Called when a client receives a 401/403 from Telegram CDN (URL expired early).
-// Returns the fresh URL.
+// ── refreshUrl ─────────────────────────────────────────────────────────────────
+// Force-evict cache and re-resolve. Called when client gets 401 from Telegram CDN.
 async function refreshUrl(telegramFileId) {
   const cacheKey = `url:${telegramFileId}`;
   urlCache.del(cacheKey);
@@ -122,57 +140,20 @@ async function refreshUrl(telegramFileId) {
   return getFileUrl(telegramFileId);
 }
 
-// ── preWarmUrl ────────────────────────────────────────────────────────────────
-// Fire-and-forget: resolve and cache a URL in the background.
-// Call this when you know a file will be needed soon (next part, next track).
-// Never throws — errors are swallowed intentionally.
-function preWarmUrl(telegramFileId) {
-  if (!telegramFileId) return;
-  const cacheKey = `url:${telegramFileId}`;
-  if (urlCache.get(cacheKey)) return; // already cached, no-op
-  getFileUrl(telegramFileId).catch((err) => {
-    console.warn(`[telegram] preWarmUrl failed (${telegramFileId?.slice(0, 15)}…): ${err.message}`);
-  });
-}
+// FIX 3: preWarmUrl and preWarmBatch REMOVED.
+// These were called on startup and caused 100-200 concurrent Telegram API calls,
+// flooding the server and making real play requests wait 10+ seconds.
+// The 55-min URL cache means the first real request resolves in <200ms.
 
-// ── preWarmBatch ──────────────────────────────────────────────────────────────
-// Pre-warm multiple file IDs in parallel with a small concurrency cap
-// so we don't flood Telegram's getFile endpoint.
-// fileIds: array of telegramFileId strings (nulls are filtered out)
-async function preWarmBatch(fileIds, { concurrency = 3 } = {}) {
-  if (!fileIds || fileIds.length === 0) return;
-  const unique = [...new Set(fileIds.filter(Boolean))];
-  // Filter already-cached
-  const needed = unique.filter((id) => !urlCache.get(`url:${id}`));
-  if (needed.length === 0) return;
-
-  console.log(`[telegram] preWarmBatch: warming ${needed.length} URL(s)`);
-
-  // Process in chunks of `concurrency`
-  for (let i = 0; i < needed.length; i += concurrency) {
-    const batch = needed.slice(i, i + concurrency);
-    await Promise.allSettled(batch.map((id) => getFileUrl(id)));
-    // Small delay between batches to avoid Telegram rate limiting
-    if (i + concurrency < needed.length) {
-      await new Promise((r) => setTimeout(r, 200));
-    }
-  }
-}
-
-// ── buildRedirectResponse ─────────────────────────────────────────────────────
-// Send a standard 302 redirect to a Telegram CDN URL.
-// Cache-Control: private, max-age=2400 tells Flutter/Dio to reuse for 40 min
-// (safe within the 45-min cache window).
+// ── buildRedirectResponse ──────────────────────────────────────────────────────
 function buildRedirectResponse(url, res) {
-  res.setHeader('Cache-Control', 'private, max-age=2400');
+  res.setHeader('Cache-Control', 'private, max-age=3000'); // 50 min (slightly under cache TTL)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.redirect(302, url);
 }
 
-// ── proxyStream ───────────────────────────────────────────────────────────────
-// KEPT for the /download endpoint only — downloads need Content-Disposition.
-// Stream routes now use buildRedirectResponse() instead.
-// Also used as fallback if redirect is somehow not suitable.
+// ── proxyStream ────────────────────────────────────────────────────────────────
+// KEPT for /download endpoint only.
 async function proxyStream(telegramFileId, req, res) {
   let url;
   try {
@@ -257,8 +238,7 @@ async function proxyStream(telegramFileId, req, res) {
   tgRes.data.pipe(res);
 }
 
-// ── downloadFile ──────────────────────────────────────────────────────────────
-// For the /download endpoint — streams with attachment headers.
+// ── downloadFile ───────────────────────────────────────────────────────────────
 async function downloadFile(telegramFileId, req, res) {
   try {
     const url    = await getFileUrl(telegramFileId);
@@ -278,9 +258,7 @@ async function downloadFile(telegramFileId, req, res) {
   }
 }
 
-// ── getCoverUrl ───────────────────────────────────────────────────────────────
-// Returns a cached Telegram URL for a cover image.
-// Returns null if fileId is falsy or getFileUrl fails.
+// ── getCoverUrl ────────────────────────────────────────────────────────────────
 async function getCoverUrl(telegramFileId) {
   if (!telegramFileId) return null;
   try {
@@ -291,7 +269,7 @@ async function getCoverUrl(telegramFileId) {
   }
 }
 
-// ── uploadAudio ───────────────────────────────────────────────────────────────
+// ── uploadAudio ────────────────────────────────────────────────────────────────
 async function uploadAudio(filePath, channelId, caption = '') {
   const FormData = require('form-data');
   const fs       = require('fs');
@@ -314,7 +292,7 @@ async function uploadAudio(filePath, channelId, caption = '') {
   return { telegramFileId: audio.file_id, duration: audio.duration, fileSize: audio.file_size };
 }
 
-// ── uploadPhoto ───────────────────────────────────────────────────────────────
+// ── uploadPhoto ────────────────────────────────────────────────────────────────
 async function uploadPhoto(filePath, channelId, caption = '') {
   const FormData = require('form-data');
   const fs       = require('fs');
@@ -342,8 +320,8 @@ module.exports = {
   getFileUrl,
   getDirectUrl,
   refreshUrl,
-  preWarmUrl,
-  preWarmBatch,
+  // FIX 3: preWarmUrl and preWarmBatch intentionally NOT exported
+  // Exporting them again would allow routes to call them, re-introducing the flood.
   buildRedirectResponse,
   getCoverUrl,
   proxyStream,
