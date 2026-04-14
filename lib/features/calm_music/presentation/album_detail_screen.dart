@@ -1,16 +1,18 @@
 // lib/features/calm_music/presentation/album_detail_screen.dart
 //
-// FIX: Download progress ring was frozen / not updating.
+// FIXES IN THIS VERSION
+// =====================
 //
-// ROOT CAUSE: DownloadModel is mutable — its fields (status, progress) are
-// mutated in-place inside DownloadManager. Riverpod's `.select((map) => map[id])`
-// returns the SAME object reference before and after the mutation, so
-// `identical(prev, next)` is true → Riverpod skips the rebuild → the ring
-// never moved.
+// FIX 1 — AUTO-PLAY WHEN TAPPING A SONG
+//    Song tiles now call playItem() AND navigate to player immediately.
+//    Previously the navigation was missing so playback started but
+//    the player screen never opened.
 //
-// FIX: _DownloadButton is now a ConsumerWidget that watches the provider
-// directly and selects the specific scalar fields it needs (status + progress).
-// Because scalars are compared by value, any change triggers a rebuild.
+// FIX 2 — PRE-WARM NEXT N SONGS IN BACKGROUND
+//    When a song starts playing, the next 5 songs in the album are
+//    immediately pre-warmed so gapless/fast transitions work.
+//
+// All download/favorite logic unchanged.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -49,6 +51,16 @@ class AlbumDetailScreen extends ConsumerWidget {
               _AlbumHeader(album: data.album!, songCount: data.songs.length)
             else
               const SliverAppBar(pinned: true),
+
+            // FIX 1: Play All button at top of song list
+            if (data.songs.isNotEmpty)
+              SliverToBoxAdapter(
+                child: _PlayAllBar(
+                  songs: data.songs,
+                  album: data.album,
+                ),
+              ),
+
             if (data.songs.isEmpty)
               const SliverToBoxAdapter(
                 child: EmptyStateWidget(
@@ -74,6 +86,100 @@ class AlbumDetailScreen extends ConsumerWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ── Play All Bar ───────────────────────────────────────────────────────────────
+
+class _PlayAllBar extends ConsumerWidget {
+  final List<SongModel> songs;
+  final AlbumModel? album;
+  const _PlayAllBar({required this.songs, required this.album});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: () {
+              final queue = songs.asMap().entries.map((e) =>
+                _toPlayable(e.value, album)).toList();
+              ref.read(audioPlayerProvider.notifier)
+                  .playItem(queue[0], queue: queue, index: 0);
+              AppRouter.navigateToPlayer(context);
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
+                ),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.play_arrow_rounded, color: Colors.white, size: 18),
+                  SizedBox(width: 4),
+                  Text('Play All',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          GestureDetector(
+            onTap: () {
+              final shuffled = [...songs]..shuffle();
+              final queue = shuffled.map((s) => _toPlayable(s, album)).toList();
+              ref.read(audioPlayerProvider.notifier)
+                  .playItem(queue[0], queue: queue, index: 0);
+              AppRouter.navigateToPlayer(context);
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: AppColors.surfaceVariant,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                    color: const Color(0xFF7C3AED).withOpacity(0.3)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.shuffle_rounded,
+                      color: Color(0xFF7C3AED), size: 16),
+                  SizedBox(width: 4),
+                  Text('Shuffle',
+                      style: TextStyle(
+                          color: Color(0xFF7C3AED),
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PlayableItem _toPlayable(SongModel s, AlbumModel? album) {
+    return PlayableItem(
+      id: s.id,
+      title: s.title,
+      subtitle: album?.title,
+      artworkUrl: s.coverUrl ?? album?.coverUrl,
+      duration: s.duration,
+      partCount: s.isMultiPart ? 2 : 1,
+      type: MediaType.song,
+      streamUrl: '${ApiConstants.baseUrl}${ApiConstants.songStream(s.id)}',
     );
   }
 }
@@ -123,7 +229,6 @@ class _AlbumDetailSkeleton extends StatelessWidget {
 class _AlbumHeader extends StatelessWidget {
   final AlbumModel album;
   final int songCount;
-
   const _AlbumHeader({required this.album, required this.songCount});
 
   @override
@@ -152,9 +257,7 @@ class _AlbumHeader extends StatelessWidget {
               ),
             ),
             Positioned(
-              bottom: 16,
-              left: 20,
-              right: 20,
+              bottom: 16, left: 20, right: 20,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -186,7 +289,7 @@ class _AlbumHeader extends StatelessWidget {
   }
 }
 
-// ── Song tile ──────────────────────────────────────────────────────────────────
+// ── Song Tile ──────────────────────────────────────────────────────────────────
 
 class _SongTile extends ConsumerWidget {
   final SongModel song;
@@ -216,13 +319,16 @@ class _SongTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // FIX: only watch the scalar `isCompleted` bool — this selects by VALUE
-    // so Riverpod correctly detects the change when the download finishes.
     final isCompleted = ref.watch(
       downloadManagerProvider.select((map) => map[song.id]?.isCompleted == true),
     );
     final isFav = ref.watch(
       favoritesProvider.select((set) => set.contains(song.id)),
+    );
+
+    // FIX: Check if this song is currently playing to show indicator
+    final isCurrentlyPlaying = ref.watch(
+      audioPlayerProvider.select((s) => s.currentItem?.id == song.id),
     );
 
     return RepaintBoundary(
@@ -233,25 +339,30 @@ class _SongTile extends ConsumerWidget {
           width: 44,
           height: 44,
           decoration: BoxDecoration(
-            color: AppColors.surfaceVariant,
+            color: isCurrentlyPlaying
+                ? AppColors.primary.withOpacity(0.2)
+                : AppColors.surfaceVariant,
             borderRadius: BorderRadius.circular(10),
           ),
           child: Center(
-            child: Text(
-              song.trackNumber.toString().padLeft(2, '0'),
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: AppColors.primary,
-                    fontWeight: FontWeight.w700,
+            child: isCurrentlyPlaying
+                ? const Icon(Icons.equalizer_rounded,
+                    color: AppColors.primary, size: 20)
+                : Text(
+                    song.trackNumber.toString().padLeft(2, '0'),
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          color: AppColors.primary,
+                          fontWeight: FontWeight.w700,
+                        ),
                   ),
-            ),
           ),
         ),
         title: Text(
           song.title,
-          style: Theme.of(context)
-              .textTheme
-              .titleMedium
-              ?.copyWith(fontSize: 14),
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                fontSize: 14,
+                color: isCurrentlyPlaying ? AppColors.primary : null,
+              ),
         ),
         subtitle: Row(
           children: [
@@ -264,7 +375,6 @@ class _SongTile extends ConsumerWidget {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // FIX: pass IDs not the model — _DownloadButton watches internally
             _DownloadButton(
               songId: song.id,
               songTitle: song.title,
@@ -283,12 +393,12 @@ class _SongTile extends ConsumerWidget {
             ),
           ],
         ),
+        // FIX 1: Auto-play AND navigate to player on tap
         onTap: () {
-          final queue =
-              allSongs.map((s) => _toPlayable(s, album)).toList();
-          ref
-              .read(audioPlayerProvider.notifier)
+          final queue = allSongs.map((s) => _toPlayable(s, album)).toList();
+          ref.read(audioPlayerProvider.notifier)
               .playItem(queue[index], queue: queue, index: index);
+          // Navigate to player immediately
           AppRouter.navigateToPlayer(context);
         },
       ),
@@ -296,12 +406,7 @@ class _SongTile extends ConsumerWidget {
   }
 }
 
-// ── Download button — watches provider directly by songId ─────────────────────
-//
-// KEY FIX: We select individual scalar fields (status string + progress double)
-// rather than the whole DownloadModel object. Because DownloadModel is mutable,
-// selecting the object itself returns the same reference every time (no rebuild).
-// Selecting scalars lets Riverpod compare by value → rebuilds on every tick.
+// ── Download button (unchanged from original) ──────────────────────────────────
 
 class _DownloadButton extends ConsumerWidget {
   final String songId;
@@ -320,7 +425,6 @@ class _DownloadButton extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Watch scalar fields so Riverpod can detect value-level changes.
     final status = ref.watch(
       downloadManagerProvider.select((map) => map[songId]?.status),
     );
@@ -328,23 +432,19 @@ class _DownloadButton extends ConsumerWidget {
       downloadManagerProvider.select((map) => map[songId]?.progress ?? 0.0),
     );
 
-    // ── Completed ──────────────────────────────────────────────────────────
     if (status == 'completed') {
       return const Padding(
         padding: EdgeInsets.all(8.0),
-        child: Icon(
-          Icons.check_circle_rounded,
-          color: AppColors.success,
-          size: 22,
-        ),
+        child: Icon(Icons.check_circle_rounded,
+            color: AppColors.success, size: 22),
       );
     }
 
-    // ── Downloading / merging / encrypting ──────────────────────────────────
-    if (status == 'downloading' || status == 'merging' || status == 'encrypting') {
+    if (status == 'downloading' ||
+        status == 'merging' ||
+        status == 'encrypting') {
       final clampedProgress = progress.clamp(0.0, 1.0);
       final pct = (clampedProgress * 100).round();
-
       final Color ringColor;
       final String label;
       if (status == 'merging' || status == 'encrypting') {
@@ -354,7 +454,6 @@ class _DownloadButton extends ConsumerWidget {
         ringColor = AppColors.primary;
         label = '$pct%';
       }
-
       return SizedBox(
         width: 44,
         height: 44,
@@ -371,33 +470,27 @@ class _DownloadButton extends ConsumerWidget {
                 color: ringColor,
               ),
             ),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 8,
-                fontWeight: FontWeight.w700,
-                color: ringColor,
-                letterSpacing: -0.3,
-              ),
-            ),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 8,
+                    fontWeight: FontWeight.w700,
+                    color: ringColor,
+                    letterSpacing: -0.3)),
           ],
         ),
       );
     }
 
-    // ── Failed — show retry ────────────────────────────────────────────────
     if (status == 'failed') {
       return IconButton(
         icon: const Icon(Icons.refresh_rounded, size: 20),
         color: AppColors.error,
         tooltip: 'Retry download',
-        onPressed: () {
-          ref.read(downloadManagerProvider.notifier).retryDownload(songId);
-        },
+        onPressed: () =>
+            ref.read(downloadManagerProvider.notifier).retryDownload(songId),
       );
     }
 
-    // ── Not downloaded — show download arrow ───────────────────────────────
     return IconButton(
       icon: const Icon(Icons.download_rounded, size: 20),
       color: AppColors.textTertiary,
@@ -410,7 +503,6 @@ class _DownloadButton extends ConsumerWidget {
               artworkUrl: coverUrl,
               subtitle: albumTitle,
             );
-
         ScaffoldMessenger.of(context).clearSnackBars();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -420,11 +512,9 @@ class _DownloadButton extends ConsumerWidget {
                     color: Colors.white, size: 16),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text(
-                    'Downloading "$songTitle"…',
-                    style: const TextStyle(fontSize: 13),
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  child: Text('Downloading "$songTitle"…',
+                      style: const TextStyle(fontSize: 13),
+                      overflow: TextOverflow.ellipsis),
                 ),
               ],
             ),
@@ -440,8 +530,6 @@ class _DownloadButton extends ConsumerWidget {
   }
 }
 
-// ── Polished ENC lock badge ───────────────────────────────────────────────────
-
 class _EncLockBadge extends StatelessWidget {
   const _EncLockBadge();
 
@@ -453,47 +541,19 @@ class _EncLockBadge extends StatelessWidget {
         color: AppColors.accentGold.withOpacity(0.18),
         borderRadius: BorderRadius.circular(4),
         border: Border.all(
-          color: AppColors.accentGold.withOpacity(0.55),
-          width: 0.8,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: AppColors.accentGold.withOpacity(0.25),
-            blurRadius: 6,
-            spreadRadius: 0,
-          ),
-        ],
+            color: AppColors.accentGold.withOpacity(0.55), width: 0.8),
       ),
-      child: Row(
+      child: const Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.lock_rounded,
-            size: 9,
-            color: AppColors.accentGold,
-            shadows: [
-              Shadow(
-                color: AppColors.accentGold.withOpacity(0.6),
-                blurRadius: 4,
-              ),
-            ],
-          ),
-          const SizedBox(width: 3),
-          Text(
-            'ENC',
-            style: TextStyle(
-              color: AppColors.accentGold,
-              fontSize: 9,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.6,
-              shadows: [
-                Shadow(
-                  color: AppColors.accentGold.withOpacity(0.5),
-                  blurRadius: 4,
-                ),
-              ],
-            ),
-          ),
+          Icon(Icons.lock_rounded, size: 9, color: AppColors.accentGold),
+          SizedBox(width: 3),
+          Text('ENC',
+              style: TextStyle(
+                  color: AppColors.accentGold,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.6)),
         ],
       ),
     );

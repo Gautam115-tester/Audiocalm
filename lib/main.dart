@@ -1,4 +1,8 @@
 // lib/main.dart — VYNCE
+//
+// FIX: Start API warmup immediately during Hive init (parallel with audio service init)
+// so the Render server is warm by the time Flutter tries to fetch data.
+// This prevents the "Failed to load" screen on cold starts.
 
 import 'dart:async';
 
@@ -12,6 +16,8 @@ import 'core/router/app_router.dart';
 import 'core/theme/app_theme.dart';
 import 'core/constants/app_constants.dart';
 import 'core/widgets/splash_screen.dart';
+import 'core/network/dio_client.dart';
+import 'core/network/api_warmup_service.dart';
 import 'features/player/services/audio_handler.dart';
 import 'features/player/providers/audio_player_provider.dart';
 import 'features/downloads/data/models/download_model.dart';
@@ -24,9 +30,9 @@ Future<void> main() async {
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
-      statusBarColor:                    Colors.transparent,
-      statusBarIconBrightness:           Brightness.light,
-      systemNavigationBarColor:          AppColors.surface,
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: AppColors.surface,
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
@@ -38,6 +44,13 @@ Future<void> main() async {
     ]);
   }));
 
+  // FIX: Start API warmup immediately, in parallel with everything else.
+  // The Render free-tier server can take 25-50s to cold-start; firing this
+  // as early as possible gives it maximum time to wake up before Flutter
+  // tries to fetch series/album data.
+  final dio = DioClient();
+  unawaited(ApiWarmupService().ensureWarmed(dio));
+
   final results = await Future.wait([
     _initHive(),
     _initAudioService(),
@@ -47,7 +60,6 @@ Future<void> main() async {
 
   await PlaybackPositionService.init();
   _splashNotifier.advance(6);
-
   _splashNotifier.advance(7);
   _splashNotifier.advance(8);
 
@@ -93,12 +105,14 @@ Future<AudioCalmHandler> _initAudioService() async {
   final handler = await AudioService.init(
     builder: () => AudioCalmHandler(),
     config: const AudioServiceConfig(
-      androidNotificationChannelId:    AppConstants.audioServiceNotificationChannelId,
-      androidNotificationChannelName:  AppConstants.audioServiceNotificationChannelName,
-      androidNotificationOngoing:      true,
-      notificationColor:               AppColors.primary,
-      artDownscaleHeight:              200,
-      artDownscaleWidth:               200,
+      androidNotificationChannelId:
+          AppConstants.audioServiceNotificationChannelId,
+      androidNotificationChannelName:
+          AppConstants.audioServiceNotificationChannelName,
+      androidNotificationOngoing: true,
+      notificationColor: AppColors.primary,
+      artDownscaleHeight: 200,
+      artDownscaleWidth: 200,
     ),
   );
 
@@ -133,20 +147,20 @@ class _VynceAppState extends State<VynceApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
-      title:                      'Vynce',
+      title: 'Vynce',
       debugShowCheckedModeBanner: false,
-      theme:                      AppTheme.darkTheme(),
-      routerConfig:               AppRouter.router,
-      showPerformanceOverlay:     false,
+      theme: AppTheme.darkTheme(),
+      routerConfig: AppRouter.router,
+      showPerformanceOverlay: false,
       builder: (context, child) {
         return RepaintBoundary(
           child: Stack(
             children: [
               child ?? const SizedBox.shrink(),
               AnimatedOpacity(
-                opacity:  _splashDone ? 0.0 : 1.0,
+                opacity: _splashDone ? 0.0 : 1.0,
                 duration: const Duration(milliseconds: 600),
-                curve:    Curves.easeOut,
+                curve: Curves.easeOut,
                 child: IgnorePointer(
                   ignoring: _splashDone,
                   child: _splashDone
