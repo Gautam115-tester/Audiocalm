@@ -1,38 +1,20 @@
 // lib/features/calm_stories/providers/calm_stories_provider.dart
 //
-// PERFORMANCE FIXES
-// =================
+// FAST LOADING CHANGES (same strategy as calm_music_provider)
+// ====================
 //
-// FIX 1 — REMOVED URL PRE-WARMING (was killing playback speed)
-//    Pre-warming ALL episode URLs on startup fired hundreds of HTTP requests
-//    simultaneously. Each request hit the backend which had to call Telegram's
-//    getFile API. This flooded the server, caused rate limiting, and made the
-//    first REAL play request wait 10+ seconds for a response.
-//    REMOVED: _preloadAllEpisodeUrls() entirely.
-//
-// FIX 2 — PARALLEL FETCH (series metadata + episodes together)
-//    Single endpoint /api/series/all-with-episodes returns everything.
-//    No sequential requests needed.
-//
-// FIX 3 — KEEPALIVE on all providers
-//    Prevents re-fetching when navigating between screens.
-//
-// FIX 4 — REMOVED retry delays
-//    3 retries with 2s delays = potentially 6s of extra wait on cold start.
-//    Backend already has keep-alive pings. Just try once fast, then retry once.
-//
-// FIX 5 — LAZY EPISODE LOADING for scalability
-//    seriesListProvider returns ONLY series metadata (no episodes embedded).
-//    Episodes are fetched per-series only when user opens that series.
-//    This scales to 500+ series without loading all episode data upfront.
+// 1. Hive persistent cache — instant load on relaunch
+// 2. Stale-while-revalidate — fresh data arrives silently
+// 3. Image cover URLs extracted for prefetching by the UI layer
 
-import 'package:flutter/foundation.dart' show compute;
+import 'package:flutter/foundation.dart' show compute, debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../data/models/series_model.dart';
 import '../data/models/episode_model.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/di/providers.dart';
+import '../../../core/cache/content_cache_service.dart';
 
 class _SeriesParsePayload {
   final List<Map<String, dynamic>> rawList;
@@ -77,15 +59,34 @@ _ParsedSeriesBatch _parseSeriesAndEpisodes(_SeriesParsePayload payload) {
 
 // ── allSeriesRawProvider ──────────────────────────────────────────────────────
 //
-// FIX 1: NO pre-warming — don't flood server with hundreds of requests.
-// FIX 4: Single attempt, one retry only (no 6s delay chains).
-// FIX 5: Returns full batch including episodes (episodes loaded lazily per-series
-//         only when user navigates to that series detail screen).
-final allSeriesRawProvider =
-    FutureProvider<_ParsedSeriesBatch>((ref) async {
+// Returns cached data immediately, then revalidates in background.
+
+final allSeriesRawProvider = FutureProvider<_ParsedSeriesBatch>((ref) async {
   ref.keepAlive();
 
-  final dio = ref.watch(dioClientProvider);
+  // Fast path: return cached data immediately
+  final cached = ContentCacheService.getCachedSeries();
+  if (cached != null) {
+    final parsed = await compute(
+      _parseSeriesAndEpisodes,
+      _SeriesParsePayload(cached),
+    );
+    await Future.microtask(() {});
+
+    // Revalidate in background if stale
+    if (!ContentCacheService.isSeriesCacheFresh()) {
+      _revalidateSeries(ref);
+    }
+
+    return parsed;
+  }
+
+  // No cache: fetch from network
+  return _fetchAndCacheSeries(ref);
+});
+
+Future<_ParsedSeriesBatch> _fetchAndCacheSeries(Ref ref) async {
+  final dio = ref.read(dioClientProvider);
 
   late Map<String, dynamic> response;
   try {
@@ -93,7 +94,6 @@ final allSeriesRawProvider =
       ApiConstants.allSeriesWithEpisodes,
     ).timeout(const Duration(seconds: 20));
   } catch (_) {
-    // One retry after a short delay (handles Render cold-start)
     await Future.delayed(const Duration(seconds: 2));
     response = await dio.get<Map<String, dynamic>>(
       ApiConstants.allSeriesWithEpisodes,
@@ -103,17 +103,29 @@ final allSeriesRawProvider =
   final rawData = response['data'] as List<dynamic>? ?? [];
   final rawList = rawData.cast<Map<String, dynamic>>();
 
-  // Parse on background isolate to avoid jank
+  // Save to persistent cache
+  ContentCacheService.saveSeries(rawList);
+
   final parsed = await compute(
     _parseSeriesAndEpisodes,
     _SeriesParsePayload(rawList),
   );
-
-  // Yield to event loop so first frame renders before state update
   await Future.microtask(() {});
-
   return parsed;
-});
+}
+
+void _revalidateSeries(Ref ref) {
+  Future.delayed(const Duration(milliseconds: 500), () async {
+    try {
+      await _fetchAndCacheSeries(ref);
+      ref.invalidateSelf();
+    } catch (e) {
+      debugPrint('[SeriesProvider] Background revalidation failed: $e');
+    }
+  });
+}
+
+// ── Derived providers (unchanged API) ─────────────────────────────────────────
 
 final seriesListProvider = FutureProvider<List<SeriesModel>>((ref) async {
   ref.keepAlive();
@@ -125,13 +137,11 @@ final seriesListProvider = FutureProvider<List<SeriesModel>>((ref) async {
 final episodesProvider =
     FutureProvider.family<List<EpisodeModel>, String>((ref, seriesId) async {
   ref.keepAlive();
-  // Try to get from cached batch first (fast path)
   final batchAsync = ref.watch(allSeriesRawProvider);
   if (batchAsync.hasValue) {
     final episodes = batchAsync.value!.episodesBySeriesId[seriesId];
     if (episodes != null) return episodes;
   }
-  // Fallback: fetch just this series' episodes (handles cache miss)
   final dio = ref.watch(dioClientProvider);
   try {
     final response = await dio.get<Map<String, dynamic>>(

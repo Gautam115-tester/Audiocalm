@@ -1,8 +1,7 @@
 // lib/main.dart — VYNCE
 //
-// FIX: Start API warmup immediately during Hive init (parallel with audio service init)
-// so the Render server is warm by the time Flutter tries to fetch data.
-// This prevents the "Failed to load" screen on cold starts.
+// FAST LOADING: Added ContentCacheService box init so Hive persistent cache
+// works from the first frame. API warmup fires in parallel as before.
 
 import 'dart:async';
 
@@ -18,6 +17,7 @@ import 'core/constants/app_constants.dart';
 import 'core/widgets/splash_screen.dart';
 import 'core/network/dio_client.dart';
 import 'core/network/api_warmup_service.dart';
+import 'core/cache/content_cache_service.dart'; // NEW
 import 'features/player/services/audio_handler.dart';
 import 'features/player/providers/audio_player_provider.dart';
 import 'features/downloads/data/models/download_model.dart';
@@ -44,10 +44,7 @@ Future<void> main() async {
     ]);
   }));
 
-  // FIX: Start API warmup immediately, in parallel with everything else.
-  // The Render free-tier server can take 25-50s to cold-start; firing this
-  // as early as possible gives it maximum time to wake up before Flutter
-  // tries to fetch series/album data.
+  // Fire API warmup ASAP — gives Render server maximum time to wake up
   final dio = DioClient();
   unawaited(ApiWarmupService().ensureWarmed(dio));
 
@@ -92,6 +89,10 @@ Future<Object?> _initHive() async {
     'playback_positions_box',
   ];
   await Future.wait(boxes.map(Hive.openBox));
+
+  // NEW: open content cache box for persistent album/series data
+  await ContentCacheService.init();
+
   _splashNotifier.advance(2);
   await Future.microtask(() {});
   _splashNotifier.advance(3);
@@ -105,10 +106,8 @@ Future<AudioCalmHandler> _initAudioService() async {
   final handler = await AudioService.init(
     builder: () => AudioCalmHandler(),
     config: const AudioServiceConfig(
-      androidNotificationChannelId:
-          AppConstants.audioServiceNotificationChannelId,
-      androidNotificationChannelName:
-          AppConstants.audioServiceNotificationChannelName,
+      androidNotificationChannelId: AppConstants.audioServiceNotificationChannelId,
+      androidNotificationChannelName: AppConstants.audioServiceNotificationChannelName,
       androidNotificationOngoing: true,
       notificationColor: AppColors.primary,
       artDownscaleHeight: 200,
