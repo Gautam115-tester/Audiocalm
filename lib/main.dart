@@ -1,18 +1,8 @@
 // lib/main.dart — VYNCE
 //
-// FIX: Start API warmup immediately during Hive init (parallel with audio
-// service init) so the Render server is warm by the time Flutter tries to
-// fetch data.
-//
-// EQUALIZER FIX
-// =============
-// AudioCalmHandler now accepts a ProviderContainer so it can call
-// equalizerProvider.notifier.setAudioSessionId() every time the underlying
-// just_audio AudioPlayer changes (new track, gapless album swap, etc.).
-//
-// The container is created before AudioService.init() and passed into the
-// builder lambda.  The same container is used for ProviderScope so all
-// providers share the same instance tree.
+// FIX: Start API warmup immediately during Hive init (parallel with audio service init)
+// so the Render server is warm by the time Flutter tries to fetch data.
+// This prevents the "Failed to load" screen on cold starts.
 
 import 'dart:async';
 
@@ -54,17 +44,16 @@ Future<void> main() async {
     ]);
   }));
 
-  // Start API warmup immediately, in parallel with everything else.
+  // FIX: Start API warmup immediately, in parallel with everything else.
+  // The Render free-tier server can take 25-50s to cold-start; firing this
+  // as early as possible gives it maximum time to wake up before Flutter
+  // tries to fetch series/album data.
   final dio = DioClient();
   unawaited(ApiWarmupService().ensureWarmed(dio));
 
-  // EQUALIZER FIX: create the container before AudioService.init() so
-  // AudioCalmHandler can reach equalizerProvider from inside the handler.
-  final container = ProviderContainer();
-
   final results = await Future.wait([
     _initHive(),
-    _initAudioService(container),
+    _initAudioService(),
   ]);
 
   final audioHandler = results[1] as AudioCalmHandler;
@@ -76,9 +65,6 @@ Future<void> main() async {
 
   runApp(
     ProviderScope(
-      // Re-use the same container that was passed to AudioCalmHandler so
-      // equalizerProvider is the same instance across the whole app.
-      parent: container,
       overrides: [
         audioHandlerProvider.overrideWithValue(audioHandler),
       ],
@@ -113,13 +99,11 @@ Future<Object?> _initHive() async {
   return null;
 }
 
-// EQUALIZER FIX: accept container and pass it to AudioCalmHandler.
-Future<AudioCalmHandler> _initAudioService(
-    ProviderContainer container) async {
+Future<AudioCalmHandler> _initAudioService() async {
   _splashNotifier.advance(4);
 
   final handler = await AudioService.init(
-    builder: () => AudioCalmHandler(container: container),
+    builder: () => AudioCalmHandler(),
     config: const AudioServiceConfig(
       androidNotificationChannelId:
           AppConstants.audioServiceNotificationChannelId,
@@ -181,8 +165,7 @@ class _VynceAppState extends State<VynceApp> {
                   ignoring: _splashDone,
                   child: _splashDone
                       ? const SizedBox.shrink()
-                      : SplashScreen(
-                          notifier: widget.splashNotifier),
+                      : SplashScreen(notifier: widget.splashNotifier),
                 ),
               ),
             ],
