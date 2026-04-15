@@ -1,25 +1,33 @@
 package com.audio.vynce
 
-import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.provider.DocumentsContract
 import android.os.ParcelFileDescriptor
-import android.content.Context
-import java.io.InputStream
-import com.ryanheise.audioservice.AudioServiceActivity
+import android.provider.DocumentsContract
 import android.view.KeyEvent
-import android.app.Activity
+import android.media.audiofx.Equalizer
+import android.util.Log
+import com.ryanheise.audioservice.AudioServiceActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import java.io.InputStream
 
 class MainActivity : AudioServiceActivity() {
-    private val CHANNEL               = "com.example.audio_series_app/file_access"
-    private val EQUALIZER_CHANNEL     = "com.example.audio_series_app/equalizer"
+    private val TAG = "VynceMainActivity"
+
+    // --- Channel Names ---
+    private val CHANNEL = "com.example.audio_series_app/file_access"
+    private val EQUALIZER_CHANNEL = "com.example.audio_series_app/equalizer"
     private val MUSIC_SCANNER_CHANNEL = "com.example.audio_series_app/music_scanner"
-    private val PICK_AUDIO_REQUEST    = 1001
-    private val fileDescriptors       = mutableMapOf<String, ParcelFileDescriptor>()
+
+    // --- State ---
+    private val PICK_AUDIO_REQUEST = 1001
+    private val fileDescriptors = mutableMapOf<String, ParcelFileDescriptor>()
     private var pendingResult: MethodChannel.Result? = null
+    private var equalizer: Equalizer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -141,8 +149,8 @@ class MainActivity : AudioServiceActivity() {
                 }
                 "readUriChunk" -> {
                     val uriString = call.argument<String>("uri")
-                    val offset    = call.argument<Int>("offset") ?: 0
-                    val length    = call.argument<Int>("length") ?: (2 * 1024 * 1024)
+                    val offset = call.argument<Int>("offset") ?: 0
+                    val length = call.argument<Int>("length") ?: (2 * 1024 * 1024)
                     if (uriString != null) {
                         var inputStream: InputStream? = null
                         try {
@@ -151,7 +159,7 @@ class MainActivity : AudioServiceActivity() {
                             if (inputStream == null) { result.error("STREAM_ERROR", "Could not open input stream", null); return@setMethodCallHandler }
                             val skipped = inputStream.skip(offset.toLong())
                             if (skipped < offset.toLong()) { result.success(ByteArray(0)); return@setMethodCallHandler }
-                            val buffer    = ByteArray(length)
+                            val buffer = ByteArray(length)
                             val bytesRead = inputStream.read(buffer, 0, length)
                             result.success(if (bytesRead > 0) buffer.copyOf(bytesRead) else ByteArray(0))
                         } catch (e: Exception) {
@@ -165,11 +173,88 @@ class MainActivity : AudioServiceActivity() {
             }
         }
 
-        // --- EQUALIZER CHANNEL ---
+        // --- EQUALIZER CHANNEL (Merged with Fixes) ---
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, EQUALIZER_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getAudioSessionId" -> result.success(0)
-                else -> EqualizerManager.handleMethodCall(call, result, this)
+                "init" -> {
+                    try {
+                        val sessionId = call.argument<Int>("audioSessionId") ?: 0
+                        Log.d(TAG, "init: audioSessionId=$sessionId")
+                        equalizer?.release()
+                        equalizer = null
+                        
+                        // FIX: do NOT call setEnabled() here.
+                        val eq = Equalizer(0, sessionId)
+                        equalizer = eq
+                        Log.d(TAG, "Equalizer created, bands=${eq.numberOfBands}")
+                        result.success(null)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "init failed: ${e.message}")
+                        result.error("EQ_INIT_ERROR", e.message, null)
+                    }
+                }
+                "getProperties" -> {
+                    try {
+                        val eq = equalizer ?: run {
+                            result.error("EQ_NOT_INIT", "Equalizer not initialized", null)
+                            return@setMethodCallHandler
+                        }
+                        val levelRange = eq.bandLevelRange
+                        val props = mapOf(
+                            "bandCount" to eq.numberOfBands.toInt(),
+                            "minDb" to levelRange[0].toInt(), // millibels
+                            "maxDb" to levelRange[1].toInt()  // millibels
+                        )
+                        Log.d(TAG, "getProperties: $props")
+                        result.success(props)
+                    } catch (e: Exception) {
+                        result.error("EQ_ERROR", e.message, null)
+                    }
+                }
+                "setBandLevel" -> {
+                    try {
+                        val eq = equalizer ?: run {
+                            result.error("EQ_NOT_INIT", "Equalizer not initialized", null)
+                            return@setMethodCallHandler
+                        }
+                        val band = call.argument<Int>("band") ?: 0
+                        val level = call.argument<Int>("level") ?: 0
+                        
+                        val range = eq.bandLevelRange
+                        val clamped = level.coerceIn(range[0].toInt(), range[1].toInt())
+                        
+                        Log.d(TAG, "setBandLevel: band=$band level=$clamped mB")
+                        eq.setBandLevel(band.toShort(), clamped.toShort())
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("EQ_ERROR", e.message, null)
+                    }
+                }
+                "setEnabled" -> {
+                    try {
+                        val eq = equalizer ?: run {
+                            result.error("EQ_NOT_INIT", "Equalizer not initialized", null)
+                            return@setMethodCallHandler
+                        }
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        Log.d(TAG, "setEnabled: $enabled")
+                        eq.enabled = enabled
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("EQ_ERROR", e.message, null)
+                    }
+                }
+                "release" -> {
+                    try {
+                        equalizer?.release()
+                        equalizer = null
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("EQ_ERROR", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
             }
         }
 
@@ -212,28 +297,28 @@ class MainActivity : AudioServiceActivity() {
             projection, selection, null, sortOrder
         )
         query?.use { cursor ->
-            val idColumn       = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media._ID)
-            val nameColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DISPLAY_NAME)
-            val pathColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
-            val titleColumn    = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.TITLE)
-            val artistColumn   = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ARTIST)
-            val albumColumn    = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ALBUM)
+            val idColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media._ID)
+            val nameColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DISPLAY_NAME)
+            val pathColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
+            val titleColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.TITLE)
+            val artistColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ARTIST)
+            val albumColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.ALBUM)
             val durationColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DURATION)
-            val sizeColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.SIZE)
-            val mimeColumn     = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.MIME_TYPE)
+            val sizeColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.SIZE)
+            val mimeColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.MIME_TYPE)
             while (cursor.moveToNext()) {
                 val mimeType = cursor.getString(mimeColumn)
-                val size     = cursor.getLong(sizeColumn)
+                val size = cursor.getLong(sizeColumn)
                 if (mimeType?.startsWith("audio/") == true && size > 0) {
                     musicFiles.add(mapOf(
-                        "id"       to cursor.getLong(idColumn),
-                        "name"     to cursor.getString(nameColumn),
-                        "path"     to cursor.getString(pathColumn),
-                        "title"    to (cursor.getString(titleColumn) ?: cursor.getString(nameColumn)),
-                        "artist"   to (cursor.getString(artistColumn) ?: "Unknown Artist"),
-                        "album"    to (cursor.getString(albumColumn) ?: "Unknown Album"),
+                        "id" to cursor.getLong(idColumn),
+                        "name" to cursor.getString(nameColumn),
+                        "path" to cursor.getString(pathColumn),
+                        "title" to (cursor.getString(titleColumn) ?: cursor.getString(nameColumn)),
+                        "artist" to (cursor.getString(artistColumn) ?: "Unknown Artist"),
+                        "album" to (cursor.getString(albumColumn) ?: "Unknown Album"),
                         "duration" to cursor.getLong(durationColumn),
-                        "size"     to size,
+                        "size" to size,
                         "mimeType" to mimeType
                     ))
                 }
@@ -307,7 +392,8 @@ class MainActivity : AudioServiceActivity() {
     override fun onDestroy() {
         fileDescriptors.values.forEach { try { it.close() } catch (_: Exception) {} }
         fileDescriptors.clear()
-        EqualizerManager.releaseAll()
+        equalizer?.release()
+        equalizer = null
         super.onDestroy()
     }
 }

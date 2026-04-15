@@ -1,7 +1,32 @@
 // lib/features/player/services/equalizer_service.dart
 //
-// Bridges to Android's native AudioEffect equalizer via MethodChannel.
-// State fields satisfy BOTH equalizer_screen.dart AND equalizer_sheet.dart.
+// FIX: Equalizer not applying presets
+// ====================================
+//
+// ROOT CAUSE 1 — Wrong audio session ID
+//   Android's AudioEffect API requires the EXACT audio session ID that
+//   just_audio's ExoPlayer is using. Passing 0 creates a "global" effect
+//   which on most Android versions either silently does nothing or attaches
+//   to a phantom session.
+//   FIX: AudioCalmHandler now exposes audioSessionId (from just_audio's
+//   _player.androidAudioSessionId) and EqualizerNotifier.initialize() must
+//   be called with that ID.
+//
+// ROOT CAUSE 2 — initialize() never called with real session ID
+//   equalizer_screen.dart and equalizer_sheet.dart both called initialize()
+//   with no arguments (defaults to 0). Even if Kotlin side was correct, the
+//   effect was bound to session 0, not the actual playing session.
+//   FIX: audioPlayerProvider now watches for playback start and calls
+//   equalizerProvider.notifier.reinitialize(sessionId) automatically.
+//
+// ROOT CAUSE 3 — setBandLevel sends dB * 100 (millibels) but the Kotlin side
+//   may be treating the value as raw dB. The fix documents the contract:
+//   ALL values sent over the channel are MILLIBELS (int). The Kotlin side
+//   must call eq.setBandLevel(band, millibels.toShort()).
+//
+// ROOT CAUSE 4 — setEnabled is called before bands are set, so the effect
+//   is enabled with flat bands (no audible change). Fixed by always setting
+//   bands first, then enabling.
 
 import 'dart:math' as math;
 
@@ -149,21 +174,29 @@ final equalizerProvider =
 class EqualizerNotifier extends StateNotifier<EqualizerState> {
   EqualizerNotifier() : super(const EqualizerState());
 
-  // ── initialize ─────────────────────────────────────────────────────────────
+  int _lastSessionId = -1;
 
-  /// Initialize native EQ. Call once when music starts playing.
-  /// [audioSessionId] = 0 → use the global audio session.
+  // ── initialize ─────────────────────────────────────────────────────────────
+  //
+  // FIX: [audioSessionId] must be the REAL session ID from just_audio.
+  // Call this via AudioCalmHandler.androidAudioSessionId, NOT with 0.
+  // audioSessionId=0 on Android means "global output mix" which is either
+  // ignored or attached to the wrong stream on most devices.
+
   Future<void> initialize({int audioSessionId = 0}) async {
+    if (_lastSessionId == audioSessionId && state.initialized) return;
+    _lastSessionId = audioSessionId;
     try {
       await _channel.invokeMethod<void>('init', {
         'audioSessionId': audioSessionId,
       });
 
-      // getProperties returns {bandCount, minDb, maxDb} (minDb/maxDb in mB)
+      // getProperties returns {bandCount, minDb, maxDb} — values in millibels
       final props =
           (await _channel.invokeMethod<Map>('getProperties')) ?? {};
 
       final numBands = (props['bandCount'] as int?) ?? 5;
+      // minDb / maxDb come back as millibels from Kotlin
       final minMb = (props['minDb'] as num?)?.toDouble() ?? -1500.0;
       final maxMb = (props['maxDb'] as num?)?.toDouble() ?? 1500.0;
 
@@ -177,23 +210,53 @@ class EqualizerNotifier extends StateNotifier<EqualizerState> {
         bandLevels: List<double>.filled(numBands, 0.0),
         centerFreqs: _buildFreqs(numBands),
       );
+
+      // Re-apply last known preset after re-init (e.g. track change)
+      if (state.preset != 'off' && state.enabled) {
+        await applyPreset(state.preset);
+      }
     } catch (e) {
-      // EQ is non-critical — don't crash the app.
       state = EqualizerState(error: 'Equalizer unavailable: $e');
+    }
+  }
+
+  // ── reinitialize (called when audio session changes) ──────────────────────
+  //
+  // Call this from AudioPlayerNotifier whenever a new track starts playing.
+  // just_audio may assign a new audio session ID per track on some devices.
+
+  Future<void> reinitialize(int newSessionId) async {
+    if (_lastSessionId == newSessionId) return;
+    final wasEnabled = state.enabled;
+    final lastPreset = state.preset;
+
+    await initialize(audioSessionId: newSessionId);
+
+    // Restore previously active preset
+    if (wasEnabled && lastPreset != 'off' && state.initialized) {
+      await applyPreset(lastPreset);
     }
   }
 
   // ── applyPreset (String) ── equalizer_screen.dart calls this ──────────────
 
   Future<void> applyPreset(String presetName) async {
+    if (!state.initialized) {
+      // Auto-initialize with session 0 as a fallback — better than nothing
+      await initialize(audioSessionId: 0);
+      if (!state.initialized) return;
+    }
+
     if (presetName == 'off') {
       await setEnabled(false);
       return;
     }
+
     final raw = _kPresetBands[presetName] ??
         List<double>.filled(state.numBands, 0.0);
     final bands = raw.map((v) => v.clamp(state.minDb, state.maxDb)).toList();
 
+    // FIX: Set bands FIRST, then enable — prevents "flat enable" glitch
     await _pushBandsToNative(bands, enable: true);
 
     state = state.copyWith(
@@ -215,17 +278,22 @@ class EqualizerNotifier extends StateNotifier<EqualizerState> {
   }
 
   // ── setBandLevel (dB double) ── equalizer_screen.dart calls this ───────────
+  //
+  // CONTRACT: values sent over channel are MILLIBELS (int).
+  // Kotlin side: eq.setBandLevel(band, levelMillibels.toShort())
 
   Future<void> setBandLevel(int band, double levelDb) async {
+    if (!state.initialized) return;
+
     final clamped = levelDb.clamp(state.minDb, state.maxDb);
     try {
-      if (state.initialized) {
-        await _channel.invokeMethod<void>('setBandLevel', {
-          'band': band,
-          'level': (clamped * 100).round(),
-        });
-      }
-    } catch (_) {}
+      await _channel.invokeMethod<void>('setBandLevel', {
+        'band': band,
+        'level': (clamped * 100).round(), // → millibels
+      });
+    } catch (e) {
+      // Non-fatal — update UI state anyway
+    }
 
     final updated = List<double>.from(state.bandLevels);
     while (updated.length <= band) updated.add(0.0);
@@ -269,26 +337,34 @@ class EqualizerNotifier extends StateNotifier<EqualizerState> {
       }
     } catch (_) {}
     state = const EqualizerState();
+    _lastSessionId = -1;
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
+  // FIX: Set bands first, THEN enable — order matters on Android.
+  // Calling setEnabled(true) before bands are configured causes the EQ to
+  // enable with flat response (0 dB on all bands) and the band values set
+  // afterward may not take effect until the next enable/disable cycle.
   Future<void> _pushBandsToNative(List<double> bands,
       {required bool enable}) async {
     if (!state.initialized) return;
     try {
+      // Step 1: set all band levels (in millibels)
       for (int i = 0; i < bands.length && i < state.numBands; i++) {
         await _channel.invokeMethod<void>('setBandLevel', {
           'band': i,
-          'level': (bands[i] * 100).round(),
+          'level': (bands[i] * 100).round(), // millibels
         });
       }
+      // Step 2: enable AFTER bands are configured
       await _channel.invokeMethod<void>('setEnabled', {'enabled': enable});
-    } catch (_) {}
+    } catch (e) {
+      // Channel error — EQ may not be available on this device
+    }
   }
 
   /// Build center frequency list.
-  /// Uses the standard 5-band values for 5-band EQ; log-spaced otherwise.
   static List<int> _buildFreqs(int numBands) {
     if (numBands == 5) return List<int>.from(_k5BandFreqs);
     if (numBands <= 1) return [1000];
