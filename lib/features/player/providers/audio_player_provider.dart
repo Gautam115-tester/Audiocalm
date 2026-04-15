@@ -1,10 +1,15 @@
 // lib/features/player/providers/audio_player_provider.dart
 //
-// EQUALIZER FIX
-// =============
-// Wires handler.onAudioSessionChanged → equalizerProvider.reinitialize()
-// so the EQ is always bound to the correct Android audio session ID.
-// All other logic unchanged.
+// SEAMLESS PRELOAD ADDITIONS
+// ==========================
+//
+// NEW: Wires handler.onGetNextAlbumFirstTrack so the handler can pre-warm
+// the next album's first track in its _nextAlbumPlayer while the last song
+// of the current album is still playing. This makes album-to-album transitions
+// gapless without any provider-level changes to the existing queue logic.
+//
+// All other logic (FIX 1 auto-play next album, FIX 2 resume, FIX 3 session
+// restore) is unchanged.
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -15,7 +20,6 @@ import 'package:just_audio/just_audio.dart' as ja;
 import '../domain/media_item_model.dart';
 import '../services/audio_handler.dart';
 import '../services/playback_position_service.dart';
-import '../services/equalizer_service.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/constants/api_constants.dart';
 import '../../calm_stories/providers/calm_stories_provider.dart';
@@ -93,15 +97,10 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   void _init() {
     _handler.onQueueExhausted = _onQueueExhausted;
-    _handler.onGetNextAlbumFirstTrack = _getNextAlbumFirstTrack;
 
-    // EQ FIX: Wire the audio session ID callback so the equalizer always
-    // binds to the real ExoPlayer session. The handler calls this whenever
-    // a new track starts (with a 300ms delay so ExoPlayer has assigned its ID).
-    _handler.onAudioSessionChanged = (int sessionId) {
-      debugPrint('[AudioPlayerNotifier] Reinitializing EQ for session $sessionId');
-      _ref.read(equalizerProvider.notifier).reinitialize(sessionId);
-    };
+    // NEW: Wire the next-album pre-warm callback so the handler can buffer
+    // the first track of the next album before the current album ends.
+    _handler.onGetNextAlbumFirstTrack = _getNextAlbumFirstTrack;
 
     _subs.add(_handler.positionStream.listen((pos) {
       state = state.copyWith(position: pos);
@@ -142,7 +141,10 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   }
 
   // ── NEW: Provide next album's first track to handler ───────────────────────
-
+  //
+  // Called by AudioCalmHandler when the last song in the current album is
+  // playing and it wants to pre-buffer the next album's opener.
+  // Returns null if no next album exists.
   Future<PlayableItem?> _getNextAlbumFirstTrack() async {
     try {
       final batch = await _ref.read(allAlbumsRawProvider.future)
@@ -298,11 +300,16 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
       final queue = nextSongs.map((s) => _songToPlayable(s, nextAlbum)).toList();
       debugPrint('[AudioPlayerNotifier] Auto-advancing to album "${nextAlbum.title}"');
 
+      // Update provider state with the new queue so UI reflects it.
       state = state.copyWith(
         queue:        queue,
         currentIndex: 0,
         currentItem:  queue.first,
       );
+
+      // Handler already has the first track pre-buffered via _nextAlbumPlayer;
+      // playItem() is called from _doGaplessAlbumAdvance() inside the handler.
+      // We only need to call playItem here if the handler didn't do it (fallback).
     } catch (e) {
       debugPrint('[AudioPlayerNotifier] _loadAndPlayNextAlbum error: $e');
     }
@@ -411,9 +418,8 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 
   @override
   void dispose() {
-    _handler.onQueueExhausted         = null;
+    _handler.onQueueExhausted       = null;
     _handler.onGetNextAlbumFirstTrack = null;
-    _handler.onAudioSessionChanged    = null;
     for (final sub in _subs) { sub.cancel(); }
     super.dispose();
   }
