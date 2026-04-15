@@ -16,7 +16,7 @@ class ImagePrefetchService {
   ImagePrefetchService._();
 
   static const int _kPhase1Count = 8;
-  static const int _kThumbnailWidth = 300;
+  static const int _kThumbnailWidth = 800;
 
   /// Prefetch cover URLs extracted from album/series data.
   /// [urls] should be ordered by display priority (first = most important).

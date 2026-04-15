@@ -1,5 +1,5 @@
 // lib/features/calm_stories/presentation/stories_screen.dart
-// FAST LOADING: Image prefetch on data load, optimized memCacheWidth
+// FIXED: High-density image decoding using devicePixelRatio to solve blurriness.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -68,7 +68,6 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
     controller.warmRange(visibleIds: visibleIds, upcomingIds: upcomingIds);
   }
 
-  // FAST LOAD: Prefetch all series cover images as soon as data arrives
   void _prefetchImages(List series) {
     if (_imagesPrefetched) return;
     _imagesPrefetched = true;
@@ -124,9 +123,13 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
   Widget build(BuildContext context) {
     final seriesAsync = ref.watch(seriesListProvider);
 
-    // FAST LOAD: compute card pixel width once
-    final screenWidth = MediaQuery.of(context).size.width;
-    final cardPixelWidth = ((screenWidth - _kPadding * 2 - _kSpacing) / _kCrossAxisCount).ceil();
+    // FIX: Multiply logical width by devicePixelRatio for high-density displays
+    final mediaQuery = MediaQuery.of(context);
+    final screenWidth = mediaQuery.size.width;
+    final pixelRatio = mediaQuery.devicePixelRatio;
+    
+    final cardLogicalWidth = (screenWidth - _kPadding * 2 - _kSpacing) / _kCrossAxisCount;
+    final cardPixelWidth = (cardLogicalWidth * pixelRatio).ceil();
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -178,7 +181,6 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
             );
           }
 
-          // FAST LOAD: prefetch images as soon as data is available
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) {
               _prefetchImages(series);
@@ -190,7 +192,7 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
             return GridView.builder(
               controller: _scrollController,
               padding: const EdgeInsets.all(_kPadding),
-              cacheExtent: 600, // cache more rows ahead
+              cacheExtent: 600,
               gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: _kCrossAxisCount,
                 mainAxisSpacing: _kSpacing,
@@ -206,7 +208,7 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
                     description: s.description,
                     coverUrl: s.coverUrl,
                     episodeCount: s.episodeCount,
-                    memCacheWidth: cardPixelWidth,
+                    memCacheWidth: cardPixelWidth, // Sharp decode for high-res screens
                     onTap: () => context.push('/stories/${s.id}'),
                   ),
                 );
@@ -225,6 +227,8 @@ class _StoriesScreenState extends ConsumerState<StoriesScreen> {
                 description: s.description,
                 coverUrl: s.coverUrl,
                 episodeCount: s.episodeCount,
+                // Fix for list tile resolution
+                memCacheWidth: (52 * pixelRatio).ceil(), 
                 onTap: () => context.push('/stories/${s.id}'),
               );
             },
@@ -255,7 +259,7 @@ class _SeriesGridCard extends StatelessWidget {
   final String? coverUrl;
   final int episodeCount;
   final VoidCallback onTap;
-  final int? memCacheWidth; // FAST LOAD
+  final int? memCacheWidth;
 
   const _SeriesGridCard({
     required this.title,
@@ -287,9 +291,8 @@ class _SeriesGridCard extends StatelessWidget {
                     url: coverUrl,
                     size: double.infinity,
                     borderRadius: 0,
-                    // FAST LOAD: decode at card display size
-                    memCacheWidth: memCacheWidth ?? 300,
-                    memCacheHeight: memCacheWidth ?? 300,
+                    memCacheWidth: memCacheWidth,
+                    memCacheHeight: memCacheWidth,
                     placeholder: Container(
                       decoration: const BoxDecoration(gradient: AppColors.cardGradient),
                       child: const Center(
@@ -328,15 +331,28 @@ class _SeriesListTile extends StatelessWidget {
   final String? coverUrl;
   final int episodeCount;
   final VoidCallback onTap;
-  const _SeriesListTile({required this.title, this.description, this.coverUrl, required this.episodeCount, required this.onTap});
+  final int? memCacheWidth; // Added parameter to fix blur in list view
+
+  const _SeriesListTile({
+    required this.title, 
+    this.description, 
+    this.coverUrl, 
+    required this.episodeCount, 
+    required this.onTap,
+    this.memCacheWidth,
+  });
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       onTap: onTap,
-      // FAST LOAD: 52px display → 104px cache (2× for retina)
-      leading: CoverImage(url: coverUrl, size: 52, borderRadius: 10, memCacheWidth: 104),
+      leading: CoverImage(
+        url: coverUrl, 
+        size: 52, 
+        borderRadius: 10, 
+        memCacheWidth: memCacheWidth ?? 104
+      ),
       title: Text(title,
           style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0))),
       subtitle: Text('$episodeCount episodes',

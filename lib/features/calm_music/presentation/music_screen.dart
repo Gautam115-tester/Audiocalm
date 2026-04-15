@@ -1,6 +1,5 @@
 // lib/features/calm_music/presentation/music_screen.dart
-// FAST LOADING: Added image prefetch on data load, optimized memCacheWidth per card size
-// All existing functionality preserved — only loading performance improved.
+// FIXED: High-density image decoding using devicePixelRatio to solve blurriness.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -184,7 +183,6 @@ class _MusicScreenState extends ConsumerState<MusicScreen> {
     controller.warmRange(visibleIds: visibleIds, upcomingIds: upcomingIds);
   }
 
-  // FAST LOAD: Prefetch all cover images when data first arrives
   void _prefetchImages(List<AlbumModel> albums) {
     if (_imagesPrefetched) return;
     _imagesPrefetched = true;
@@ -258,7 +256,6 @@ class _MusicScreenState extends ConsumerState<MusicScreen> {
             );
           }
 
-          // FAST LOAD: Prefetch images as soon as data arrives
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) _prefetchImages(albums);
           });
@@ -386,15 +383,19 @@ class _AlbumsTab extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     WidgetsBinding.instance.addPostFrameCallback((_) => onPrefetch(albums));
 
-    // FAST LOAD: compute card pixel width for correct memCacheWidth
-    final screenWidth = MediaQuery.of(context).size.width;
-    final cardPixelWidth = ((screenWidth - _kPadding * 2 - _kSpacing) / _kCrossAxisCount).ceil();
+    // FIX: Multiply logical width by devicePixelRatio for high-density display
+    final mediaQuery = MediaQuery.of(context);
+    final screenWidth = mediaQuery.size.width;
+    final pixelRatio = mediaQuery.devicePixelRatio;
+    
+    final cardLogicalWidth = (screenWidth - _kPadding * 2 - _kSpacing) / _kCrossAxisCount;
+    final cardPixelWidth = (cardLogicalWidth * pixelRatio).ceil();
 
     if (gridView) {
       return GridView.builder(
         controller: scrollController,
         padding: const EdgeInsets.all(_kPadding),
-        cacheExtent: 600, // cache more rows ahead
+        cacheExtent: 600, 
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: _kCrossAxisCount,
           mainAxisSpacing: _kSpacing,
@@ -410,14 +411,16 @@ class _AlbumsTab extends ConsumerWidget {
               artist: a.artist,
               coverUrl: a.coverUrl,
               trackCount: a.trackCount,
-              // FAST LOAD: decode at actual display size, not full resolution
-              memCacheWidth: cardPixelWidth,
+              memCacheWidth: cardPixelWidth, // Sharp decode
               onTap: () => context.push('/music/${a.id}'),
             ),
           );
         },
       );
     }
+
+    // Fixed for List Tile as well
+    final tilePixelSize = (50 * pixelRatio).ceil();
 
     return ListView.builder(
       controller: scrollController,
@@ -430,6 +433,7 @@ class _AlbumsTab extends ConsumerWidget {
           artist: a.artist,
           coverUrl: a.coverUrl,
           trackCount: a.trackCount,
+          memCacheWidth: tilePixelSize, 
           onTap: () => context.push('/music/${a.id}'),
         );
       },
@@ -444,6 +448,7 @@ class _AllMusicTab extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final batchAsync = ref.watch(allAlbumsRawProvider);
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
 
     return batchAsync.when(
       loading: () => const Center(child: CircularProgressIndicator(color: AppColors.primary)),
@@ -521,8 +526,12 @@ class _AllMusicTab extends ConsumerWidget {
                   final album = songAlbumMap[song.id];
                   return ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    // FAST LOAD: 48px display → 96px cache (2x for retina)
-                    leading: CoverImage(url: song.coverUrl ?? album?.coverUrl, size: 48, borderRadius: 10, memCacheWidth: 96),
+                    leading: CoverImage(
+                      url: song.coverUrl ?? album?.coverUrl, 
+                      size: 48, 
+                      borderRadius: 10, 
+                      memCacheWidth: (48 * pixelRatio).ceil()
+                    ),
                     title: Text(song.title,
                         style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0)),
                         maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -567,6 +576,7 @@ class _ArtistsTab extends ConsumerWidget {
     final registry = _ArtistUtils.buildRegistry(albums.map((a) => a.artist).toList());
     final artistMap = _buildArtistMap(albums, registry);
     final artists = artistMap.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
 
     if (artists.isEmpty) {
       return const EmptyStateWidget(icon: Icons.person_rounded, title: 'No Artists',
@@ -589,7 +599,12 @@ class _ArtistsTab extends ConsumerWidget {
           leading: Container(
             width: 52, height: 52,
             decoration: const BoxDecoration(shape: BoxShape.circle),
-            child: ClipOval(child: CoverImage(url: coverUrl, size: 52, borderRadius: 26, memCacheWidth: 104)),
+            child: ClipOval(child: CoverImage(
+              url: coverUrl, 
+              size: 52, 
+              borderRadius: 26, 
+              memCacheWidth: (52 * pixelRatio).ceil()
+            )),
           ),
           title: Text(entry.key,
               style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0))),
@@ -621,6 +636,7 @@ class _ArtistSongsTab extends ConsumerWidget {
     final artistMap = _buildArtistMap(albums, registry);
     final artistAlbums = artistMap[artist] ?? [];
     final batchAsync = ref.watch(allAlbumsRawProvider);
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
 
     return batchAsync.when(
       loading: () => const Center(child: CircularProgressIndicator(color: AppColors.primary)),
@@ -654,7 +670,7 @@ class _ArtistSongsTab extends ConsumerWidget {
                   const SizedBox(width: 12),
                   ClipOval(child: CoverImage(
                       url: artistAlbums.isNotEmpty ? artistAlbums.first.coverUrl : null,
-                      size: 44, borderRadius: 22, memCacheWidth: 88)),
+                      size: 44, borderRadius: 22, memCacheWidth: (44 * pixelRatio).ceil())),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -705,7 +721,7 @@ class _ArtistSongsTab extends ConsumerWidget {
                     return GestureDetector(
                       onTap: () => context.push('/music/${a.id}'),
                       child: Column(children: [
-                        CoverImage(url: a.coverUrl, size: 72, borderRadius: 10, memCacheWidth: 144),
+                        CoverImage(url: a.coverUrl, size: 72, borderRadius: 10, memCacheWidth: (72 * pixelRatio).ceil()),
                         const SizedBox(height: 4),
                         SizedBox(width: 72,
                             child: Text(a.title,
@@ -731,7 +747,12 @@ class _ArtistSongsTab extends ConsumerWidget {
                         final album = songAlbumMap[song.id];
                         return ListTile(
                           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
-                          leading: CoverImage(url: song.coverUrl ?? album?.coverUrl, size: 44, borderRadius: 8, memCacheWidth: 88),
+                          leading: CoverImage(
+                            url: song.coverUrl ?? album?.coverUrl, 
+                            size: 44, 
+                            borderRadius: 8, 
+                            memCacheWidth: (44 * pixelRatio).ceil()
+                          ),
                           title: Text(song.title,
                               style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0)),
                               maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -771,7 +792,7 @@ class _AlbumGridCard extends StatelessWidget {
   final String? coverUrl;
   final int trackCount;
   final VoidCallback onTap;
-  final int? memCacheWidth; // FAST LOAD: decode at display size
+  final int? memCacheWidth; 
 
   const _AlbumGridCard({
     required this.title,
@@ -803,9 +824,8 @@ class _AlbumGridCard extends StatelessWidget {
                     url: coverUrl,
                     size: double.infinity,
                     borderRadius: 0,
-                    // FAST LOAD: use computed card width for cache key
-                    memCacheWidth: memCacheWidth ?? 300,
-                    memCacheHeight: memCacheWidth ?? 300,
+                    memCacheWidth: memCacheWidth,
+                    memCacheHeight: memCacheWidth,
                     placeholder: Container(
                       decoration: const BoxDecoration(
                         gradient: LinearGradient(
@@ -852,14 +872,28 @@ class _AlbumListTile extends StatelessWidget {
   final String? coverUrl;
   final int trackCount;
   final VoidCallback onTap;
-  const _AlbumListTile({required this.title, this.artist, this.coverUrl, required this.trackCount, required this.onTap});
+  final int? memCacheWidth; // Added support for high-res thumbnails
+
+  const _AlbumListTile({
+    required this.title, 
+    this.artist, 
+    this.coverUrl, 
+    required this.trackCount, 
+    required this.onTap,
+    this.memCacheWidth,
+  });
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       onTap: onTap,
-      leading: CoverImage(url: coverUrl, size: 50, borderRadius: 10, memCacheWidth: 100),
+      leading: CoverImage(
+        url: coverUrl, 
+        size: 50, 
+        borderRadius: 10, 
+        memCacheWidth: memCacheWidth ?? 100
+      ),
       title: Text(title,
           style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Color(0xFFD0D0F0))),
       subtitle: Text(
