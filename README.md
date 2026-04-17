@@ -1,4 +1,4 @@
-# 🎧 Audio Calm — Flutter App
+# 🎧 Audio Calm bulid using AI — Flutter App
 
 A production-grade mindfulness audio streaming app built with Flutter + Riverpod + Clean Architecture. Streams from a Node.js/Telegram backend. Full offline support with AES-256-CBC encryption.
 
