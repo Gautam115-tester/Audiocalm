@@ -1,12 +1,5 @@
 // lib/features/player/presentation/player_screen.dart
-// VYNCE PLAYER — Full screen, Purple/Cyan gradient identity with glow effects
-//
-// FIXES:
-// 1. SEEKBAR PIXEL OVERFLOW — thumb was rendering outside track bounds when
-//    progress was near 1.0. Fixed by clamping fillW so the thumb center never
-//    exceeds the track width, and using a ClipRect on the fill bar.
-// 2. TAP-TO-SEEK — added onTapDown handler so a single tap (not just drag)
-//    also seeks to the tapped position.
+// VYNCE PLAYER — with error banner, retry button, slow-network indicator
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,8 +10,6 @@ import '../../../core/widgets/shared_widgets.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../favorites/providers/favorites_provider.dart';
 import 'equalizer_sheet.dart';
-
-// ─── Root ─────────────────────────────────────────────────────────────────────
 
 class PlayerScreen extends ConsumerWidget {
   const PlayerScreen({super.key});
@@ -39,23 +30,21 @@ class PlayerScreen extends ConsumerWidget {
   }
 }
 
-// ─── Body ─────────────────────────────────────────────────────────────────────
-
 class _PlayerBody extends ConsumerWidget {
   const _PlayerBody();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final notifier = ref.read(audioPlayerProvider.notifier);
+    final error    = ref.watch(audioPlayerProvider.select((s) => s.error));
 
     return Scaffold(
       backgroundColor: AppColors.background,
       body: GestureDetector(
-        onHorizontalDragEnd: (details) {
-          if (details.primaryVelocity != null) {
-            if (details.primaryVelocity! > 500)       notifier.skipToPrevious();
-            else if (details.primaryVelocity! < -500) notifier.skipToNext();
-          }
+        onHorizontalDragEnd: (d) {
+          if (d.primaryVelocity == null) return;
+          if (d.primaryVelocity! > 500)       notifier.skipToPrevious();
+          else if (d.primaryVelocity! < -500) notifier.skipToNext();
         },
         child: Container(
           decoration: const BoxDecoration(gradient: AppColors.playerGradient),
@@ -63,15 +52,17 @@ class _PlayerBody extends ConsumerWidget {
             child: Column(
               children: [
                 const _TopBar(),
+                // Error banner
+                if (error != null) _ErrorBanner(error: error, onDismiss: notifier.dismissError),
                 Expanded(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      const _ArtworkSection(),
-                      const _TitleSection(),
-                      const RepaintBoundary(child: _SeekBarSection()),
-                      const _MainControlsSection(),
-                      const _BottomControlsSection(),
+                    children: const [
+                      _ArtworkSection(),
+                      _TitleSection(),
+                      RepaintBoundary(child: _SeekBarSection()),
+                      _MainControlsSection(),
+                      _BottomControlsSection(),
                     ],
                   ),
                 ),
@@ -84,7 +75,58 @@ class _PlayerBody extends ConsumerWidget {
   }
 }
 
-// ─── Top bar ──────────────────────────────────────────────────────────────────
+// ── Error Banner ──────────────────────────────────────────────────────────────
+
+class _ErrorBanner extends ConsumerWidget {
+  final String error;
+  final VoidCallback onDismiss;
+  const _ErrorBanner({required this.error, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppColors.error.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.error.withOpacity(0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.wifi_off_rounded, color: AppColors.error, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              error,
+              style: const TextStyle(color: AppColors.error, fontSize: 12),
+            ),
+          ),
+          const SizedBox(width: 8),
+          GestureDetector(
+            onTap: () => ref.read(audioPlayerProvider.notifier).skipToNext(),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Text('Retry', style: TextStyle(color: AppColors.primary, fontSize: 11, fontWeight: FontWeight.w600)),
+            ),
+          ),
+          const SizedBox(width: 6),
+          GestureDetector(
+            onTap: onDismiss,
+            child: const Icon(Icons.close_rounded, size: 16, color: AppColors.textTertiary),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Top bar ───────────────────────────────────────────────────────────────────
 
 class _TopBar extends ConsumerWidget {
   const _TopBar();
@@ -108,12 +150,7 @@ class _TopBar extends ConsumerWidget {
               child: const Text(
                 'NOW PLAYING',
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 2.5,
-                ),
+                style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w600, letterSpacing: 2.5),
               ),
             ),
           ),
@@ -134,21 +171,12 @@ class _TopBar extends ConsumerWidget {
       builder: (ctx) => SafeArea(
         child: Container(
           margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          decoration: BoxDecoration(
-            color: AppColors.surfaceVariant,
-            borderRadius: BorderRadius.circular(20),
-          ),
+          decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(20)),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               const SizedBox(height: 12),
-              Container(
-                width: 36, height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.textTertiary,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
+              Container(width: 36, height: 4, decoration: BoxDecoration(color: AppColors.textTertiary, borderRadius: BorderRadius.circular(2))),
               const SizedBox(height: 8),
               ListTile(
                 leading: const Icon(Icons.queue_music_rounded, color: AppColors.primary),
@@ -163,7 +191,7 @@ class _TopBar extends ConsumerWidget {
   }
 }
 
-// ─── Artwork ──────────────────────────────────────────────────────────────────
+// ── Artwork ───────────────────────────────────────────────────────────────────
 
 class _ArtworkSection extends ConsumerStatefulWidget {
   const _ArtworkSection();
@@ -174,85 +202,98 @@ class _ArtworkSection extends ConsumerStatefulWidget {
 
 class _ArtworkSectionState extends ConsumerState<_ArtworkSection>
     with SingleTickerProviderStateMixin {
-  late AnimationController _ctrl;
-  late Animation<double> _scale;
+  late final AnimationController _ctrl;
+  late final Animation<double>   _scale;
 
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 300));
+    _ctrl  = AnimationController(vsync: this, duration: const Duration(milliseconds: 300));
     _scale = Tween<double>(begin: 0.88, end: 1.0)
         .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
   }
 
   @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
+  void dispose() { _ctrl.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
     final isPlaying  = ref.watch(audioPlayerProvider.select((s) => s.isPlaying));
+    final isLoading  = ref.watch(audioPlayerProvider.select((s) => s.isLoading));
     final artworkUrl = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.artworkUrl));
     final screenWidth = MediaQuery.of(context).size.width;
     final artworkSize = screenWidth - 48.0;
 
-    if (isPlaying) _ctrl.forward();
+    if (isPlaying && !isLoading) _ctrl.forward();
     else _ctrl.reverse();
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24),
       child: ScaleTransition(
         scale: _scale,
-        child: Container(
-          height: artworkSize,
-          width: artworkSize,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: const Color(0xFF8B5CF6).withOpacity(0.25)),
-            boxShadow: [
-              BoxShadow(
-                color: const Color(0xFF7C3AED).withOpacity(0.35),
-                blurRadius: 50,
-                spreadRadius: 4,
-                offset: const Offset(0, 16),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              height: artworkSize, width: artworkSize,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: const Color(0xFF8B5CF6).withOpacity(0.25)),
+                boxShadow: [
+                  BoxShadow(color: const Color(0xFF7C3AED).withOpacity(0.35), blurRadius: 50, spreadRadius: 4, offset: const Offset(0, 16)),
+                  BoxShadow(color: const Color(0xFF06B6D4).withOpacity(0.15), blurRadius: 70, offset: const Offset(0, 24)),
+                ],
               ),
-              BoxShadow(
-                color: const Color(0xFF06B6D4).withOpacity(0.15),
-                blurRadius: 70,
-                spreadRadius: 0,
-                offset: const Offset(0, 24),
-              ),
-            ],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(24),
-            child: CoverImage(
-              url: artworkUrl,
-              size: double.infinity,
-              borderRadius: 24,
-              placeholder: Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [Color(0xFF1A0533), Color(0xFF0C1A4A)],
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(24),
+                child: CoverImage(
+                  url: artworkUrl,
+                  size: double.infinity,
+                  borderRadius: 24,
+                  placeholder: Container(
+                    decoration: const BoxDecoration(gradient: LinearGradient(
+                      begin: Alignment.topLeft, end: Alignment.bottomRight,
+                      colors: [Color(0xFF1A0533), Color(0xFF0C1A4A)],
+                    )),
+                    child: const Center(child: Icon(Icons.music_note_rounded, size: 100, color: Color(0xFF7C3AED))),
                   ),
-                ),
-                child: const Center(
-                  child: Icon(Icons.music_note_rounded, size: 100, color: Color(0xFF7C3AED)),
                 ),
               ),
             ),
-          ),
+            // Loading overlay on artwork
+            if (isLoading)
+              Positioned.fill(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(24),
+                    color: Colors.black.withOpacity(0.45),
+                  ),
+                  child: const Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(
+                          color: Color(0xFF06B6D4),
+                          strokeWidth: 2.5,
+                        ),
+                        SizedBox(height: 12),
+                        Text(
+                          'Loading...',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
   }
 }
 
-// ─── Title + Favorite ─────────────────────────────────────────────────────────
+// ── Title + Favorite ──────────────────────────────────────────────────────────
 
 class _TitleSection extends ConsumerWidget {
   const _TitleSection();
@@ -273,31 +314,20 @@ class _TitleSection extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(item.title,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFFF0F0FF),
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis),
+                    style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: Color(0xFFF0F0FF)),
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
                 if (item.subtitle != null) ...[
                   const SizedBox(height: 4),
-                  Text(
-                    '${item.subtitle!} · Vynce',
-                    style: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  Text('${item.subtitle!} · Vynce',
+                      style: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
                 ],
               ],
             ),
           ),
           IconButton(
-            icon: Icon(
-              isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-              color: isFav ? AppColors.error : AppColors.textSecondary,
-              size: 28,
-            ),
+            icon: Icon(isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                color: isFav ? AppColors.error : AppColors.textSecondary, size: 28),
             onPressed: () => ref.read(favoritesProvider.notifier).toggle(item.id),
           ),
         ],
@@ -306,15 +336,7 @@ class _TitleSection extends ConsumerWidget {
   }
 }
 
-// ─── Seek Bar ─────────────────────────────────────────────────────────────────
-//
-// FIX 1: PIXEL OVERFLOW — thumb was painted outside track bounds when progress ≈ 1.0
-//   Root cause: `left: fillW - 7` could place the 14px thumb so its right edge
-//   exceeded `totalW`, causing a RenderFlex overflow pixel.
-//   Fix: clamp the thumb's left position to `totalW - 14` so it never escapes.
-//
-// FIX 2: TAP-TO-SEEK — onTapDown now seeks immediately on a single tap.
-//   Previously only drag worked; tapping had no effect.
+// ── Seek Bar ──────────────────────────────────────────────────────────────────
 
 class _SeekBarSection extends ConsumerStatefulWidget {
   const _SeekBarSection();
@@ -327,21 +349,18 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
   bool   _isSeeking = false;
   double _seekValue = 0;
 
-  // Convert a local x offset to a 0..1 progress value, clamped.
-  double _xToProgress(double x, double totalWidth) {
-    return (x / totalWidth).clamp(0.0, 1.0);
-  }
+  double _xToProgress(double x, double w) => (x / w).clamp(0.0, 1.0);
 
   void _commitSeek(double progress, Duration? duration) {
     if (duration == null || duration == Duration.zero) return;
-    final ms = (progress * duration.inMilliseconds).toInt();
-    ref.read(audioPlayerProvider.notifier).seek(Duration(milliseconds: ms));
+    ref.read(audioPlayerProvider.notifier).seek(Duration(milliseconds: (progress * duration.inMilliseconds).toInt()));
   }
 
   @override
   Widget build(BuildContext context) {
     final position = ref.watch(audioPlayerProvider.select((s) => s.position));
     final duration = ref.watch(audioPlayerProvider.select((s) => s.duration));
+    final isLoading = ref.watch(audioPlayerProvider.select((s) => s.isLoading));
 
     final displayPos = _isSeeking
         ? Duration(milliseconds: (_seekValue * (duration?.inMilliseconds ?? 0)).toInt())
@@ -356,34 +375,25 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
       child: Column(
         children: [
           LayoutBuilder(builder: (_, constraints) {
-            final totalW = constraints.maxWidth;
-            // FIX 1: clamp fill so the 14px thumb never overflows totalW.
-            // fillW can equal totalW; thumb left is clamped to totalW - 14.
-            final rawFillW = totalW * progress;
-            final fillW    = rawFillW.clamp(0.0, totalW);
+            final totalW   = constraints.maxWidth;
+            final fillW    = (totalW * progress).clamp(0.0, totalW);
             final thumbLeft = (fillW - 7.0).clamp(0.0, totalW - 14.0);
 
             return GestureDetector(
               behavior: HitTestBehavior.opaque,
-              // FIX 2: tap-to-seek
-              onTapDown: (details) {
-                final p = _xToProgress(details.localPosition.dx, totalW);
-                setState(() {
-                  _isSeeking  = false;
-                  _seekValue  = p;
-                });
+              onTapDown: (d) {
+                if (isLoading) return;
+                final p = _xToProgress(d.localPosition.dx, totalW);
+                setState(() { _isSeeking = false; _seekValue = p; });
                 _commitSeek(p, duration);
               },
-              onHorizontalDragStart: (details) {
-                setState(() {
-                  _isSeeking = true;
-                  _seekValue = _xToProgress(details.localPosition.dx, totalW);
-                });
+              onHorizontalDragStart: (d) {
+                if (isLoading) return;
+                setState(() { _isSeeking = true; _seekValue = _xToProgress(d.localPosition.dx, totalW); });
               },
-              onHorizontalDragUpdate: (details) {
-                setState(() {
-                  _seekValue = _xToProgress(details.localPosition.dx, totalW);
-                });
+              onHorizontalDragUpdate: (d) {
+                if (isLoading) return;
+                setState(() { _seekValue = _xToProgress(d.localPosition.dx, totalW); });
               },
               onHorizontalDragEnd: (_) {
                 final p = _seekValue;
@@ -391,71 +401,23 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
                 _commitSeek(p, duration);
               },
               child: SizedBox(
-                height: 36, // taller hit area for easier touch
+                height: 36,
                 child: Stack(
                   alignment: Alignment.centerLeft,
                   clipBehavior: Clip.none,
                   children: [
-                    // Track background
-                    Positioned(
-                      top: 0, bottom: 0,
-                      left: 0, right: 0,
-                      child: Center(
-                        child: Container(
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF1A1A2E),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                        ),
-                      ),
-                    ),
-                    // Filled portion — clipped so it never overflows
-                    Positioned(
-                      top: 0, bottom: 0, left: 0,
-                      child: Center(
-                        child: ClipRect(
-                          child: Container(
-                            height: 4,
-                            width: fillW,
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(4),
-                              gradient: const LinearGradient(
-                                colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    // Thumb — FIX 1: left is clamped so thumb stays on screen
+                    Positioned(top: 0, bottom: 0, left: 0, right: 0,
+                        child: Center(child: Container(height: 4, decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(4))))),
+                    Positioned(top: 0, bottom: 0, left: 0,
+                        child: Center(child: ClipRect(child: Container(height: 4, width: fillW,
+                            decoration: BoxDecoration(borderRadius: BorderRadius.circular(4),
+                                gradient: const LinearGradient(colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)])))))),
                     if (fillW > 0)
-                      Positioned(
-                        left: thumbLeft,
-                        top: 0,
-                        bottom: 0,
-                        child: Center(
-                          child: Container(
-                            width: 14,
-                            height: 14,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: _isSeeking
-                                  ? const Color(0xFF06B6D4)
-                                  : const Color(0xFFA855F7),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: _isSeeking
-                                      ? const Color(0xFF06B6D4)
-                                      : const Color(0xFFA855F7),
-                                  blurRadius: _isSeeking ? 14 : 10,
-                                  spreadRadius: _isSeeking ? 3 : 2,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
+                      Positioned(left: thumbLeft, top: 0, bottom: 0,
+                          child: Center(child: Container(width: 14, height: 14,
+                              decoration: BoxDecoration(shape: BoxShape.circle,
+                                  color: _isSeeking ? const Color(0xFF06B6D4) : const Color(0xFFA855F7),
+                                  boxShadow: [BoxShadow(color: _isSeeking ? const Color(0xFF06B6D4) : const Color(0xFFA855F7), blurRadius: _isSeeking ? 14 : 10, spreadRadius: _isSeeking ? 3 : 2)])))),
                   ],
                 ),
               ),
@@ -468,6 +430,15 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(_fmt(displayPos), style: const TextStyle(fontSize: 11, color: Color(0xFF4B5563))),
+                // Show buffering indicator when loading
+                if (isLoading)
+                  const SizedBox(width: 60, child: LinearProgressIndicator(
+                    backgroundColor: Color(0xFF1A1A2E),
+                    color: Color(0xFF06B6D4),
+                    minHeight: 2,
+                  ))
+                else
+                  const SizedBox(width: 60),
                 Text(_fmt(displayDur), style: const TextStyle(fontSize: 11, color: Color(0xFF4B5563))),
               ],
             ),
@@ -486,7 +457,7 @@ class _SeekBarSectionState extends ConsumerState<_SeekBarSection> {
   }
 }
 
-// ─── Main Controls ────────────────────────────────────────────────────────────
+// ── Main Controls ─────────────────────────────────────────────────────────────
 
 class _MainControlsSection extends ConsumerWidget {
   const _MainControlsSection();
@@ -500,72 +471,39 @@ class _MainControlsSection extends ConsumerWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        _VynceCtrlBtn(
-          icon: Icons.skip_previous_rounded,
-          onTap: notifier.skipToPrevious,
-          size: 30,
-        ),
+        _VynceCtrlBtn(icon: Icons.skip_previous_rounded, onTap: isLoading ? null : notifier.skipToPrevious, size: 30),
         const SizedBox(width: 8),
-        _VynceCtrlBtn(
-          widget: _SkipWidget(label: '-10s', onTap: notifier.skipBackward, forward: false),
-          size: 30,
-        ),
+        _VynceCtrlBtn(widget: _SkipWidget(label: '-10s', onTap: isLoading ? null : notifier.skipBackward, forward: false), size: 30),
         const SizedBox(width: 16),
         GestureDetector(
-          onTap: notifier.togglePlayPause,
+          onTap: isLoading ? null : notifier.togglePlayPause,
           child: Container(
-            width: 72,
-            height: 72,
+            width: 72, height: 72,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              gradient: const LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF7C3AED).withOpacity(0.5),
-                  blurRadius: 24,
-                  offset: const Offset(0, 8),
-                ),
-              ],
+              gradient: const LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
+                  colors: [Color(0xFF7C3AED), Color(0xFF06B6D4)]),
+              boxShadow: [BoxShadow(color: const Color(0xFF7C3AED).withOpacity(0.5), blurRadius: 24, offset: const Offset(0, 8))],
             ),
             child: isLoading
-                ? const Padding(
-                    padding: EdgeInsets.all(20),
-                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
-                  )
-                : Icon(
-                    isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                    color: Colors.white,
-                    size: 38,
-                  ),
+                ? const Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5))
+                : Icon(isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: Colors.white, size: 38),
           ),
         ),
         const SizedBox(width: 16),
-        _VynceCtrlBtn(
-          widget: _SkipWidget(label: '+15s', onTap: notifier.skipForward, forward: true),
-          size: 30,
-        ),
+        _VynceCtrlBtn(widget: _SkipWidget(label: '+15s', onTap: isLoading ? null : notifier.skipForward, forward: true), size: 30),
         const SizedBox(width: 8),
-        _VynceCtrlBtn(
-          icon: Icons.skip_next_rounded,
-          onTap: notifier.skipToNext,
-          size: 30,
-        ),
+        _VynceCtrlBtn(icon: Icons.skip_next_rounded, onTap: isLoading ? null : notifier.skipToNext, size: 30),
       ],
     );
   }
 }
 
-// ─── Skip visual ──────────────────────────────────────────────────────────────
-
 class _SkipWidget extends StatelessWidget {
   final String label;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final bool forward;
-  const _SkipWidget({required this.label, required this.onTap, this.forward = false});
+  const _SkipWidget({required this.label, required this.onTap, required this.forward});
 
   @override
   Widget build(BuildContext context) {
@@ -575,42 +513,26 @@ class _SkipWidget extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           SizedBox(
-            width: 44,
-            height: 44,
+            width: 44, height: 44,
             child: Stack(
               alignment: Alignment.center,
               children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFF4B5563), width: 1.5),
-                  ),
-                ),
-                Text(
-                  forward ? '15' : '10',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Color(0xFFC4B5FD),
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
+                Container(width: 44, height: 44, decoration: BoxDecoration(shape: BoxShape.circle,
+                    border: Border.all(color: onTap != null ? const Color(0xFF4B5563) : const Color(0xFF2A2A3E), width: 1.5))),
+                Text(forward ? '15' : '10', style: TextStyle(fontSize: 11,
+                    color: onTap != null ? const Color(0xFFC4B5FD) : const Color(0xFF4B5563), fontWeight: FontWeight.w700)),
               ],
             ),
           ),
           const SizedBox(height: 4),
-          Text(
-            label,
-            style: const TextStyle(fontSize: 9, color: Color(0xFF6B7280), letterSpacing: 0.3),
-          ),
+          Text(label, style: const TextStyle(fontSize: 9, color: Color(0xFF6B7280), letterSpacing: 0.3)),
         ],
       ),
     );
   }
 }
 
-// ─── Bottom Controls ──────────────────────────────────────────────────────────
+// ── Bottom Controls ───────────────────────────────────────────────────────────
 
 class _BottomControlsSection extends ConsumerWidget {
   const _BottomControlsSection();
@@ -623,7 +545,7 @@ class _BottomControlsSection extends ConsumerWidget {
     final isSong      = ref.watch(audioPlayerProvider.select((s) => s.currentItem?.isSong ?? false));
     final notifier    = ref.read(audioPlayerProvider.notifier);
 
-    final loopIcon = switch (loopMode) {
+    final loopIcon   = switch (loopMode) {
       ja.LoopMode.off => Icons.repeat_rounded,
       ja.LoopMode.all => Icons.repeat_rounded,
       ja.LoopMode.one => Icons.repeat_one_rounded,
@@ -639,11 +561,7 @@ class _BottomControlsSection extends ConsumerWidget {
           _IconToggle(icon: loopIcon, active: loopActive, onTap: notifier.cycleLoopMode),
           _SpeedButton(speed: speed, onChanged: notifier.setSpeed),
           if (isSong)
-            _IconToggle(
-              icon: Icons.equalizer_rounded,
-              active: false,
-              onTap: () => _showEqualizer(context),
-            )
+            _IconToggle(icon: Icons.equalizer_rounded, active: false, onTap: () => _showEq(context))
           else
             const SizedBox(width: 36),
         ],
@@ -651,17 +569,11 @@ class _BottomControlsSection extends ConsumerWidget {
     );
   }
 
-  void _showEqualizer(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => const EqualizerSheet(),
-    );
+  void _showEq(BuildContext context) {
+    showModalBottomSheet(context: context, isScrollControlled: true,
+        backgroundColor: Colors.transparent, builder: (_) => const EqualizerSheet());
   }
 }
-
-// ─── Speed Button ─────────────────────────────────────────────────────────────
 
 class _SpeedButton extends StatelessWidget {
   final double speed;
@@ -671,73 +583,40 @@ class _SpeedButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () => _showSpeedMenu(context),
+      onTap: () => _showMenu(context),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
           color: const Color(0xFF1A1A2E),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: speed != 1.0
-                ? const Color(0xFF7C3AED).withOpacity(0.5)
-                : Colors.transparent,
-          ),
+          border: Border.all(color: speed != 1.0 ? const Color(0xFF7C3AED).withOpacity(0.5) : Colors.transparent),
         ),
-        child: Text(
-          '${speed}x',
-          style: TextStyle(
-            fontSize: 13,
-            fontWeight: FontWeight.w700,
-            color: speed != 1.0 ? const Color(0xFFA855F7) : const Color(0xFF6B7280),
-          ),
-        ),
+        child: Text('${speed}x', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700,
+            color: speed != 1.0 ? const Color(0xFFA855F7) : const Color(0xFF6B7280))),
       ),
     );
   }
 
-  void _showSpeedMenu(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (ctx) => SafeArea(
-        child: Container(
+  void _showMenu(BuildContext context) {
+    showModalBottomSheet(context: context, backgroundColor: Colors.transparent, isScrollControlled: true,
+        builder: (ctx) => SafeArea(child: Container(
           margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          decoration: BoxDecoration(
-            color: AppColors.surfaceVariant,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 16),
-              const Text('Playback Speed',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
-              const SizedBox(height: 8),
-              ...AppConstants.playbackSpeeds.map(
-                (s) => ListTile(
-                  title: Text('${s}x'),
-                  trailing: speed == s
-                      ? ShaderMask(
-                          shaderCallback: (r) => const LinearGradient(
-                            colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
-                          ).createShader(r),
-                          child: const Icon(Icons.check_rounded, color: Colors.white),
-                        )
-                      : null,
-                  onTap: () { onChanged(s); Navigator.pop(ctx); },
-                ),
-              ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
+          decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(20)),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const SizedBox(height: 16),
+            const Text('Playback Speed', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
+            const SizedBox(height: 8),
+            ...AppConstants.playbackSpeeds.map((s) => ListTile(
+              title: Text('${s}x'),
+              trailing: speed == s ? ShaderMask(shaderCallback: (r) => const LinearGradient(colors: [Color(0xFFA855F7), Color(0xFF06B6D4)]).createShader(r),
+                  child: const Icon(Icons.check_rounded, color: Colors.white)) : null,
+              onTap: () { onChanged(s); Navigator.pop(ctx); },
+            )),
+            const SizedBox(height: 8),
+          ]),
+        )));
   }
 }
-
-// ─── Shared control widgets ───────────────────────────────────────────────────
 
 class _VynceCtrlBtn extends StatelessWidget {
   final IconData? icon;
@@ -753,7 +632,8 @@ class _VynceCtrlBtn extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       child: Padding(
         padding: const EdgeInsets.all(6),
-        child: widget ?? Icon(icon, size: size, color: const Color(0xFF6B7280)),
+        child: widget ?? Icon(icon, size: size,
+            color: onTap != null ? const Color(0xFF6B7280) : const Color(0xFF2A2A3E)),
       ),
     );
   }
@@ -772,12 +652,8 @@ class _IconToggle extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.all(8),
         child: active
-            ? ShaderMask(
-                shaderCallback: (r) => const LinearGradient(
-                  colors: [Color(0xFFA855F7), Color(0xFF06B6D4)],
-                ).createShader(r),
-                child: Icon(icon, size: 24, color: Colors.white),
-              )
+            ? ShaderMask(shaderCallback: (r) => const LinearGradient(colors: [Color(0xFFA855F7), Color(0xFF06B6D4)]).createShader(r),
+                child: Icon(icon, size: 24, color: Colors.white))
             : Icon(icon, size: 24, color: const Color(0xFF4B5563)),
       ),
     );
