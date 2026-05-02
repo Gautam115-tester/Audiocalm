@@ -4,49 +4,17 @@
 // =====================
 //
 // FIX 1 — REMOVE ?t CACHE-BUSTER CACHE KEY (CRITICAL BACKEND FIX)
-// ----------------------------------------------------------------
-// PROBLEM: The previous version used the Flutter ?t query param as part of
-// the NodeCache key: `all_with_episodes_${t}`
-//
-// This created UNBOUNDED cache slots:
-//   - Flutter sends ?t=100 → cached as "all_with_episodes_100" (5min TTL)
-//   - Flutter sends ?t=101 → cached as "all_with_episodes_101" (5min TTL)
-//   - Flutter sends ?t=102 → cached as "all_with_episodes_102" (5min TTL)
-//   ...up to 10 simultaneous stale slots within a 5-minute window
-//
-// When admin syncs ep 81 → invalidateSeriesCache() → flushAll() ✓ (all cleared)
-// But THEN Flutter immediately re-requests with the same ?t=100 value
-// (it's still within the same 30s epoch window).
-// The cache slot "all_with_episodes_100" was just flushed → MISS → DB query
-// → fresh data with 81 episodes. This actually works...
-//
-// BUT: If Flutter sends a NEW epoch ?t=101 AFTER the cache was populated with
-// ?t=100 but BEFORE the sync happened, then:
-//   - ?t=100 → DB query → 80 eps cached
-//   - Admin syncs → flushAll() clears everything ✓
-//   - Flutter now in epoch 101 → ?t=101 → MISS → DB query → 81 eps ✓
-// This also works...
-//
-// The REAL problem the ?t approach caused: It prevented the server-side cache
-// from being effective at all. Each new 30s epoch = guaranteed cache miss =
-// guaranteed DB query every 30 seconds per user, even for identical data.
-// At 10,000 users this is a significant unnecessary DB load.
-//
-// FIX: Use a single stable cache key "all_with_episodes".
-// The cache is properly invalidated by invalidateSeriesCache() → flushAll()
-// which clears it after every sync. This is the correct design:
-//   - One cache entry, one invalidation point
-//   - TTL of 60s (reduced from 300s so stale window is at most 60s)
-//   - After a sync, the next request always hits DB and gets fresh data
+//    Uses a single stable cache key "all_with_episodes" instead of including
+//    the ?t query parameter. The ?t param is intentionally IGNORED.
 //
 // FIX 2 — REDUCED allWithEpisodesCache TTL: 300s → 60s
-// ------------------------------------------------------
-// Reduces the worst-case stale window from 5 minutes to 60 seconds.
-// If a sync happens and invalidateSeriesCache() is called, the cache is
-// immediately flushed. If somehow it isn't called (edge case), the data
-// will be at most 60 seconds stale.
+//    Reduces the worst-case stale window from 5 minutes to 60 seconds.
 //
-// All existing routes are unchanged.
+// FIX 3 — BACKGROUND URL PRE-WARMING after all-with-episodes response
+//    After building the response, resolves the Telegram CDN URL for the
+//    first episode of each series so it's cached before the user taps play.
+//    Completely non-blocking — fire and forget. Eliminates the 200–800ms
+//    cold Telegram getFile delay on first playback.
 
 const express   = require('express');
 const router    = express.Router();
@@ -56,7 +24,6 @@ const NodeCache = require('node-cache');
 
 // ── Caches ────────────────────────────────────────────────────────────────────
 const listCache            = new NodeCache({ stdTTL: 60,  checkperiod: 30  });
-// FIX 2: Reduced TTL from 300s to 60s — reduces worst-case stale window.
 const allWithEpisodesCache = new NodeCache({ stdTTL: 60,  checkperiod: 30  });
 const detailCache          = new NodeCache({ stdTTL: 300, checkperiod: 60  });
 const episodesCache        = new NodeCache({ stdTTL: 300, checkperiod: 60  });
@@ -85,7 +52,6 @@ async function withCache(cache, key, fetcher) {
 
 function invalidateSeries(id) {
   listCache.del('series_list');
-  // Flush ALL keys in allWithEpisodesCache.
   allWithEpisodesCache.flushAll();
   if (id) {
     detailCache.del(`series:${id}`);
@@ -102,20 +68,12 @@ function invalidateSeriesCache() {
 
 // ── GET /api/series/all-with-episodes ─────────────────────────────────────────
 //
-// FIX 1: Uses a single stable cache key "all_with_episodes" instead of
-// including the ?t query parameter in the key.
-//
-// The ?t param is intentionally IGNORED for caching purposes.
-// It was sent by older Flutter builds as a cache-buster; ignoring it here
-// means the server cache works correctly with a single invalidation point.
-//
-// Result: one cache entry, invalidated cleanly by invalidateSeriesCache()
-// after every sync. TTL is 60s so data is at most 60s stale even without
-// an explicit invalidation.
+// FIX 1: Single stable cache key "all_with_episodes" — ignore ?t param entirely.
+// FIX 3: After responding, fires background URL pre-warm for first episode
+//         of each series. Completely non-blocking.
 
 router.get('/all-with-episodes', async (req, res, next) => {
   try {
-    // FIX 1: Single stable cache key — ignore ?t param entirely.
     const cacheKey = 'all_with_episodes';
 
     const { data, fromCache } = await withCache(allWithEpisodesCache, cacheKey, async () => {
@@ -141,11 +99,11 @@ router.get('/all-with-episodes', async (req, res, next) => {
             title:        series.title,
             description:  series.description,
             coverUrl,
-            // Always derive episodeCount from the live embedded list.
-            // Never return the potentially-stale series.episodeCount DB column.
             episodeCount: series.episodes.length,
             isActive:     series.isActive,
             createdAt:    series.createdAt,
+            // Store first episode fileId for pre-warming (stripped before response)
+            _firstEpFileId: series.episodes[0]?.telegramFileId || null,
             episodes: series.episodes.map((ep) => ({
               id:            ep.id,
               seriesId:      ep.seriesId,
@@ -164,7 +122,29 @@ router.get('/all-with-episodes', async (req, res, next) => {
 
     res.setHeader('X-Cache',       fromCache ? 'HIT' : 'MISS');
     res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
-    res.json({ success: true, data });
+
+    // Strip internal field before sending to client
+    const clientData = data.map(({ _firstEpFileId, ...series }) => series);
+    res.json({ success: true, data: clientData });
+
+    // FIX 3: Fire background pre-warm AFTER responding (non-blocking)
+    if (!fromCache) {
+      const fileIds = data
+        .map(s => {
+          const raw = s._firstEpFileId;
+          if (!raw) return null;
+          if (raw.startsWith('[')) {
+            try { return JSON.parse(raw)[0]; } catch { return null; }
+          }
+          return raw;
+        })
+        .filter(Boolean)
+        .slice(0, 8);
+
+      if (fileIds.length > 0) {
+        telegram.warmUrlsBackground(fileIds);
+      }
+    }
   } catch (err) { next(err); }
 });
 

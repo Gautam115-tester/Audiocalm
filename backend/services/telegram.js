@@ -20,9 +20,13 @@
 //    With the server-side cache (55min TTL), the first play request
 //    resolves in <200ms. No pre-warming needed.
 //
-// FIX 4 — FASTER getFileUrl: connection timeout 30s → 10s
+// FIX 4 — FASTER getFileUrl: connection timeout 10s → 5s
 //    If Telegram API is slow, fail fast and let the client retry.
-//    A 30s timeout means the user waits 30s before seeing an error.
+//    A 10s timeout means the user waits 10s before seeing an error.
+//
+// FIX 5 — warmUrlsBackground: fire-and-forget background pre-warm
+//    Called after list responses to resolve CDN URLs before user taps play.
+//    Max 5 concurrent, no await, completely non-blocking.
 
 const axios = require('axios');
 const NodeCache = require('node-cache');
@@ -75,9 +79,10 @@ function _releaseGetFileSlot() {
   }
 }
 
+// FIX 4: 5s timeout (was 10s) — fail fast so client can retry quickly
 const tgApi = axios.create({
   baseURL: TELEGRAM_API,
-  timeout: 10_000, // FIX 4: 10s timeout (was 30s)
+  timeout: 5_000,
 });
 
 // ── getFileUrl ─────────────────────────────────────────────────────────────────
@@ -140,10 +145,32 @@ async function refreshUrl(telegramFileId) {
   return getFileUrl(telegramFileId);
 }
 
-// FIX 3: preWarmUrl and preWarmBatch REMOVED.
-// These were called on startup and caused 100-200 concurrent Telegram API calls,
-// flooding the server and making real play requests wait 10+ seconds.
-// The 55-min URL cache means the first real request resolves in <200ms.
+// ── warmUrlsBackground ─────────────────────────────────────────────────────────
+// FIX 5: Fire-and-forget background URL pre-warming.
+// Called after list responses to resolve CDN URLs before the user taps play.
+// Max 5 concurrent to avoid Telegram rate limits. Never blocks the caller.
+async function warmUrlsBackground(fileIds) {
+  if (!fileIds || fileIds.length === 0) return;
+
+  const batch = fileIds.filter(Boolean).slice(0, 5);
+
+  // Stagger requests to avoid burst
+  const warmOne = async (fileId, delayMs) => {
+    try {
+      await new Promise(r => setTimeout(r, delayMs));
+      const cached = urlCache.get(`url:${fileId}`);
+      if (!cached) {
+        await getFileUrl(fileId);
+        console.log(`[telegram] Pre-warmed URL for ${fileId?.slice(0, 15)}…`);
+      }
+    } catch (_) {
+      // Non-fatal — user will fall back to on-demand resolution
+    }
+  };
+
+  // Fire all without awaiting — completely non-blocking
+  Promise.allSettled(batch.map((id, i) => warmOne(id, i * 250))).catch(() => {});
+}
 
 // ── buildRedirectResponse ──────────────────────────────────────────────────────
 function buildRedirectResponse(url, res) {
@@ -320,8 +347,7 @@ module.exports = {
   getFileUrl,
   getDirectUrl,
   refreshUrl,
-  // FIX 3: preWarmUrl and preWarmBatch intentionally NOT exported
-  // Exporting them again would allow routes to call them, re-introducing the flood.
+  warmUrlsBackground,
   buildRedirectResponse,
   getCoverUrl,
   proxyStream,

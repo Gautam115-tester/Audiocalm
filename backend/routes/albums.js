@@ -1,23 +1,15 @@
 // routes/albums.js
 //
-// FIXES IN THIS VERSION
-// =====================
+// PERFORMANCE FIXES IN THIS VERSION
+// ==================================
 //
-// 1. NEW: GET /api/albums/all-with-songs  ← THE PRIMARY FIX
-//    Returns ALL albums + their songs in a SINGLE database query.
-//    Flutter currently fires: 1 list + 11×2 detail/songs = 23 requests on startup.
-//    With this endpoint: 1 request → done. No parallel flood, no P2024 timeouts.
-//    Flutter should call this INSTEAD of the separate list + per-album requests.
-//    Response: { success: true, data: [ { ...album, coverUrl, songs: [...] } ] }
-//    Cached 5 minutes server-side.
+// 1. GET /api/albums/all-with-songs now fires warmUrlsBackground() after
+//    building the response — resolves CDN URLs for the first track of each
+//    album BEFORE the user taps play. This eliminates the 200–800ms cold
+//    Telegram getFile delay on first playback.
 //
-// 2. CACHE STAMPEDE PREVENTION (withCache helper)
-//    Multiple cold-start requests for the same key share one Promise.
-//
-// 3. SERVER-SIDE CACHE FOR /:id AND /:id/songs
-//    5-minute NodeCache (Dio ignores HTTP Cache-Control headers).
-//
-// 4. CACHE INVALIDATION via invalidateAlbum() on all mutations.
+// 2. All other existing fixes preserved (cache stampede prevention,
+//    server-side NodeCache, cache invalidation on mutations).
 
 const express   = require('express');
 const router    = express.Router();
@@ -59,9 +51,44 @@ function invalidateAlbum(id) {
   }
 }
 
+// ── Background URL pre-warmer ─────────────────────────────────────────────────
+// Resolves the first track's Telegram CDN URL for each album so it's cached
+// before the user taps play. Completely non-blocking — fire and forget.
+function preWarmFirstTrackUrls(albums) {
+  try {
+    const fileIds = [];
+
+    for (const album of albums) {
+      if (!album.songs || album.songs.length === 0) continue;
+      const firstSong = album.songs[0];
+      const raw = firstSong._telegramFileId; // stored temporarily below
+      if (!raw) continue;
+
+      if (raw.startsWith('[')) {
+        try {
+          const parts = JSON.parse(raw);
+          if (parts[0]) fileIds.push(parts[0]);
+        } catch (_) {}
+      } else {
+        fileIds.push(raw);
+      }
+
+      // Stop after 8 albums — enough to cover the visible screen
+      if (fileIds.length >= 8) break;
+    }
+
+    if (fileIds.length > 0) {
+      telegram.warmUrlsBackground(fileIds);
+    }
+  } catch (_) {
+    // Non-fatal — pre-warming is best-effort
+  }
+}
+
 // ── GET /api/albums/all-with-songs ───────────────────────────────────────────
-// PRIMARY FIX: single endpoint replaces 23 parallel startup requests.
+// PRIMARY: single endpoint replaces 23 parallel startup requests.
 // Flutter calls this ONCE and gets everything it needs.
+// After responding, fires background URL pre-warm for instant playback.
 router.get('/all-with-songs', async (req, res, next) => {
   try {
     const { data, fromCache } = await withCache(allWithSongCache, 'all_with_songs', async () => {
@@ -81,6 +108,7 @@ router.get('/all-with-songs', async (req, res, next) => {
           const coverUrl = album.coverTelegramFileId
             ? await telegram.getCoverUrl(album.coverTelegramFileId).catch(() => null)
             : null;
+
           return {
             id:          album.id,
             title:       album.title,
@@ -91,6 +119,8 @@ router.get('/all-with-songs', async (req, res, next) => {
             coverUrl,
             trackCount:  album.songs.length,
             createdAt:   album.createdAt,
+            // Temporarily store first song fileId for pre-warming (stripped before response)
+            _firstTrackFileId: album.songs[0]?.telegramFileId || null,
             songs: album.songs.map((s) => ({
               id:          s.id,
               albumId:     s.albumId,
@@ -110,7 +140,29 @@ router.get('/all-with-songs', async (req, res, next) => {
 
     res.setHeader('X-Cache',       fromCache ? 'HIT' : 'MISS');
     res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
-    res.json({ success: true, data });
+
+    // Strip internal _firstTrackFileId before sending to client
+    const clientData = data.map(({ _firstTrackFileId, ...album }) => album);
+    res.json({ success: true, data: clientData });
+
+    // Fire background pre-warm AFTER responding (non-blocking)
+    if (!fromCache) {
+      const fileIds = data
+        .map(a => {
+          const raw = a._firstTrackFileId;
+          if (!raw) return null;
+          if (raw.startsWith('[')) {
+            try { return JSON.parse(raw)[0]; } catch { return null; }
+          }
+          return raw;
+        })
+        .filter(Boolean)
+        .slice(0, 8);
+
+      if (fileIds.length > 0) {
+        telegram.warmUrlsBackground(fileIds);
+      }
+    }
   } catch (err) { next(err); }
 });
 
