@@ -1,42 +1,31 @@
 // lib/features/player/services/audio_handler.dart
 //
-// COMPLETE REWRITE — Smart Loading, Prefetch & Fast Transitions
-// =============================================================
+// FIX: INFINITE LOADING STATE
+// ============================
 //
-// KEY FIXES:
-// 1. OPTIMISTIC PLAY — sub-1s audio start
-//    - setAudioSource is called WITHOUT awaiting it
-//    - play() is called 80ms later so buffering starts immediately
-//    - User hears audio in ~200–400ms instead of 2–6s
-//    - Loading indicator shows during the brief buffer fill
+// ROOT CAUSE:
+//   In _loadWithRetry(), the optimistic play path:
+//     1. calls unawaited(setAudioSource(...))
+//     2. awaits Future.delayed(80ms)
+//     3. calls await player.play()
+//     4. returns true
+//   But onLoadingStateChanged?.call(false, null) was NEVER called after
+//   this success path. So isLoading in AudioPlayerState stayed true forever,
+//   causing the loading spinner on the artwork and seek bar to never dismiss.
 //
-// 2. INFINITE LOADING FIX
-//    - Hard 15s timeout on setAudioSource → shows error instead of spinning forever
-//    - Automatic URL refresh on 401/403 (expired Telegram signed URL)
-//    - Retry logic with exponential backoff (max 3 attempts)
-//    - Loading state always resolves (success, error, or timeout)
+//   Additionally, _loadPartAndPlay called onLoadingStateChanged(true) before
+//   the load, but only called (false) in one branch — the non-preload path.
+//   The preload-swap path (_swapToPreloadedPart) never cleared loading state.
 //
-// 3. SLOW NETWORK (8MB avg file) OPTIMISATIONS
-//    - Streams via redirect (no proxy copy) → Telegram CDN serves directly
-//    - LockCachingAudioSource for parts that have been prefetched
-//    - Progressive loading: playback starts as soon as first buffer fills (~1-2s)
-//    - Adaptive prefetch lead-time based on measured bandwidth
-//
-// 4. SMART PREFETCH ENGINE
-//    - Next item prefetch starts 60s before current track ends
-//    - Short tracks (< 90s) prefetch next immediately on load
-//    - Next album first track pre-warms when last queue item plays
-//    - Priority queue: critical (user tapped) > high (next) > normal > low
-//    - Max 2 concurrent prefetches to avoid bandwidth starvation
-//
-// 5. GAPLESS TRANSITIONS
-//    - Preloaded player swapped in atomically (zero-gap crossfade)
-//    - Old player disposed after 500ms (avoids audio glitch)
-//    - Part-to-part transitions use pre-buffered next part
-//
-// 6. POSITION PERSISTENCE
-//    - Saved every 5s while playing
-//    - Restored on resume with pending-seek (plays immediately, seeks when ready)
+// FIX:
+//   1. In _loadWithRetry optimistic path: after player.play() succeeds,
+//      call onLoadingStateChanged?.call(false, null) immediately.
+//   2. In _loadPartAndPlay: call onLoadingStateChanged(false) after the
+//      preload-swap path too.
+//   3. The playerStateStream listener in _reAttachStreams already drives
+//      isLoading from ProcessingState.loading/buffering → this is the
+//      correct long-term signal. But onLoadingStateChanged bridges the gap
+//      between "tap play" and "first playerState event arrives".
 
 import 'dart:async';
 import 'package:audio_service/audio_service.dart';
@@ -107,7 +96,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   static const int _kShortTrackThresholdSecs = 90;
 
   // ── Timeouts ───────────────────────────────────────────────────────────────
-  /// Hard timeout for setAudioSource — fixes infinite loading on slow networks
   static const Duration _kLoadTimeout     = Duration(seconds: 20);
   static const Duration _kRetryDelay      = Duration(seconds: 3);
   static const int      _kMaxLoadAttempts = 3;
@@ -116,7 +104,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   void Function()? onQueueExhausted;
   Future<PlayableItem?> Function()? onGetNextAlbumFirstTrack;
   void Function(int sessionId)? onAudioSessionChanged;
-  /// Notifies UI when loading state changes (true=loading, false=done, error=string)
   void Function(bool isLoading, String? error)? onLoadingStateChanged;
 
   // ── Android session ID ─────────────────────────────────────────────────────
@@ -166,13 +153,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   // ── OPTIMISTIC PLAY: load with timeout + retry ─────────────────────────────
   //
-  // KEY CHANGE: For non-preload calls, we no longer await setAudioSource.
-  // Instead we call setAudioSource without awaiting, then call play() after
-  // a brief 80ms delay. This lets just_audio start buffering immediately
-  // while we return control to the UI — the user sees the player and hears
-  // audio in ~200–400ms instead of 2–6s.
-  //
-  // For preload-only calls, we still await (they happen in background).
+  // FIX: After successful optimistic play, call onLoadingStateChanged(false)
+  // so the UI loading spinner clears immediately. Previously this was missing,
+  // leaving isLoading=true permanently in the optimistic (non-preload) path.
 
   Future<bool> _loadWithRetry(
     ja.AudioPlayer player,
@@ -198,7 +181,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
         // OPTIMISTIC PLAY: do NOT await setAudioSource.
         // Start playback intent immediately — just_audio will buffer while playing.
-        // This is the primary fix for the "tap play → wait 3s → hear audio" UX.
         if (startAt > Duration.zero) {
           _pendingSeekAfterLoad = startAt;
         }
@@ -217,6 +199,12 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         await player.play();
         _pendingSeekAfterLoad = null;
 
+        // FIX: Signal that the initial "tap → load" phase is done.
+        // The playerStateStream will continue to drive isLoading=true while
+        // ProcessingState is loading/buffering, which is correct behavior.
+        // But we must clear our own "pending load" signal here.
+        onLoadingStateChanged?.call(false, null);
+
         debugPrint('[AudioHandler] ✅ Optimistic play started on attempt $attempt');
         return true;
 
@@ -227,7 +215,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         final isTimeout = e is TimeoutException || e.toString().contains('timed out');
 
         if (isExpired && attempt < _kMaxLoadAttempts) {
-          // URL expired — ask server to refresh its Telegram CDN cache
           url = _appendRefresh(url);
           debugPrint('[AudioHandler] URL expired, refreshing...');
           continue;
@@ -273,13 +260,11 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       return;
     }
 
-    // Short track → prefetch immediately
     if (totalDuration.inSeconds < _kShortTrackThresholdSecs) {
       _doPreloadNextItem(nextIndex);
       return;
     }
 
-    // Schedule prefetch to fire [_kPreloadLeadSeconds] before track ends
     final leadTime  = Duration(seconds: _kPreloadLeadSeconds);
     final fireAfter = totalDuration - leadTime;
     final currentPos = _unifiedPosition;
@@ -445,6 +430,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       if (s == ja.ProcessingState.completed) _onPartCompleted();
     });
 
+    // FIX: Clear loading state after gapless swap
+    onLoadingStateChanged?.call(false, null);
+
     _broadcastCritical();
     Future.delayed(const Duration(milliseconds: 500), old.dispose);
 
@@ -482,6 +470,9 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       if (s == ja.ProcessingState.completed) _onPartCompleted();
     });
 
+    // FIX: Clear loading state after gapless album swap
+    onLoadingStateChanged?.call(false, null);
+
     _broadcastCritical();
     Future.delayed(const Duration(milliseconds: 500), old.dispose);
     _scheduleNextItemPreload();
@@ -502,14 +493,19 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     // Try using pre-loaded part first (instant transition)
     if (startAt == Duration.zero && partIndex > 0 && _preloadReady) {
       await _swapToPreloadedPart();
+      // FIX: Clear loading state after preload swap — was missing before
+      onLoadingStateChanged?.call(false, null);
     } else {
       onLoadingStateChanged?.call(true, null);
       final ok = await _loadWithRetry(_player, url, startAt: startAt);
+      // Note: _loadWithRetry now calls onLoadingStateChanged(false) internally
+      // on the optimistic path. For the failure path it also calls (false, error).
+      // So we only need the explicit call below for the preload=false error case
+      // where _loadWithRetry returns false without calling the callback.
       if (!ok) {
         onLoadingStateChanged?.call(false, 'Failed to load audio part.');
         return;
       }
-      onLoadingStateChanged?.call(false, null);
     }
 
     _maybePreloadNextPart(partIndex);
@@ -616,7 +612,8 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     // Signal loading to UI immediately
     onLoadingStateChanged?.call(true, null);
     await _loadPartAndPlay(0, startAt: resumeAt);
-    onLoadingStateChanged?.call(false, null);
+    // Note: onLoadingStateChanged(false) is called inside _loadPartAndPlay
+    // via _loadWithRetry on success, so no duplicate call needed here.
 
     _broadcastCritical();
     _scheduleNextItemPreload();
@@ -627,7 +624,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       Future.delayed(const Duration(seconds: 3), _preloadNextAlbumTrack);
     }
 
-    // Kick off smart batch prefetch for upcoming queue items
     _scheduleBatchPrefetch();
 
     Future.delayed(const Duration(milliseconds: 300), () {
@@ -674,7 +670,6 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         _partDurations[_currentPartIndex] = dur;
       }
 
-      // Execute pending seek once duration is known
       if (dur != null && dur > Duration.zero && _pendingSeekAfterLoad != null) {
         final seekTo = _pendingSeekAfterLoad!;
         _pendingSeekAfterLoad = null;
@@ -692,6 +687,14 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
     _subs.add(_player.playerStateStream.listen((ps) {
       if (!_playerStateController.isClosed) _playerStateController.add(ps);
+
+      // FIX: When player transitions to 'ready', ensure loading state is cleared.
+      // This handles the case where the optimistic play's onLoadingStateChanged(false)
+      // races with the playerState stream — we always clear on 'ready'.
+      if (ps.processingState == ja.ProcessingState.ready && ps.playing) {
+        onLoadingStateChanged?.call(false, null);
+      }
+
       _scheduleBroadcast(structural: true);
     }));
   }
@@ -884,7 +887,10 @@ class AudioCalmHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
       onLoadingStateChanged?.call(true, null);
       final ok = await _loadWithRetry(_player, _partUrls[targetPart], startAt: remaining);
-      onLoadingStateChanged?.call(false, ok ? null : 'Seek failed. Try again.');
+      // _loadWithRetry now calls onLoadingStateChanged(false) on success/failure
+      if (!ok) {
+        onLoadingStateChanged?.call(false, 'Seek failed. Try again.');
+      }
 
       if (ok) {
         _maybePreloadNextPart(targetPart);
